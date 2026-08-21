@@ -8,6 +8,9 @@ pytest>=7.0
 # the C/C++ toolchain (build-essential) needed to build it either way.
 # Using pybind11 instead of Cython is also fine — add it here yourself.
 Cython>=3.0
+pybind11>=2.10.0
+setuptools>=60.0
+
 
 # Needed only for scripts/download_full_corpus.py (fetching the real
 # assignment corpus). Not required to run the toy set or the harness itself.

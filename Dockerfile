@@ -19,6 +19,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+RUN pip install --no-cache-dir -e .
 
 # Default command: run the interface conformance + smoke-test suite
 # against the toy set. Course staff override CMD to point at the real

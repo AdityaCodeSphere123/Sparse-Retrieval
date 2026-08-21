@@ -8,3 +8,7 @@ data/full/
 *.aux
 *.out
 *.log
+build/
+*.so
+*.dylib
+

@@ -46,32 +46,51 @@ import os
 from typing import List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
+
 from submission.corpus_utils import load_corpus
 from submission.indexer import InvertedIndex
 
+try:
+    import cpp_engine
+    HAS_CPP = True
+except ImportError:
+    HAS_CPP = False
+
 _INDEX: Optional[InvertedIndex] = None
+_CPP_ENGINE: Optional[object] = None
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
-    """Load corpus, build the inverted index and corpus statistics, and save to `index_dir`."""
+    """Load corpus, build index using C++ engine if available (or Python fallback), and save to disk."""
     corpus = load_corpus(corpus_path)
-    index = InvertedIndex()
-    index.build(corpus)
-    index.save(index_dir)
+    if HAS_CPP:
+        engine = cpp_engine.CPPEngine()
+        engine.build_index(corpus, index_dir)
+    else:
+        index = InvertedIndex()
+        index.build(corpus)
+        index.save(index_dir)
 
 
 def load_index(index_dir: str) -> None:
-    """Load the inverted index from `index_dir` and initialize all retrievers."""
-    global _INDEX
-    _INDEX = InvertedIndex.load(index_dir)
-    bm25.build(_INDEX)
-    boolean_vsm.build(_INDEX)
+    """Reconstruct index from `index_dir` using C++ engine (or Python fallback)."""
+    global _INDEX, _CPP_ENGINE
+    if HAS_CPP:
+        _CPP_ENGINE = cpp_engine.CPPEngine()
+        _CPP_ENGINE.load_index(index_dir)
+    else:
+        _INDEX = InvertedIndex.load(index_dir)
+        bm25.build(_INDEX)
+        boolean_vsm.build(_INDEX)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, ranked by BM25+."""
-    if _INDEX is None:
-        raise RuntimeError("load_index() must be called before retrieve()")
-
-    return bm25.score(query, k, k1=1.2, b=0.75, delta=1.0)
-
+    if HAS_CPP:
+        if _CPP_ENGINE is None:
+            raise RuntimeError("load_index() must be called before retrieve()")
+        return _CPP_ENGINE.retrieve(query, k, k1=1.2, b=0.75, delta=1.0)
+    else:
+        if _INDEX is None:
+            raise RuntimeError("load_index() must be called before retrieve()")
+        return bm25.score(query, k, k1=1.2, b=0.75, delta=1.0)
