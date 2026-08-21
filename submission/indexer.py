@@ -26,6 +26,9 @@ directly (smaller, relative to the class median, scores better), so a
 compact postings encoding is worth more here than in most course
 assignments — see the `save()` docstring for concrete starting points.
 """
+import gzip
+import json
+import os
 import re
 from typing import Dict, List, Tuple
 
@@ -52,49 +55,69 @@ class InvertedIndex:
         self.avg_doc_len: float = 0.0
 
     def build(self, corpus: List[Tuple[str, str]]) -> None:
-        """corpus: list of (doc_id, text) pairs, e.g. from
-        submission.corpus_utils.load_corpus().
+        """Build the inverted index and corpus statistics from a list of (doc_id, text) pairs."""
+        self.postings = {}
+        self.doc_len = {}
+        self.doc_text = {}
+        self.N = len(corpus)
+        total_tokens = 0
 
-        TODO(you): tokenize each document, populate self.postings,
-        self.doc_len, self.doc_text, self.N, and self.avg_doc_len.
-        """
-        raise NotImplementedError("Implement InvertedIndex.build() — see assignment Section 4.1.")
+        for doc_id, text in corpus:
+            tokens = tokenize(text)
+            self.doc_len[doc_id] = len(tokens)
+            total_tokens += len(tokens)
+
+            tf_map: Dict[str, int] = {}
+            for token in tokens:
+                tf_map[token] = tf_map.get(token, 0) + 1
+
+            for term, tf in tf_map.items():
+                if term not in self.postings:
+                    self.postings[term] = {}
+                self.postings[term][doc_id] = tf
+
+        self.avg_doc_len = (total_tokens / self.N) if self.N > 0 else 0.0
 
     def document_frequency(self, term: str) -> int:
-        """Number of documents containing `term` at least once.
-
-        TODO(you): implement using self.postings.
-        """
-        raise NotImplementedError("Implement InvertedIndex.document_frequency().")
+        """Number of documents containing `term` at least once."""
+        return len(self.postings.get(term, {}))
 
     def save(self, index_dir: str) -> None:
-        """Persist everything document_frequency() / your scorers need to
-        `index_dir`, so `load()` can reconstruct this object in a fresh
-        process with no memory of `build()` ever having run. Called from
-        retrieve.build_index().
-
-        The on-disk byte size of whatever you write here is graded
-        directly (assignment Section 7, "index size", relative to the
-        class median) — some starting points, roughly in order of effort:
-          - json/pickle-dump self.postings etc. directly (works, but
-            verbose: repeats every doc_id string per posting).
-          - drop self.doc_text if your scorers don't need raw text at
-            query time (BM25/VSM only need term-frequency and length
-            statistics, not the original documents).
-          - delta-encode each postings list's doc-ids (sorted ascending,
-            store gaps instead of absolute ids) and varint/byte-pack them,
-            instead of a naive JSON list of integers.
-
-        TODO(you): implement.
         """
-        raise NotImplementedError("Implement InvertedIndex.save() — see assignment Section 4.1.")
+        Persist postings and statistics to `index_dir` as compressed JSON.
+
+        The on-disk byte size is graded directly: aim to keep this small.
+        Starting from this uncompressed baseline, you can reduce size by
+        - using a compact postings encoding (e.g. gap encoding + variable-byte
+          deltas for document IDs and term frequencies),
+        - storing only what's needed for scoring (you can drop self.doc_text
+          from the file if you don't use it at query time),
+        - perhaps storing term frequencies as integers scaled by 100 or 1000
+          and rounded, if that helps.
+        The assignment spec's index-size-bonus section has more ideas.
+        """
+        os.makedirs(index_dir, exist_ok=True)
+        data = {
+            "postings": self.postings,
+            "doc_len": self.doc_len,
+            "N": self.N,
+            "avg_doc_len": self.avg_doc_len,
+        }
+        index_file = os.path.join(index_dir, "index.json.gz")
+        with gzip.open(index_file, "wt", encoding="utf-8") as f:
+            json.dump(data, f)
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
-        """Reconstruct an InvertedIndex purely from what save() wrote to
-        `index_dir`. Called in a fresh process — do not rely on any state
-        other than what's actually on disk in `index_dir`.
+        """Reconstruct an InvertedIndex from compressed disk representation in `index_dir`."""
+        index = cls()
+        index_file = os.path.join(index_dir, "index.json.gz")
+        with gzip.open(index_file, "rt", encoding="utf-8") as f:
+            data = json.load(f)
 
-        TODO(you): implement, matching whatever format save() wrote.
-        """
-        raise NotImplementedError("Implement InvertedIndex.load() — see assignment Section 4.1.")
+        index.postings = data["postings"]
+        index.doc_len = data["doc_len"]
+        index.N = data["N"]
+        index.avg_doc_len = data["avg_doc_len"]
+        return index
+

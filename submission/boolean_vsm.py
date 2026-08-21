@@ -27,33 +27,102 @@ Two independent pieces to implement:
 Both pieces should read from the same InvertedIndex you build in
 indexer.py.
 """
-from typing import List, Tuple
+import math
+from typing import Dict, List, Optional, Set, Tuple
 
-from submission.indexer import InvertedIndex
+from submission.indexer import InvertedIndex, tokenize
+
+_INDEX: Optional[InvertedIndex] = None
 
 
 def build(index: InvertedIndex) -> None:
-    """Optional: precompute anything VSM-specific (e.g. document vector
-    norms) from the InvertedIndex built in indexer.py.
-
-    Call this from retrieve.load_index(), not retrieve.build_index() —
-    the harness runs those two in separate processes, so any cache this
-    creates only needs to exist in the process that also calls
-    retrieve(). If you want a precomputed cache to persist across the
-    build/load boundary too, write it out via InvertedIndex.save() instead
-    (it then counts toward your index-size score) and rebuild the cache
-    here from the loaded index."""
-    raise NotImplementedError
+    """Store reference to the loaded inverted index for VSM/Boolean scoring."""
+    global _INDEX
+    _INDEX = index
 
 
 def boolean_search(query: str, mode: str = "and") -> List[str]:
     """Return the (unranked) list of doc_ids matching `query`, treating it
-    as a conjunction (`mode="and"`) or disjunction (`mode="or"`) of its
-    terms."""
-    raise NotImplementedError
+    as a conjunction (`mode="and"`) or disjunction (`mode="or"`) of its terms."""
+    if _INDEX is None:
+        raise RuntimeError("boolean_vsm.build() must be called before boolean_search()")
+
+    tokens = tokenize(query)
+    if not tokens:
+        return []
+
+    mode = mode.lower()
+    matching_docs: Optional[Set[str]] = None
+
+    for term in tokens:
+        doc_set = set(_INDEX.postings.get(term, {}).keys())
+        if mode == "and":
+            if matching_docs is None:
+                matching_docs = doc_set
+            else:
+                matching_docs &= doc_set
+            if not matching_docs:
+                break
+        elif mode == "or":
+            if matching_docs is None:
+                matching_docs = doc_set
+            else:
+                matching_docs |= doc_set
+
+    return sorted(list(matching_docs)) if matching_docs else []
 
 
 def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs for `query`, ranked by
-    TF-IDF cosine similarity, highest score first."""
-    raise NotImplementedError
+    """Return up to k (doc_id, score) pairs for `query`, ranked by TF-IDF cosine similarity."""
+    if _INDEX is None:
+        raise RuntimeError("boolean_vsm.build() must be called before vsm_score()")
+
+    tokens = tokenize(query)
+    if not tokens or _INDEX.N == 0:
+        return []
+
+    q_tf: Dict[str, int] = {}
+    for t in tokens:
+        q_tf[t] = q_tf.get(t, 0) + 1
+
+    # Query vector weights & norm
+    q_weights: Dict[str, float] = {}
+    q_norm_sq = 0.0
+
+    for term, tf in q_tf.items():
+        df = _INDEX.document_frequency(term)
+        if df > 0:
+            idf = math.log(_INDEX.N / df)
+            weight = (1.0 + math.log(tf)) * idf
+            q_weights[term] = weight
+            q_norm_sq += weight * weight
+
+    if not q_weights or q_norm_sq == 0.0:
+        return []
+
+    q_norm = math.sqrt(q_norm_sq)
+
+    # Accumulate dot products and document norms
+    doc_dots: Dict[str, float] = {}
+    doc_norms_sq: Dict[str, float] = {}
+
+    for term, q_w in q_weights.items():
+        postings = _INDEX.postings.get(term, {})
+        df = _INDEX.document_frequency(term)
+        idf = math.log(_INDEX.N / df)
+
+        for doc_id, tf in postings.items():
+            doc_w = (1.0 + math.log(tf)) * idf
+            doc_dots[doc_id] = doc_dots.get(doc_id, 0.0) + (q_w * doc_w)
+            doc_norms_sq[doc_id] = doc_norms_sq.get(doc_id, 0.0) + (doc_w * doc_w)
+
+    scores: List[Tuple[str, float]] = []
+    for doc_id, dot in doc_dots.items():
+        doc_norm = math.sqrt(doc_norms_sq[doc_id])
+        if doc_norm > 0:
+            sim = dot / (q_norm * doc_norm)
+            scores.append((doc_id, sim))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return scores[:k]
+
