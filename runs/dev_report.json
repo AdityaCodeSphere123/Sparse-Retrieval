@@ -20,11 +20,11 @@
     "beats_baseline_map@10": false
   },
   "efficiency": {
-    "index_build_seconds": 0.0016412500008300412,
-    "index_load_seconds": 0.0001512910002929857,
+    "index_build_seconds": 0.0008772920009505469,
+    "index_load_seconds": 0.00016474999938509427,
     "index_size_bytes": 10422,
-    "mean_query_latency_seconds": 3.244433294942913e-05,
-    "max_query_latency_seconds": 8.620799962955061e-05
+    "mean_query_latency_seconds": 3.593083359495116e-05,
+    "max_query_latency_seconds": 8.833299943944439e-05
   },
   "per_query_metrics": {
     "q1": {

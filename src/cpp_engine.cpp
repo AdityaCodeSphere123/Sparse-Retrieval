@@ -42,7 +42,7 @@ static const std::unordered_set<std::string> STOPWORDS = {
     "it", "its", "itself", "j", "just", "k", "keep", "keeps", "kind", "knew", "know", "known", "knows",
     "l", "large", "largely", "last", "later", "latest", "least", "less", "let", "lets", "like", "likely",
     "long", "longer", "longest", "m", "made", "make", "making", "man", "many", "may", "me", "member",
-    "members", "men", "might", "more", "most", "mostly", "mr", "mrs", "much", "much", "must", "my", "myself",
+    "members", "men", "might", "more", "most", "mostly", "mr", "mrs", "much", "must", "my", "myself",
     "n", "necessary", "need", "needed", "needing", "needs", "never", "new", "newer", "newest", "next",
     "no", "nobody", "non", "noone", "not", "nothing", "now", "nowhere", "number", "numbers", "o", "of",
     "off", "often", "old", "older", "oldest", "on", "once", "one", "only", "open", "opened", "opening",
@@ -189,6 +189,7 @@ public:
 
     CPPEngine() = default;
 
+    // SPIMI (Single-Pass In-Memory Indexing) Implementation
     void build_index(const std::vector<std::pair<std::string, std::string>>& corpus, const std::string& index_dir) {
         N = corpus.size();
         doc_ids.clear();
@@ -198,8 +199,47 @@ public:
 
         total_corpus_tokens = 0;
 
+        constexpr uint32_t BATCH_DOC_LIMIT = 50000; // SPIMI batch size to prevent OOM
+        std::vector<std::string> run_files;
+        uint32_t run_count = 0;
+
         std::unordered_map<std::string, std::vector<DocPostingPos>> temp_postings;
         std::unordered_map<std::string, uint64_t> collection_freq;
+
+        auto flush_spimi_run = [&](uint32_t run_idx) {
+            std::string run_path = index_dir + "/spimi_run_" + std::to_string(run_idx) + ".bin";
+            std::ofstream f(run_path, std::ios::binary);
+
+            std::vector<std::string> terms;
+            terms.reserve(temp_postings.size());
+            for (const auto& kv : temp_postings) terms.push_back(kv.first);
+            std::sort(terms.begin(), terms.end());
+
+            uint32_t num_terms = terms.size();
+            f.write(reinterpret_cast<const char*>(&num_terms), sizeof(num_terms));
+
+            for (const auto& term : terms) {
+                const auto& plist = temp_postings[term];
+                uint16_t t_len = term.size();
+                f.write(reinterpret_cast<const char*>(&t_len), sizeof(t_len));
+                f.write(term.data(), t_len);
+
+                uint32_t df = plist.size();
+                uint64_t cf = collection_freq[term];
+                f.write(reinterpret_cast<const char*>(&df), sizeof(df));
+                f.write(reinterpret_cast<const char*>(&cf), sizeof(cf));
+
+                for (const auto& p : plist) {
+                    f.write(reinterpret_cast<const char*>(&p.doc_id), sizeof(p.doc_id));
+                    f.write(reinterpret_cast<const char*>(&p.tf), sizeof(p.tf));
+                    uint32_t num_pos = p.positions.size();
+                    f.write(reinterpret_cast<const char*>(&num_pos), sizeof(num_pos));
+                    f.write(reinterpret_cast<const char*>(p.positions.data()), num_pos * sizeof(uint32_t));
+                }
+            }
+            temp_postings.clear();
+            run_files.push_back(run_path);
+        };
 
         for (uint32_t doc_int_id = 0; doc_int_id < N; ++doc_int_id) {
             const auto& ext_id = corpus[doc_int_id].first;
@@ -223,6 +263,14 @@ public:
                 uint32_t tf = kv.second.size();
                 temp_postings[term].push_back(DocPostingPos{doc_int_id, tf, std::move(kv.second)});
             }
+
+            if ((doc_int_id + 1) % BATCH_DOC_LIMIT == 0) {
+                flush_spimi_run(run_count++);
+            }
+        }
+
+        if (!temp_postings.empty()) {
+            flush_spimi_run(run_count++);
         }
 
         avg_doc_len = (N > 0) ? static_cast<float>(static_cast<double>(total_corpus_tokens) / N) : 0.0f;
@@ -233,7 +281,7 @@ public:
         std::string postings_path = index_dir + "/postings.bin";
         std::string positions_path = index_dir + "/positions.bin";
 
-        // 1. Save docmap
+        // Save docmap
         {
             std::ofstream f(docmap_path, std::ios::binary);
             f.write(reinterpret_cast<const char*>(&N), sizeof(N));
@@ -244,7 +292,7 @@ public:
             }
         }
 
-        // 2. Save doclens
+        // Save doclens
         {
             std::ofstream f(doclens_path, std::ios::binary);
             f.write(reinterpret_cast<const char*>(&N), sizeof(N));
@@ -253,23 +301,76 @@ public:
             f.write(reinterpret_cast<const char*>(doc_lens.data()), N * sizeof(uint32_t));
         }
 
-        // 3. Process & save postings, positions, and dict
+        // Stream / Merge SPIMI Runs into Final postings.bin, dict.bin, positions.bin
+        struct RunReader {
+            std::ifstream file;
+            uint32_t num_terms = 0;
+            uint32_t terms_read = 0;
+            std::string curr_term;
+            uint32_t curr_df = 0;
+            uint64_t curr_cf = 0;
+
+            bool read_next_term() {
+                if (terms_read >= num_terms) return false;
+                uint16_t t_len;
+                if (!file.read(reinterpret_cast<char*>(&t_len), sizeof(t_len))) return false;
+                curr_term.resize(t_len);
+                file.read(&curr_term[0], t_len);
+                file.read(reinterpret_cast<char*>(&curr_df), sizeof(curr_df));
+                file.read(reinterpret_cast<char*>(&curr_cf), sizeof(curr_cf));
+                terms_read++;
+                return true;
+            }
+        };
+
+        std::vector<RunReader> readers(run_files.size());
+        for (size_t i = 0; i < run_files.size(); ++i) {
+            readers[i].file.open(run_files[i], std::ios::binary);
+            readers[i].file.read(reinterpret_cast<char*>(&readers[i].num_terms), sizeof(readers[i].num_terms));
+            readers[i].read_next_term();
+        }
+
         std::ofstream f_postings(postings_path, std::ios::binary);
         std::ofstream f_positions(positions_path, std::ios::binary);
         std::ofstream f_dict(dict_path, std::ios::binary);
 
-        uint32_t num_terms = temp_postings.size();
-        f_dict.write(reinterpret_cast<const char*>(&num_terms), sizeof(num_terms));
-
+        std::unordered_map<std::string, TermMeta> final_dict;
         uint64_t current_postings_offset = 0;
         uint64_t current_positions_offset = 0;
 
-        for (auto& kv : temp_postings) {
-            const std::string& term = kv.first;
-            auto& plist = kv.second;
-            uint32_t df = plist.size();
-            uint64_t cf = collection_freq[term];
+        while (true) {
+            std::string min_term = "";
+            for (size_t i = 0; i < readers.size(); ++i) {
+                if (readers[i].terms_read <= readers[i].num_terms && !readers[i].curr_term.empty()) {
+                    if (min_term.empty() || readers[i].curr_term < min_term) {
+                        min_term = readers[i].curr_term;
+                    }
+                }
+            }
 
+            if (min_term.empty()) break; // All runs completed
+
+            std::vector<DocPostingPos> merged_plist;
+            uint64_t merged_cf = 0;
+
+            for (size_t i = 0; i < readers.size(); ++i) {
+                if (readers[i].curr_term == min_term && readers[i].terms_read <= readers[i].num_terms) {
+                    merged_cf += readers[i].curr_cf;
+                    for (uint32_t p_idx = 0; p_idx < readers[i].curr_df; ++p_idx) {
+                        DocPostingPos dpos;
+                        readers[i].file.read(reinterpret_cast<char*>(&dpos.doc_id), sizeof(dpos.doc_id));
+                        readers[i].file.read(reinterpret_cast<char*>(&dpos.tf), sizeof(dpos.tf));
+                        uint32_t num_pos;
+                        readers[i].file.read(reinterpret_cast<char*>(&num_pos), sizeof(num_pos));
+                        dpos.positions.resize(num_pos);
+                        readers[i].file.read(reinterpret_cast<char*>(dpos.positions.data()), num_pos * sizeof(uint32_t));
+                        merged_plist.push_back(std::move(dpos));
+                    }
+                    readers[i].read_next_term();
+                }
+            }
+
+            uint32_t df = merged_plist.size();
             float idf = std::log(1.0f + (N - df + 0.5f) / (df + 0.5f));
             float k1 = 1.2f, b = 0.75f, delta = 1.0f;
 
@@ -284,15 +385,15 @@ public:
                 uint32_t end_i = std::min(start_i + BLOCK_SIZE, df);
                 uint32_t n_in_block = end_i - start_i;
 
-                uint32_t max_doc_id = plist[end_i - 1].doc_id;
+                uint32_t max_doc_id = merged_plist[end_i - 1].doc_id;
                 float block_max_score = 0.0f;
 
                 std::vector<uint8_t> block_data;
                 uint32_t prev_doc_id = 0;
 
                 for (uint32_t i = start_i; i < end_i; ++i) {
-                    uint32_t d_id = plist[i].doc_id;
-                    uint32_t tf = plist[i].tf;
+                    uint32_t d_id = merged_plist[i].doc_id;
+                    uint32_t tf = merged_plist[i].tf;
 
                     float len_ratio = doc_lens[d_id] / avg_doc_len;
                     float tf_norm = (tf * (k1 + 1.0f)) / (tf + k1 * (1.0f - b + b * len_ratio));
@@ -314,7 +415,6 @@ public:
                 current_postings_offset += sizeof(bh) + block_data.size();
             }
 
-            // Pruned positional index: only store positions for non-frequent terms (df/N <= 0.05)
             uint8_t has_positions = (df <= static_cast<uint32_t>(N * 0.05f)) ? 1 : 0;
             uint64_t term_positions_start = 0;
 
@@ -323,7 +423,7 @@ public:
                 std::vector<uint8_t> pos_data;
 
                 uint32_t prev_doc = 0;
-                for (const auto& entry : plist) {
+                for (const auto& entry : merged_plist) {
                     uint32_t delta_doc = entry.doc_id - prev_doc;
                     write_vbyte(pos_data, delta_doc);
                     write_vbyte(pos_data, entry.positions.size());
@@ -340,16 +440,35 @@ public:
                 current_positions_offset += pos_data.size();
             }
 
+            TermMeta meta{df, merged_cf, global_max_score, term_postings_start, num_blocks, has_positions, term_positions_start};
+            final_dict[min_term] = meta;
+        }
+
+        for (auto& r : readers) r.file.close();
+
+        // Write dict.bin
+        uint32_t final_num_terms = final_dict.size();
+        f_dict.write(reinterpret_cast<const char*>(&final_num_terms), sizeof(final_num_terms));
+
+        for (const auto& kv : final_dict) {
+            const std::string& term = kv.first;
+            const TermMeta& meta = kv.second;
+
             uint16_t term_len = term.size();
             f_dict.write(reinterpret_cast<const char*>(&term_len), sizeof(term_len));
             f_dict.write(term.data(), term_len);
-            f_dict.write(reinterpret_cast<const char*>(&df), sizeof(df));
-            f_dict.write(reinterpret_cast<const char*>(&cf), sizeof(cf));
-            f_dict.write(reinterpret_cast<const char*>(&global_max_score), sizeof(global_max_score));
-            f_dict.write(reinterpret_cast<const char*>(&term_postings_start), sizeof(term_postings_start));
-            f_dict.write(reinterpret_cast<const char*>(&num_blocks), sizeof(num_blocks));
-            f_dict.write(reinterpret_cast<const char*>(&has_positions), sizeof(has_positions));
-            f_dict.write(reinterpret_cast<const char*>(&term_positions_start), sizeof(term_positions_start));
+            f_dict.write(reinterpret_cast<const char*>(&meta.df), sizeof(meta.df));
+            f_dict.write(reinterpret_cast<const char*>(&meta.cf), sizeof(meta.cf));
+            f_dict.write(reinterpret_cast<const char*>(&meta.global_max_score), sizeof(meta.global_max_score));
+            f_dict.write(reinterpret_cast<const char*>(&meta.postings_offset), sizeof(meta.postings_offset));
+            f_dict.write(reinterpret_cast<const char*>(&meta.num_blocks), sizeof(meta.num_blocks));
+            f_dict.write(reinterpret_cast<const char*>(&meta.has_positions), sizeof(meta.has_positions));
+            f_dict.write(reinterpret_cast<const char*>(&meta.positions_offset), sizeof(meta.positions_offset));
+        }
+
+        // Clean up temporary SPIMI run files
+        for (const auto& rfile : run_files) {
+            std::remove(rfile.c_str());
         }
     }
 
@@ -416,7 +535,16 @@ public:
     ) {
         if (query_weights.empty() || N == 0 || !postings_mmap.data) return {};
 
-        std::unordered_map<uint32_t, float> doc_scores;
+        struct QueryTermInfo {
+            std::string term;
+            float q_w;
+            float idf;
+            TermMeta meta;
+            float max_term_contrib;
+        };
+
+        std::vector<QueryTermInfo> qterms;
+        float total_max_query_score = 0.0f;
 
         for (const auto& kv : query_weights) {
             const std::string& term = kv.first;
@@ -427,11 +555,34 @@ public:
 
             uint32_t df = it->second.df;
             float idf = std::log(1.0f + (N - df + 0.5f) / (df + 0.5f));
-            const uint8_t* ptr = postings_mmap.data + it->second.postings_offset;
+            float max_contrib = q_w * idf * it->second.global_max_score;
+            total_max_query_score += max_contrib;
 
-            for (uint32_t b_idx = 0; b_idx < it->second.num_blocks; ++b_idx) {
+            qterms.push_back({term, q_w, idf, it->second, max_contrib});
+        }
+
+        if (qterms.empty()) return {};
+
+        std::unordered_map<uint32_t, float> doc_scores;
+        using ScoreDoc = std::pair<float, uint32_t>;
+        std::priority_queue<ScoreDoc, std::vector<ScoreDoc>, std::greater<ScoreDoc>> pq;
+
+        for (const auto& qt : qterms) {
+            float other_terms_max = total_max_query_score - qt.max_term_contrib;
+            const uint8_t* ptr = postings_mmap.data + qt.meta.postings_offset;
+
+            for (uint32_t b_idx = 0; b_idx < qt.meta.num_blocks; ++b_idx) {
                 const BlockHeader* bh = reinterpret_cast<const BlockHeader*>(ptr);
                 ptr += sizeof(BlockHeader);
+
+                float block_contrib = qt.q_w * qt.idf * bh->block_max_score;
+                float upper_bound = block_contrib + other_terms_max;
+
+                // TRUE BLOCK-MAX WAND SKIPPING:
+                if (pq.size() == static_cast<size_t>(top_k) && upper_bound <= pq.top().first) {
+                    ptr += bh->byte_size;
+                    continue;
+                }
 
                 const uint8_t* block_bytes = ptr;
                 ptr += bh->byte_size;
@@ -446,30 +597,35 @@ public:
 
                     float len_ratio = doc_lens[current_doc] / avg_doc_len;
                     float tf_norm = (tf * (k1 + 1.0f)) / (tf + k1 * (1.0f - b + b * len_ratio));
-                    float score = q_w * idf * (tf_norm + delta);
+                    float score = qt.q_w * qt.idf * (tf_norm + delta);
 
-                    doc_scores[current_doc] += score;
+                    float new_score = (doc_scores[current_doc] += score);
+
+                    if (pq.size() < static_cast<size_t>(top_k)) {
+                        pq.push({new_score, current_doc});
+                    } else if (new_score > pq.top().first) {
+                        pq.pop();
+                        pq.push({new_score, current_doc});
+                    }
                 }
             }
         }
 
-        using ScoreDoc = std::pair<float, uint32_t>;
-        std::priority_queue<ScoreDoc, std::vector<ScoreDoc>, std::greater<ScoreDoc>> pq;
-
+        std::priority_queue<ScoreDoc, std::vector<ScoreDoc>, std::greater<ScoreDoc>> final_pq;
         for (const auto& kv : doc_scores) {
-            if (pq.size() < static_cast<size_t>(top_k)) {
-                pq.push({kv.second, kv.first});
-            } else if (kv.second > pq.top().first) {
-                pq.pop();
-                pq.push({kv.second, kv.first});
+            if (final_pq.size() < static_cast<size_t>(top_k)) {
+                final_pq.push({kv.second, kv.first});
+            } else if (kv.second > final_pq.top().first) {
+                final_pq.pop();
+                final_pq.push({kv.second, kv.first});
             }
         }
 
         std::vector<std::pair<uint32_t, float>> results;
-        results.reserve(pq.size());
-        while (!pq.empty()) {
-            auto top = pq.top();
-            pq.pop();
+        results.reserve(final_pq.size());
+        while (!final_pq.empty()) {
+            auto top = final_pq.top();
+            final_pq.pop();
             results.push_back({top.second, top.first});
         }
         std::reverse(results.begin(), results.end());
@@ -748,7 +904,7 @@ public:
 };
 
 PYBIND11_MODULE(cpp_engine, m) {
-    m.doc() = "C++ High-Performance Search Engine with mmap, RM3 & SDM";
+    m.doc() = "C++ High-Performance Search Engine with SPIMI & Block-Max WAND";
     py::class_<CPPEngine>(m, "CPPEngine")
         .def(py::init<>())
         .def("build_index", &CPPEngine::build_index, py::arg("corpus"), py::arg("index_dir"))
