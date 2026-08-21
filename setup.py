@@ -6,7 +6,8 @@ ext_modules = [
         "cpp_engine",
         ["src/cpp_engine.cpp"],
         cxx_std=17,
-        extra_compile_args=["-O3"],
+        extra_compile_args=["-O3", "-ffast-math", "-funroll-loops"],
+
     ),
 ]
 

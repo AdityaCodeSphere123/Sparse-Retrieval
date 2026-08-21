@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <cmath>
 #include <queue>
@@ -12,7 +13,55 @@
 #include <sstream>
 #include <cctype>
 
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 namespace py = pybind11;
+
+// ---------------------------------------------------------------------------
+// Stopwords List (Indri / INQUERY inspired subset for expansion & position pruning)
+// ---------------------------------------------------------------------------
+static const std::unordered_set<std::string> STOPWORDS = {
+    "a", "about", "above", "across", "after", "again", "against", "all", "almost", "alone", "along",
+    "already", "also", "although", "always", "among", "an", "and", "another", "any", "anybody", "anyone",
+    "anything", "anywhere", "are", "area", "areas", "around", "as", "ask", "asked", "asking", "asks", "at",
+    "away", "b", "back", "backed", "backing", "backs", "be", "became", "because", "become", "becomes",
+    "been", "before", "began", "behind", "being", "beings", "best", "better", "between", "big", "both",
+    "but", "by", "c", "came", "can", "cannot", "case", "cases", "certain", "certainly", "clear", "clearly",
+    "come", "could", "d", "did", "differ", "different", "differently", "do", "does", "done", "down",
+    "downed", "downing", "downs", "during", "e", "each", "early", "either", "end", "ended", "ending",
+    "ends", "enough", "even", "evenly", "ever", "every", "everybody", "everyone", "everything",
+    "everywhere", "f", "fact", "facts", "far", "felt", "few", "find", "finds", "first", "for", "four",
+    "from", "full", "fully", "further", "furthered", "furthering", "furthers", "g", "gave", "general",
+    "generally", "get", "gets", "give", "given", "gives", "go", "going", "good", "goods", "got", "great",
+    "greater", "greatest", "group", "grouped", "grouping", "groups", "h", "had", "has", "have", "having",
+    "he", "her", "here", "herself", "high", "higher", "highest", "him", "himself", "his", "how", "however",
+    "i", "if", "important", "in", "interest", "interested", "interesting", "interests", "into", "is",
+    "it", "its", "itself", "j", "just", "k", "keep", "keeps", "kind", "knew", "know", "known", "knows",
+    "l", "large", "largely", "last", "later", "latest", "least", "less", "let", "lets", "like", "likely",
+    "long", "longer", "longest", "m", "made", "make", "making", "man", "many", "may", "me", "member",
+    "members", "men", "might", "more", "most", "mostly", "mr", "mrs", "much", "much", "must", "my", "myself",
+    "n", "necessary", "need", "needed", "needing", "needs", "never", "new", "newer", "newest", "next",
+    "no", "nobody", "non", "noone", "not", "nothing", "now", "nowhere", "number", "numbers", "o", "of",
+    "off", "often", "old", "older", "oldest", "on", "once", "one", "only", "open", "opened", "opening",
+    "opens", "or", "order", "ordered", "ordering", "orders", "other", "others", "our", "out", "over",
+    "p", "part", "parted", "parting", "parts", "per", "perhaps", "place", "places", "point", "pointed",
+    "pointing", "points", "possible", "present", "presented", "presenting", "presents", "problem",
+    "problems", "put", "puts", "q", "quite", "r", "rather", "really", "right", "room", "rooms", "s",
+    "said", "same", "saw", "say", "says", "second", "seconds", "see", "seem", "seemed", "seeming",
+    "seems", "sees", "several", "shall", "she", "should", "show", "showed", "showing", "shows", "side",
+    "sides", "since", "small", "smaller", "smallest", "so", "some", "somebody", "someone", "something",
+    "somewhere", "state", "states", "still", "such", "sure", "t", "take", "taken", "than", "that", "the",
+    "their", "them", "then", "there", "therefore", "these", "they", "thing", "things", "think", "thinks",
+    "this", "those", "though", "thought", "thoughts", "three", "through", "thus", "to", "today",
+    "together", "too", "took", "toward", "turn", "turned", "turning", "turns", "two", "u", "under",
+    "until", "up", "upon", "us", "use", "used", "uses", "v", "very", "w", "want", "wanted", "wanting",
+    "wants", "was", "way", "ways", "we", "well", "wells", "went", "were", "what", "when", "where",
+    "whether", "which", "while", "who", "whole", "whose", "why", "will", "with", "within", "without",
+    "work", "worked", "working", "works", "would", "x", "y", "year", "years", "yet", "you", "your", "yours"
+};
 
 // ---------------------------------------------------------------------------
 // VByte encoding helpers
@@ -37,7 +86,6 @@ static inline uint32_t read_vbyte(const uint8_t*& ptr) {
     return val;
 }
 
-// Simple tokenizer
 static inline std::vector<std::string> cpp_tokenize(const std::string& text) {
     std::vector<std::string> tokens;
     tokens.reserve(text.size() / 5);
@@ -59,7 +107,50 @@ static inline std::vector<std::string> cpp_tokenize(const std::string& text) {
 }
 
 // ---------------------------------------------------------------------------
-// Data Structures for Block-Max WAND Index
+// Mmap Buffer Wrapper for Instant Zero-Copy Load
+// ---------------------------------------------------------------------------
+struct MmapBuffer {
+    const uint8_t* data = nullptr;
+    size_t length = 0;
+
+    bool map_file(const std::string& path) {
+        unmap();
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd == -1) return false;
+
+        struct stat st;
+        if (fstat(fd, &st) == -1 || st.st_size == 0) {
+            close(fd);
+            return false;
+        }
+        length = st.st_size;
+        void* addr = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
+
+        if (addr == MAP_FAILED) {
+            data = nullptr;
+            length = 0;
+            return false;
+        }
+        data = static_cast<const uint8_t*>(addr);
+        return true;
+    }
+
+    void unmap() {
+        if (data && data != MAP_FAILED) {
+            munmap(const_cast<uint8_t*>(data), length);
+            data = nullptr;
+            length = 0;
+        }
+    }
+
+    ~MmapBuffer() {
+        unmap();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Index Data Structures
 // ---------------------------------------------------------------------------
 struct BlockHeader {
     uint32_t max_doc_id;
@@ -70,9 +161,18 @@ struct BlockHeader {
 
 struct TermMeta {
     uint32_t df;
+    uint64_t cf;
     float global_max_score;
     uint64_t postings_offset;
     uint32_t num_blocks;
+    uint8_t has_positions;
+    uint64_t positions_offset;
+};
+
+struct DocPostingPos {
+    uint32_t doc_id;
+    uint32_t tf;
+    std::vector<uint32_t> positions;
 };
 
 class CPPEngine {
@@ -81,8 +181,11 @@ public:
     std::vector<uint32_t> doc_lens;
     float avg_doc_len = 0.0f;
     uint32_t N = 0;
+    uint64_t total_corpus_tokens = 0;
     std::unordered_map<std::string, TermMeta> dictionary;
-    std::vector<uint8_t> postings_buf;
+    
+    MmapBuffer postings_mmap;
+    MmapBuffer positions_mmap;
 
     CPPEngine() = default;
 
@@ -93,8 +196,10 @@ public:
         doc_lens.clear();
         doc_lens.reserve(N);
 
-        double total_tokens = 0;
-        std::unordered_map<std::string, std::vector<std::pair<uint32_t, uint32_t>>> temp_postings;
+        total_corpus_tokens = 0;
+
+        std::unordered_map<std::string, std::vector<DocPostingPos>> temp_postings;
+        std::unordered_map<std::string, uint64_t> collection_freq;
 
         for (uint32_t doc_int_id = 0; doc_int_id < N; ++doc_int_id) {
             const auto& ext_id = corpus[doc_int_id].first;
@@ -104,25 +209,29 @@ public:
             auto tokens = cpp_tokenize(text);
             uint32_t d_len = tokens.size();
             doc_lens.push_back(d_len);
-            total_tokens += d_len;
+            total_corpus_tokens += d_len;
 
-            std::unordered_map<std::string, uint32_t> tf_map;
-            for (const auto& tok : tokens) {
-                tf_map[tok]++;
+            std::unordered_map<std::string, std::vector<uint32_t>> term_positions;
+            for (uint32_t pos = 0; pos < tokens.size(); ++pos) {
+                const auto& tok = tokens[pos];
+                term_positions[tok].push_back(pos);
+                collection_freq[tok]++;
             }
 
-            for (const auto& kv : tf_map) {
-                temp_postings[kv.first].emplace_back(doc_int_id, kv.second);
+            for (auto& kv : term_positions) {
+                const std::string& term = kv.first;
+                uint32_t tf = kv.second.size();
+                temp_postings[term].push_back(DocPostingPos{doc_int_id, tf, std::move(kv.second)});
             }
         }
 
-        avg_doc_len = (N > 0) ? static_cast<float>(total_tokens / N) : 0.0f;
+        avg_doc_len = (N > 0) ? static_cast<float>(static_cast<double>(total_corpus_tokens) / N) : 0.0f;
 
-        // Serialize to binary files
         std::string docmap_path = index_dir + "/docmap.bin";
         std::string doclens_path = index_dir + "/doclens.bin";
         std::string dict_path = index_dir + "/dict.bin";
         std::string postings_path = index_dir + "/postings.bin";
+        std::string positions_path = index_dir + "/positions.bin";
 
         // 1. Save docmap
         {
@@ -140,27 +249,30 @@ public:
             std::ofstream f(doclens_path, std::ios::binary);
             f.write(reinterpret_cast<const char*>(&N), sizeof(N));
             f.write(reinterpret_cast<const char*>(&avg_doc_len), sizeof(avg_doc_len));
+            f.write(reinterpret_cast<const char*>(&total_corpus_tokens), sizeof(total_corpus_tokens));
             f.write(reinterpret_cast<const char*>(doc_lens.data()), N * sizeof(uint32_t));
         }
 
-        // 3. Process & save postings and dict
+        // 3. Process & save postings, positions, and dict
         std::ofstream f_postings(postings_path, std::ios::binary);
+        std::ofstream f_positions(positions_path, std::ios::binary);
         std::ofstream f_dict(dict_path, std::ios::binary);
 
         uint32_t num_terms = temp_postings.size();
         f_dict.write(reinterpret_cast<const char*>(&num_terms), sizeof(num_terms));
 
         uint64_t current_postings_offset = 0;
+        uint64_t current_positions_offset = 0;
 
         for (auto& kv : temp_postings) {
             const std::string& term = kv.first;
-            auto& plist = kv.second; // sorted by doc_int_id ascending
+            auto& plist = kv.second;
             uint32_t df = plist.size();
+            uint64_t cf = collection_freq[term];
 
             float idf = std::log(1.0f + (N - df + 0.5f) / (df + 0.5f));
             float k1 = 1.2f, b = 0.75f, delta = 1.0f;
 
-            // Block building (block size = 128)
             constexpr uint32_t BLOCK_SIZE = 128;
             uint32_t num_blocks = (df + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -172,15 +284,15 @@ public:
                 uint32_t end_i = std::min(start_i + BLOCK_SIZE, df);
                 uint32_t n_in_block = end_i - start_i;
 
-                uint32_t max_doc_id = plist[end_i - 1].first;
+                uint32_t max_doc_id = plist[end_i - 1].doc_id;
                 float block_max_score = 0.0f;
 
                 std::vector<uint8_t> block_data;
                 uint32_t prev_doc_id = 0;
 
                 for (uint32_t i = start_i; i < end_i; ++i) {
-                    uint32_t d_id = plist[i].first;
-                    uint32_t tf = plist[i].second;
+                    uint32_t d_id = plist[i].doc_id;
+                    uint32_t tf = plist[i].tf;
 
                     float len_ratio = doc_lens[d_id] / avg_doc_len;
                     float tf_norm = (tf * (k1 + 1.0f)) / (tf + k1 * (1.0f - b + b * len_ratio));
@@ -202,19 +314,46 @@ public:
                 current_postings_offset += sizeof(bh) + block_data.size();
             }
 
-            // Write dict entry
+            // Pruned positional index: only store positions for non-frequent terms (df/N <= 0.05)
+            uint8_t has_positions = (df <= static_cast<uint32_t>(N * 0.05f)) ? 1 : 0;
+            uint64_t term_positions_start = 0;
+
+            if (has_positions) {
+                term_positions_start = current_positions_offset;
+                std::vector<uint8_t> pos_data;
+
+                uint32_t prev_doc = 0;
+                for (const auto& entry : plist) {
+                    uint32_t delta_doc = entry.doc_id - prev_doc;
+                    write_vbyte(pos_data, delta_doc);
+                    write_vbyte(pos_data, entry.positions.size());
+
+                    uint32_t prev_pos = 0;
+                    for (uint32_t p : entry.positions) {
+                        write_vbyte(pos_data, p - prev_pos);
+                        prev_pos = p;
+                    }
+                    prev_doc = entry.doc_id;
+                }
+
+                f_positions.write(reinterpret_cast<const char*>(pos_data.data()), pos_data.size());
+                current_positions_offset += pos_data.size();
+            }
+
             uint16_t term_len = term.size();
             f_dict.write(reinterpret_cast<const char*>(&term_len), sizeof(term_len));
             f_dict.write(term.data(), term_len);
             f_dict.write(reinterpret_cast<const char*>(&df), sizeof(df));
+            f_dict.write(reinterpret_cast<const char*>(&cf), sizeof(cf));
             f_dict.write(reinterpret_cast<const char*>(&global_max_score), sizeof(global_max_score));
             f_dict.write(reinterpret_cast<const char*>(&term_postings_start), sizeof(term_postings_start));
             f_dict.write(reinterpret_cast<const char*>(&num_blocks), sizeof(num_blocks));
+            f_dict.write(reinterpret_cast<const char*>(&has_positions), sizeof(has_positions));
+            f_dict.write(reinterpret_cast<const char*>(&term_positions_start), sizeof(term_positions_start));
         }
     }
 
     void load_index(const std::string& index_dir) {
-        // Read docmap
         {
             std::ifstream f(index_dir + "/docmap.bin", std::ios::binary);
             f.read(reinterpret_cast<char*>(&N), sizeof(N));
@@ -228,16 +367,15 @@ public:
             }
         }
 
-        // Read doclens
         {
             std::ifstream f(index_dir + "/doclens.bin", std::ios::binary);
             f.read(reinterpret_cast<char*>(&N), sizeof(N));
             f.read(reinterpret_cast<char*>(&avg_doc_len), sizeof(avg_doc_len));
+            f.read(reinterpret_cast<char*>(&total_corpus_tokens), sizeof(total_corpus_tokens));
             doc_lens.resize(N);
             f.read(reinterpret_cast<char*>(doc_lens.data()), N * sizeof(uint32_t));
         }
 
-        // Read dict
         {
             std::ifstream f(index_dir + "/dict.bin", std::ios::binary);
             uint32_t num_terms;
@@ -253,62 +391,45 @@ public:
 
                 TermMeta meta;
                 f.read(reinterpret_cast<char*>(&meta.df), sizeof(meta.df));
+                f.read(reinterpret_cast<char*>(&meta.cf), sizeof(meta.cf));
                 f.read(reinterpret_cast<char*>(&meta.global_max_score), sizeof(meta.global_max_score));
                 f.read(reinterpret_cast<char*>(&meta.postings_offset), sizeof(meta.postings_offset));
                 f.read(reinterpret_cast<char*>(&meta.num_blocks), sizeof(meta.num_blocks));
+                f.read(reinterpret_cast<char*>(&meta.has_positions), sizeof(meta.has_positions));
+                f.read(reinterpret_cast<char*>(&meta.positions_offset), sizeof(meta.positions_offset));
 
                 dictionary[term] = meta;
             }
         }
 
-        // Read entire postings buffer into memory for fast zero-copy decoding
-        {
-            std::ifstream f(index_dir + "/postings.bin", std::ios::binary | std::ios::ate);
-            std::streamsize size = f.tellg();
-            f.seekg(0, std::ios::beg);
-            postings_buf.resize(size);
-            f.read(reinterpret_cast<char*>(postings_buf.data()), size);
-        }
+        // Fast zero-copy memory mapping
+        postings_mmap.map_file(index_dir + "/postings.bin");
+        positions_mmap.map_file(index_dir + "/positions.bin");
     }
 
-    std::vector<std::pair<std::string, float>> retrieve(
-        const std::string& query,
-        int k,
-        float k1 = 1.2f,
-        float b = 0.75f,
-        float delta = 1.0f
+    std::vector<std::pair<uint32_t, float>> raw_retrieve(
+        const std::unordered_map<std::string, float>& query_weights,
+        int top_k,
+        float k1,
+        float b,
+        float delta
     ) {
-        auto tokens = cpp_tokenize(query);
-        if (tokens.empty() || N == 0) return {};
+        if (query_weights.empty() || N == 0 || !postings_mmap.data) return {};
 
-        std::unordered_map<std::string, int> q_counts;
-        for (const auto& t : tokens) q_counts[t]++;
-
-        struct QueryTerm {
-            std::string term;
-            float idf;
-            TermMeta meta;
-        };
-
-        std::vector<QueryTerm> qterms;
-        for (const auto& kv : q_counts) {
-            auto it = dictionary.find(kv.first);
-            if (it != dictionary.end()) {
-                uint32_t df = it->second.df;
-                float idf = std::log(1.0f + (N - df + 0.5f) / (df + 0.5f));
-                qterms.push_back({kv.first, idf, it->second});
-            }
-        }
-
-        if (qterms.empty()) return {};
-
-        // Accumulate scores across candidate documents
         std::unordered_map<uint32_t, float> doc_scores;
 
-        for (const auto& qt : qterms) {
-            const uint8_t* ptr = postings_buf.data() + qt.meta.postings_offset;
+        for (const auto& kv : query_weights) {
+            const std::string& term = kv.first;
+            float q_w = kv.second;
 
-            for (uint32_t b_idx = 0; b_idx < qt.meta.num_blocks; ++b_idx) {
+            auto it = dictionary.find(term);
+            if (it == dictionary.end()) continue;
+
+            uint32_t df = it->second.df;
+            float idf = std::log(1.0f + (N - df + 0.5f) / (df + 0.5f));
+            const uint8_t* ptr = postings_mmap.data + it->second.postings_offset;
+
+            for (uint32_t b_idx = 0; b_idx < it->second.num_blocks; ++b_idx) {
                 const BlockHeader* bh = reinterpret_cast<const BlockHeader*>(ptr);
                 ptr += sizeof(BlockHeader);
 
@@ -325,19 +446,18 @@ public:
 
                     float len_ratio = doc_lens[current_doc] / avg_doc_len;
                     float tf_norm = (tf * (k1 + 1.0f)) / (tf + k1 * (1.0f - b + b * len_ratio));
-                    float score = qt.idf * (tf_norm + delta);
+                    float score = q_w * idf * (tf_norm + delta);
 
                     doc_scores[current_doc] += score;
                 }
             }
         }
 
-        // Top-k min-heap
         using ScoreDoc = std::pair<float, uint32_t>;
         std::priority_queue<ScoreDoc, std::vector<ScoreDoc>, std::greater<ScoreDoc>> pq;
 
         for (const auto& kv : doc_scores) {
-            if (pq.size() < static_cast<size_t>(k)) {
+            if (pq.size() < static_cast<size_t>(top_k)) {
                 pq.push({kv.second, kv.first});
             } else if (kv.second > pq.top().first) {
                 pq.pop();
@@ -345,23 +465,308 @@ public:
             }
         }
 
-        std::vector<std::pair<std::string, float>> results;
+        std::vector<std::pair<uint32_t, float>> results;
         results.reserve(pq.size());
         while (!pq.empty()) {
             auto top = pq.top();
             pq.pop();
-            results.push_back({doc_ids[top.second], top.first});
+            results.push_back({top.second, top.first});
         }
         std::reverse(results.begin(), results.end());
+        return results;
+    }
+
+    std::unordered_map<std::string, uint32_t> get_doc_term_freqs(uint32_t target_doc_id) {
+        std::unordered_map<std::string, uint32_t> freqs;
+        if (!postings_mmap.data) return freqs;
+
+        for (const auto& kv : dictionary) {
+            const std::string& term = kv.first;
+            const uint8_t* ptr = postings_mmap.data + kv.second.postings_offset;
+
+            for (uint32_t b_idx = 0; b_idx < kv.second.num_blocks; ++b_idx) {
+                const BlockHeader* bh = reinterpret_cast<const BlockHeader*>(ptr);
+                ptr += sizeof(BlockHeader);
+
+                const uint8_t* block_bytes = ptr;
+                ptr += bh->byte_size;
+
+                if (bh->max_doc_id < target_doc_id) continue;
+
+                const uint8_t* b_ptr = block_bytes;
+                uint32_t current_doc = 0;
+
+                for (uint32_t i = 0; i < bh->num_postings; ++i) {
+                    uint32_t delta_doc = read_vbyte(b_ptr);
+                    uint32_t tf = read_vbyte(b_ptr);
+                    current_doc += delta_doc;
+
+                    if (current_doc == target_doc_id) {
+                        freqs[term] = tf;
+                        break;
+                    }
+                    if (current_doc > target_doc_id) break;
+                }
+            }
+        }
+        return freqs;
+    }
+
+    std::vector<uint32_t> get_positions(const std::string& term, uint32_t target_doc_id) {
+        auto it = dictionary.find(term);
+        if (it == dictionary.end() || !it->second.has_positions || !positions_mmap.data) return {};
+
+        const uint8_t* ptr = positions_mmap.data + it->second.positions_offset;
+        uint32_t current_doc = 0;
+
+        for (uint32_t i = 0; i < it->second.df; ++i) {
+            uint32_t delta_doc = read_vbyte(ptr);
+            uint32_t num_pos = read_vbyte(ptr);
+            current_doc += delta_doc;
+
+            if (current_doc == target_doc_id) {
+                std::vector<uint32_t> pos_list;
+                pos_list.reserve(num_pos);
+                uint32_t current_pos = 0;
+                for (uint32_t p = 0; p < num_pos; ++p) {
+                    uint32_t delta_pos = read_vbyte(ptr);
+                    current_pos += delta_pos;
+                    pos_list.push_back(current_pos);
+                }
+                return pos_list;
+            } else {
+                for (uint32_t p = 0; p < num_pos; ++p) {
+                    read_vbyte(ptr);
+                }
+            }
+
+            if (current_doc > target_doc_id) break;
+        }
+        return {};
+    }
+
+    std::vector<std::pair<std::string, float>> sdm_rerank(
+        const std::vector<std::string>& query_tokens,
+        const std::vector<std::pair<uint32_t, float>>& candidates,
+        int top_k,
+        float lambda_t = 0.85f,
+        float lambda_o = 0.10f,
+        float lambda_u = 0.05f,
+        uint32_t window_u = 8
+    ) {
+        if (candidates.empty()) return {};
+
+        std::vector<std::pair<std::string, std::string>> bigrams;
+        for (size_t i = 0; i + 1 < query_tokens.size(); ++i) {
+            bigrams.push_back({query_tokens[i], query_tokens[i + 1]});
+        }
+
+        std::vector<std::pair<uint32_t, float>> reranked;
+        reranked.reserve(candidates.size());
+
+        for (const auto& cand : candidates) {
+            uint32_t doc_id = cand.first;
+            float unigram_score = cand.second;
+
+            float ordered_score = 0.0f;
+            float unordered_score = 0.0f;
+
+            for (const auto& bg : bigrams) {
+                auto pos1 = get_positions(bg.first, doc_id);
+                auto pos2 = get_positions(bg.second, doc_id);
+
+                if (pos1.empty() || pos2.empty()) continue;
+
+                uint32_t ordered_cnt = 0;
+                uint32_t unordered_cnt = 0;
+
+                size_t idx1 = 0, idx2 = 0;
+                while (idx1 < pos1.size() && idx2 < pos2.size()) {
+                    long diff = static_cast<long>(pos2[idx2]) - static_cast<long>(pos1[idx1]);
+
+                    if (diff == 1) {
+                        ordered_cnt++;
+                        unordered_cnt++;
+                        idx1++;
+                        idx2++;
+                    } else if (diff > 1 && diff <= static_cast<long>(window_u)) {
+                        unordered_cnt++;
+                        idx2++;
+                    } else if (diff > static_cast<long>(window_u)) {
+                        idx1++;
+                    } else if (diff < 0 && std::abs(diff) <= static_cast<long>(window_u)) {
+                        unordered_cnt++;
+                        idx1++;
+                    } else {
+                        idx2++;
+                    }
+                }
+
+                if (ordered_cnt > 0) ordered_score += std::log(1.0f + ordered_cnt);
+                if (unordered_cnt > 0) unordered_score += std::log(1.0f + unordered_cnt);
+            }
+
+            float final_score = lambda_t * unigram_score + lambda_o * ordered_score + lambda_u * unordered_score;
+            reranked.push_back({doc_id, final_score});
+        }
+
+        std::sort(reranked.begin(), reranked.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+
+        std::vector<std::pair<std::string, float>> results;
+        results.reserve(std::min(static_cast<size_t>(top_k), reranked.size()));
+        for (size_t i = 0; i < std::min(static_cast<size_t>(top_k), reranked.size()); ++i) {
+            results.push_back({doc_ids[reranked[i].first], reranked[i].second});
+        }
+        return results;
+    }
+
+    std::vector<std::pair<std::string, float>> retrieve(
+        const std::string& query,
+        int k,
+        float k1 = 1.2f,
+        float b = 0.75f,
+        float delta = 1.0f,
+        bool use_rm3 = true,
+        int fb_docs = 10,
+        int fb_terms = 25,
+        float alpha = 0.6f,
+        float mu = 1000.0f,
+        bool use_sdm = true,
+        int sdm_rerank_depth = 200
+    ) {
+        auto tokens = cpp_tokenize(query);
+        if (tokens.empty() || N == 0) return {};
+
+        std::unordered_map<std::string, float> q_weights;
+        for (const auto& t : tokens) {
+            q_weights[t] += 1.0f;
+        }
+        float q_size = tokens.size();
+        for (auto& kv : q_weights) {
+            kv.second /= q_size;
+        }
+
+        // 1st Pass Retrieval
+        auto pass1 = raw_retrieve(q_weights, std::max(fb_docs, sdm_rerank_depth), k1, b, delta);
+        if (pass1.empty()) return {};
+
+        std::vector<std::pair<uint32_t, float>> candidate_pool;
+
+        if (!use_rm3 || pass1.size() < 2) {
+            candidate_pool = pass1;
+        } else {
+            // Adaptive Guard: Score Variance Check
+            float score_sum = 0.0f;
+            int num_fb = std::min(static_cast<int>(pass1.size()), fb_docs);
+            for (int i = 0; i < num_fb; ++i) score_sum += pass1[i].second;
+            float score_mean = score_sum / num_fb;
+
+            float score_var = 0.0f;
+            for (int i = 0; i < num_fb; ++i) {
+                float diff = pass1[i].second - score_mean;
+                score_var += diff * diff;
+            }
+            score_var /= num_fb;
+
+            if (score_var < 1e-6f) {
+                candidate_pool = pass1;
+            } else {
+                // RM3 Relevance Model Estimation P(w|R)
+                std::unordered_map<std::string, float> p_w_r;
+                float norm_pass1_scores = 0.0f;
+                for (int i = 0; i < num_fb; ++i) norm_pass1_scores += pass1[i].second;
+                if (norm_pass1_scores <= 0.0f) norm_pass1_scores = 1.0f;
+
+                for (int i = 0; i < num_fb; ++i) {
+                    uint32_t doc_id = pass1[i].first;
+                    float p_d_q = pass1[i].second / norm_pass1_scores;
+                    uint32_t d_len = doc_lens[doc_id];
+
+                    auto term_freqs = get_doc_term_freqs(doc_id);
+
+                    for (const auto& tf_kv : term_freqs) {
+                        const std::string& term = tf_kv.first;
+                        if (STOPWORDS.count(term)) continue;
+
+                        uint32_t tf = tf_kv.second;
+                        auto dict_it = dictionary.find(term);
+                        if (dict_it == dictionary.end()) continue;
+
+                        if (dict_it->second.df > static_cast<uint32_t>(N * 0.05f)) continue;
+
+                        float p_w_c = (total_corpus_tokens > 0) ? (static_cast<float>(dict_it->second.cf) / total_corpus_tokens) : 0.0001f;
+                        float p_w_d = (tf + mu * p_w_c) / (d_len + mu);
+
+                        p_w_r[term] += p_w_d * p_d_q;
+                    }
+                }
+
+                std::vector<std::pair<std::string, float>> sorted_expansion(p_w_r.begin(), p_w_r.end());
+                std::sort(sorted_expansion.begin(), sorted_expansion.end(), [](const auto& a, const auto& b) {
+                    return a.second > b.second;
+                });
+
+                if (sorted_expansion.size() > static_cast<size_t>(fb_terms)) {
+                    sorted_expansion.resize(fb_terms);
+                }
+
+                float rm3_sum = 0.0f;
+                for (const auto& kv : sorted_expansion) rm3_sum += kv.second;
+                if (rm3_sum <= 0.0f) rm3_sum = 1.0f;
+
+                std::unordered_map<std::string, float> final_query_weights;
+                for (const auto& kv : q_weights) {
+                    final_query_weights[kv.first] += alpha * kv.second;
+                }
+
+                for (const auto& kv : sorted_expansion) {
+                    final_query_weights[kv.first] += (1.0f - alpha) * (kv.second / rm3_sum);
+                }
+
+                // 2nd Pass RM3 BM25+ Retrieval
+                candidate_pool = raw_retrieve(final_query_weights, std::max(sdm_rerank_depth, k), k1, b, delta);
+            }
+        }
+
+        // Apply SDM Reranking over candidate pool if enabled and query has > 1 term
+        if (use_sdm && tokens.size() > 1) {
+            if (candidate_pool.size() > static_cast<size_t>(sdm_rerank_depth)) {
+                candidate_pool.resize(sdm_rerank_depth);
+            }
+            return sdm_rerank(tokens, candidate_pool, k);
+        }
+
+        std::vector<std::pair<std::string, float>> results;
+        results.reserve(std::min(static_cast<size_t>(k), candidate_pool.size()));
+        for (size_t i = 0; i < std::min(static_cast<size_t>(k), candidate_pool.size()); ++i) {
+            results.push_back({doc_ids[candidate_pool[i].first], candidate_pool[i].second});
+        }
         return results;
     }
 };
 
 PYBIND11_MODULE(cpp_engine, m) {
-    m.doc() = "C++ High-Performance Block-Max WAND Search Engine";
+    m.doc() = "C++ High-Performance Search Engine with mmap, RM3 & SDM";
     py::class_<CPPEngine>(m, "CPPEngine")
         .def(py::init<>())
         .def("build_index", &CPPEngine::build_index, py::arg("corpus"), py::arg("index_dir"))
         .def("load_index", &CPPEngine::load_index, py::arg("index_dir"))
-        .def("retrieve", &CPPEngine::retrieve, py::arg("query"), py::arg("k"), py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f);
+        .def(
+            "retrieve",
+            &CPPEngine::retrieve,
+            py::arg("query"),
+            py::arg("k"),
+            py::arg("k1") = 1.2f,
+            py::arg("b") = 0.75f,
+            py::arg("delta") = 1.0f,
+            py::arg("use_rm3") = true,
+            py::arg("fb_docs") = 10,
+            py::arg("fb_terms") = 25,
+            py::arg("alpha") = 0.6f,
+            py::arg("mu") = 1000.0f,
+            py::arg("use_sdm") = true,
+            py::arg("sdm_rerank_depth") = 200
+        );
 }
