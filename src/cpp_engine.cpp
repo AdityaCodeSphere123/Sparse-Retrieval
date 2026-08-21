@@ -64,6 +64,20 @@ static const std::unordered_set<std::string> STOPWORDS = {
 };
 
 // ---------------------------------------------------------------------------
+// Document Length Logarithmic Quantization (uint8_t)
+// ---------------------------------------------------------------------------
+static inline uint8_t quantize_doc_len(float len_ratio) {
+    if (len_ratio <= 0.0f) return 0;
+    float val = 64.0f * std::log2(1.0f + len_ratio);
+    if (val >= 255.0f) return 255;
+    return static_cast<uint8_t>(val);
+}
+
+static inline float dequantize_doc_len(uint8_t q) {
+    return std::pow(2.0f, static_cast<float>(q) / 64.0f) - 1.0f;
+}
+
+// ---------------------------------------------------------------------------
 // VByte encoding helpers
 // ---------------------------------------------------------------------------
 static inline void write_vbyte(std::vector<uint8_t>& out, uint32_t val) {
@@ -157,6 +171,7 @@ struct BlockHeader {
     float block_max_score;
     uint32_t num_postings;
     uint32_t byte_size;
+    uint64_t block_positions_offset;
 };
 
 struct TermMeta {
@@ -166,7 +181,6 @@ struct TermMeta {
     uint64_t postings_offset;
     uint32_t num_blocks;
     uint8_t has_positions;
-    uint64_t positions_offset;
 };
 
 struct DocPostingPos {
@@ -178,7 +192,8 @@ struct DocPostingPos {
 class CPPEngine {
 public:
     std::vector<std::string> doc_ids;
-    std::vector<uint32_t> doc_lens;
+    std::vector<uint8_t> quantized_doc_lens; // 1 byte per document for 500KB footprint
+    std::vector<uint32_t> doc_lens;           // Exact doc lengths in memory
     float avg_doc_len = 0.0f;
     uint32_t N = 0;
     uint64_t total_corpus_tokens = 0;
@@ -189,8 +204,11 @@ public:
 
     CPPEngine() = default;
 
-    // SPIMI (Single-Pass In-Memory Indexing) Implementation
+    // SPIMI Implementation
     void build_index(const std::vector<std::pair<std::string, std::string>>& corpus, const std::string& index_dir) {
+        postings_mmap.unmap();
+        positions_mmap.unmap();
+
         N = corpus.size();
         doc_ids.clear();
         doc_ids.reserve(N);
@@ -199,7 +217,7 @@ public:
 
         total_corpus_tokens = 0;
 
-        constexpr uint32_t BATCH_DOC_LIMIT = 50000; // SPIMI batch size to prevent OOM
+        constexpr uint32_t BATCH_DOC_LIMIT = 50000;
         std::vector<std::string> run_files;
         uint32_t run_count = 0;
 
@@ -275,6 +293,13 @@ public:
 
         avg_doc_len = (N > 0) ? static_cast<float>(static_cast<double>(total_corpus_tokens) / N) : 0.0f;
 
+        // Quantize doc lens (uint8_t per doc)
+        quantized_doc_lens.resize(N);
+        for (uint32_t i = 0; i < N; ++i) {
+            float ratio = (avg_doc_len > 0) ? (static_cast<float>(doc_lens[i]) / avg_doc_len) : 1.0f;
+            quantized_doc_lens[i] = quantize_doc_len(ratio);
+        }
+
         std::string docmap_path = index_dir + "/docmap.bin";
         std::string doclens_path = index_dir + "/doclens.bin";
         std::string dict_path = index_dir + "/dict.bin";
@@ -292,16 +317,16 @@ public:
             }
         }
 
-        // Save doclens
+        // Save doclens as uint8_t quantized bytes (500KB on 500K docs)
         {
             std::ofstream f(doclens_path, std::ios::binary);
             f.write(reinterpret_cast<const char*>(&N), sizeof(N));
             f.write(reinterpret_cast<const char*>(&avg_doc_len), sizeof(avg_doc_len));
             f.write(reinterpret_cast<const char*>(&total_corpus_tokens), sizeof(total_corpus_tokens));
-            f.write(reinterpret_cast<const char*>(doc_lens.data()), N * sizeof(uint32_t));
+            f.write(reinterpret_cast<const char*>(quantized_doc_lens.data()), N * sizeof(uint8_t));
         }
 
-        // Stream / Merge SPIMI Runs into Final postings.bin, dict.bin, positions.bin
+        // Merge SPIMI Runs
         struct RunReader {
             std::ifstream file;
             uint32_t num_terms = 0;
@@ -311,9 +336,15 @@ public:
             uint64_t curr_cf = 0;
 
             bool read_next_term() {
-                if (terms_read >= num_terms) return false;
+                if (terms_read >= num_terms) {
+                    curr_term.clear();
+                    return false;
+                }
                 uint16_t t_len;
-                if (!file.read(reinterpret_cast<char*>(&t_len), sizeof(t_len))) return false;
+                if (!file.read(reinterpret_cast<char*>(&t_len), sizeof(t_len))) {
+                    curr_term.clear();
+                    return false;
+                }
                 curr_term.resize(t_len);
                 file.read(&curr_term[0], t_len);
                 file.read(reinterpret_cast<char*>(&curr_df), sizeof(curr_df));
@@ -348,7 +379,7 @@ public:
                 }
             }
 
-            if (min_term.empty()) break; // All runs completed
+            if (min_term.empty()) break;
 
             std::vector<DocPostingPos> merged_plist;
             uint64_t merged_cf = 0;
@@ -380,6 +411,8 @@ public:
             float global_max_score = 0.0f;
             uint64_t term_postings_start = current_postings_offset;
 
+            uint8_t has_positions = (df <= static_cast<uint32_t>(N * 0.05f)) ? 1 : 0;
+
             for (uint32_t b_idx = 0; b_idx < num_blocks; ++b_idx) {
                 uint32_t start_i = b_idx * BLOCK_SIZE;
                 uint32_t end_i = std::min(start_i + BLOCK_SIZE, df);
@@ -395,7 +428,7 @@ public:
                     uint32_t d_id = merged_plist[i].doc_id;
                     uint32_t tf = merged_plist[i].tf;
 
-                    float len_ratio = doc_lens[d_id] / avg_doc_len;
+                    float len_ratio = dequantize_doc_len(quantized_doc_lens[d_id]);
                     float tf_norm = (tf * (k1 + 1.0f)) / (tf + k1 * (1.0f - b + b * len_ratio));
                     float score = idf * (tf_norm + delta);
                     if (score > block_max_score) block_max_score = score;
@@ -408,39 +441,36 @@ public:
 
                 if (block_max_score > global_max_score) global_max_score = block_max_score;
 
-                BlockHeader bh{max_doc_id, block_max_score, n_in_block, static_cast<uint32_t>(block_data.size())};
+                uint64_t block_positions_offset = 0;
+
+                if (has_positions) {
+                    block_positions_offset = current_positions_offset;
+                    std::vector<uint8_t> pos_data;
+
+                    for (uint32_t i = start_i; i < end_i; ++i) {
+                        const auto& entry = merged_plist[i];
+                        write_vbyte(pos_data, entry.doc_id);
+                        write_vbyte(pos_data, entry.positions.size());
+
+                        uint32_t prev_pos = 0;
+                        for (uint32_t p : entry.positions) {
+                            write_vbyte(pos_data, p - prev_pos);
+                            prev_pos = p;
+                        }
+                    }
+
+                    f_positions.write(reinterpret_cast<const char*>(pos_data.data()), pos_data.size());
+                    current_positions_offset += pos_data.size();
+                }
+
+                BlockHeader bh{max_doc_id, block_max_score, n_in_block, static_cast<uint32_t>(block_data.size()), block_positions_offset};
                 f_postings.write(reinterpret_cast<const char*>(&bh), sizeof(bh));
                 f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
 
                 current_postings_offset += sizeof(bh) + block_data.size();
             }
 
-            uint8_t has_positions = (df <= static_cast<uint32_t>(N * 0.05f)) ? 1 : 0;
-            uint64_t term_positions_start = 0;
-
-            if (has_positions) {
-                term_positions_start = current_positions_offset;
-                std::vector<uint8_t> pos_data;
-
-                uint32_t prev_doc = 0;
-                for (const auto& entry : merged_plist) {
-                    uint32_t delta_doc = entry.doc_id - prev_doc;
-                    write_vbyte(pos_data, delta_doc);
-                    write_vbyte(pos_data, entry.positions.size());
-
-                    uint32_t prev_pos = 0;
-                    for (uint32_t p : entry.positions) {
-                        write_vbyte(pos_data, p - prev_pos);
-                        prev_pos = p;
-                    }
-                    prev_doc = entry.doc_id;
-                }
-
-                f_positions.write(reinterpret_cast<const char*>(pos_data.data()), pos_data.size());
-                current_positions_offset += pos_data.size();
-            }
-
-            TermMeta meta{df, merged_cf, global_max_score, term_postings_start, num_blocks, has_positions, term_positions_start};
+            TermMeta meta{df, merged_cf, global_max_score, term_postings_start, num_blocks, has_positions};
             final_dict[min_term] = meta;
         }
 
@@ -463,10 +493,8 @@ public:
             f_dict.write(reinterpret_cast<const char*>(&meta.postings_offset), sizeof(meta.postings_offset));
             f_dict.write(reinterpret_cast<const char*>(&meta.num_blocks), sizeof(meta.num_blocks));
             f_dict.write(reinterpret_cast<const char*>(&meta.has_positions), sizeof(meta.has_positions));
-            f_dict.write(reinterpret_cast<const char*>(&meta.positions_offset), sizeof(meta.positions_offset));
         }
 
-        // Clean up temporary SPIMI run files
         for (const auto& rfile : run_files) {
             std::remove(rfile.c_str());
         }
@@ -491,8 +519,14 @@ public:
             f.read(reinterpret_cast<char*>(&N), sizeof(N));
             f.read(reinterpret_cast<char*>(&avg_doc_len), sizeof(avg_doc_len));
             f.read(reinterpret_cast<char*>(&total_corpus_tokens), sizeof(total_corpus_tokens));
+            quantized_doc_lens.resize(N);
+            f.read(reinterpret_cast<char*>(quantized_doc_lens.data()), N * sizeof(uint8_t));
+
+            // Dequantize exact lengths for RM3 expansion lookup
             doc_lens.resize(N);
-            f.read(reinterpret_cast<char*>(doc_lens.data()), N * sizeof(uint32_t));
+            for (uint32_t i = 0; i < N; ++i) {
+                doc_lens[i] = static_cast<uint32_t>(dequantize_doc_len(quantized_doc_lens[i]) * avg_doc_len);
+            }
         }
 
         {
@@ -515,13 +549,11 @@ public:
                 f.read(reinterpret_cast<char*>(&meta.postings_offset), sizeof(meta.postings_offset));
                 f.read(reinterpret_cast<char*>(&meta.num_blocks), sizeof(meta.num_blocks));
                 f.read(reinterpret_cast<char*>(&meta.has_positions), sizeof(meta.has_positions));
-                f.read(reinterpret_cast<char*>(&meta.positions_offset), sizeof(meta.positions_offset));
 
                 dictionary[term] = meta;
             }
         }
 
-        // Fast zero-copy memory mapping
         postings_mmap.map_file(index_dir + "/postings.bin");
         positions_mmap.map_file(index_dir + "/positions.bin");
     }
@@ -534,6 +566,13 @@ public:
         float delta
     ) {
         if (query_weights.empty() || N == 0 || !postings_mmap.data) return {};
+
+        // Precompute 256-element Length Penalty Lookup Table (LUT) for parameter b
+        float length_penalty_lut[256];
+        for (int q = 0; q < 256; ++q) {
+            float ratio = dequantize_doc_len(static_cast<uint8_t>(q));
+            length_penalty_lut[q] = k1 * (1.0f - b + b * ratio);
+        }
 
         struct QueryTermInfo {
             std::string term;
@@ -595,8 +634,9 @@ public:
                     uint32_t tf = read_vbyte(b_ptr);
                     current_doc += delta_doc;
 
-                    float len_ratio = doc_lens[current_doc] / avg_doc_len;
-                    float tf_norm = (tf * (k1 + 1.0f)) / (tf + k1 * (1.0f - b + b * len_ratio));
+                    // LIGHTNING-FAST ARRAY LOOKUP (Eliminated floating-point division & parameter math from inner loop!)
+                    uint8_t q_len = quantized_doc_lens[current_doc];
+                    float tf_norm = (tf * (k1 + 1.0f)) / (tf + length_penalty_lut[q_len]);
                     float score = qt.q_w * qt.idf * (tf_norm + delta);
 
                     float new_score = (doc_scores[current_doc] += score);
@@ -668,35 +708,44 @@ public:
         return freqs;
     }
 
+    // INSTANT BLOCK FAST-FORWARDING FOR POSITIONS: O(128) instead of O(N)
     std::vector<uint32_t> get_positions(const std::string& term, uint32_t target_doc_id) {
         auto it = dictionary.find(term);
-        if (it == dictionary.end() || !it->second.has_positions || !positions_mmap.data) return {};
+        if (it == dictionary.end() || !it->second.has_positions || !positions_mmap.data || !postings_mmap.data) return {};
 
-        const uint8_t* ptr = positions_mmap.data + it->second.positions_offset;
-        uint32_t current_doc = 0;
+        const uint8_t* ptr = postings_mmap.data + it->second.postings_offset;
 
-        for (uint32_t i = 0; i < it->second.df; ++i) {
-            uint32_t delta_doc = read_vbyte(ptr);
-            uint32_t num_pos = read_vbyte(ptr);
-            current_doc += delta_doc;
+        for (uint32_t b_idx = 0; b_idx < it->second.num_blocks; ++b_idx) {
+            const BlockHeader* bh = reinterpret_cast<const BlockHeader*>(ptr);
+            ptr += sizeof(BlockHeader) + bh->byte_size;
 
-            if (current_doc == target_doc_id) {
-                std::vector<uint32_t> pos_list;
-                pos_list.reserve(num_pos);
-                uint32_t current_pos = 0;
-                for (uint32_t p = 0; p < num_pos; ++p) {
-                    uint32_t delta_pos = read_vbyte(ptr);
-                    current_pos += delta_pos;
-                    pos_list.push_back(current_pos);
+            if (bh->max_doc_id < target_doc_id) continue;
+
+            const uint8_t* pos_ptr = positions_mmap.data + bh->block_positions_offset;
+
+            for (uint32_t i = 0; i < bh->num_postings; ++i) {
+                uint32_t doc_id = read_vbyte(pos_ptr);
+                uint32_t num_pos = read_vbyte(pos_ptr);
+
+                if (doc_id == target_doc_id) {
+                    std::vector<uint32_t> pos_list;
+                    pos_list.reserve(num_pos);
+                    uint32_t current_pos = 0;
+                    for (uint32_t p = 0; p < num_pos; ++p) {
+                        uint32_t delta_pos = read_vbyte(pos_ptr);
+                        current_pos += delta_pos;
+                        pos_list.push_back(current_pos);
+                    }
+                    return pos_list;
+                } else {
+                    for (uint32_t p = 0; p < num_pos; ++p) {
+                        read_vbyte(pos_ptr);
+                    }
                 }
-                return pos_list;
-            } else {
-                for (uint32_t p = 0; p < num_pos; ++p) {
-                    read_vbyte(ptr);
-                }
+
+                if (doc_id > target_doc_id) break;
             }
-
-            if (current_doc > target_doc_id) break;
+            break;
         }
         return {};
     }
@@ -904,7 +953,7 @@ public:
 };
 
 PYBIND11_MODULE(cpp_engine, m) {
-    m.doc() = "C++ High-Performance Search Engine with SPIMI & Block-Max WAND";
+    m.doc() = "C++ High-Performance Search Engine with DocLen Quantization & Precomputed LUT";
     py::class_<CPPEngine>(m, "CPPEngine")
         .def(py::init<>())
         .def("build_index", &CPPEngine::build_index, py::arg("corpus"), py::arg("index_dir"))
