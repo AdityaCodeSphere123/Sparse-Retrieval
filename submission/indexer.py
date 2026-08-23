@@ -35,9 +35,28 @@ from typing import Dict, List, Tuple
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
+def s_stem(word: str) -> str:
+    """Light S-stemmer (plural stripping only)."""
+    if len(word) <= 3:
+        return word
+    if not word.endswith("s"):
+        return word
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 3 and word.endswith("es"):
+        third_last = word[-3]
+        if third_last in ("s", "x", "z") or word.endswith("ches") or word.endswith("shes"):
+            return word[:-2]
+        return word[:-1]
+    if word.endswith("s") and word[-2] not in ("s", "u"):
+        return word[:-1]
+    return word
+
+
 def tokenize(text: str) -> List[str]:
-    """Lowercase, alphanumeric-only tokenization."""
-    return _TOKEN_RE.findall(text.lower())
+    """Lowercase, alphanumeric-only tokenization with S-stemming."""
+    raw_tokens = _TOKEN_RE.findall(text.lower())
+    return [s_stem(t) for t in raw_tokens]
 
 
 class InvertedIndex:

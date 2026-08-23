@@ -53,13 +53,16 @@ def run_grid_search(corpus_path: str, queries_path: str, qrels_path: str):
                 results_grid[i, j] = ndcg
                 print(f"k1={k1:.1f}, b={b:.2f} -> nDCG@10 = {ndcg:.4f}")
 
-    # Find highest-scoring plateau center
+    # Find highest-scoring plateau center (centroid of nDCG >= max_val - 0.005)
     max_val = np.max(results_grid)
     plateau_mask = results_grid >= (max_val - 0.005)
-    best_i, best_j = np.unravel_index(np.argmax(results_grid), results_grid.shape)
 
-    best_k1 = float(k1_grid[best_i])
-    best_b = float(b_grid[best_j])
+    plateau_indices = np.argwhere(plateau_mask)
+    mean_i = int(np.round(np.mean(plateau_indices[:, 0])))
+    mean_j = int(np.round(np.mean(plateau_indices[:, 1])))
+
+    best_k1 = float(k1_grid[mean_i])
+    best_b = float(b_grid[mean_j])
 
     print("\n==========================================")
     print(f"Max nDCG@10: {max_val:.4f}")

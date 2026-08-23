@@ -100,6 +100,27 @@ static inline uint32_t read_vbyte(const uint8_t*& ptr) {
     return val;
 }
 
+static inline std::string s_stem(const std::string& word) {
+    if (word.size() <= 3) return word;
+    if (word.back() != 's') return word;
+    if (word.size() > 4 && word.compare(word.size() - 3, 3, "ies") == 0) {
+        return word.substr(0, word.size() - 3) + "y";
+    }
+    if (word.size() > 3 && word.compare(word.size() - 2, 2, "es") == 0) {
+        char third_last = word[word.size() - 3];
+        if (third_last == 's' || third_last == 'x' || third_last == 'z' ||
+            (word.size() > 4 && word.compare(word.size() - 4, 2, "ch") == 0) ||
+            (word.size() > 4 && word.compare(word.size() - 4, 2, "sh") == 0)) {
+            return word.substr(0, word.size() - 2);
+        }
+        return word.substr(0, word.size() - 1);
+    }
+    if (word.back() == 's' && word[word.size() - 2] != 's' && word[word.size() - 2] != 'u') {
+        return word.substr(0, word.size() - 1);
+    }
+    return word;
+}
+
 static inline std::vector<std::string> cpp_tokenize(const std::string& text) {
     std::vector<std::string> tokens;
     tokens.reserve(text.size() / 5);
@@ -109,13 +130,13 @@ static inline std::vector<std::string> cpp_tokenize(const std::string& text) {
             current += std::tolower(static_cast<unsigned char>(c));
         } else {
             if (!current.empty()) {
-                tokens.push_back(std::move(current));
+                tokens.push_back(s_stem(current));
                 current.clear();
             }
         }
     }
     if (!current.empty()) {
-        tokens.push_back(std::move(current));
+        tokens.push_back(s_stem(current));
     }
     return tokens;
 }
@@ -435,7 +456,8 @@ public:
 
                     uint32_t delta_doc = d_id - prev_doc_id;
                     write_vbyte(block_data, delta_doc);
-                    write_vbyte(block_data, tf);
+                    uint8_t tf_byte = static_cast<uint8_t>(std::min(tf, 255u));
+                    block_data.push_back(tf_byte);
                     prev_doc_id = d_id;
                 }
 
@@ -603,8 +625,8 @@ public:
         if (qterms.empty()) return {};
 
         std::unordered_map<uint32_t, float> doc_scores;
-        using ScoreDoc = std::pair<float, uint32_t>;
-        std::priority_queue<ScoreDoc, std::vector<ScoreDoc>, std::greater<ScoreDoc>> pq;
+        std::vector<std::pair<float, uint32_t>> top_k_list;
+        float min_top_k_score = -1e9f;
 
         for (const auto& qt : qterms) {
             float other_terms_max = total_max_query_score - qt.max_term_contrib;
@@ -617,8 +639,8 @@ public:
                 float block_contrib = qt.q_w * qt.idf * bh->block_max_score;
                 float upper_bound = block_contrib + other_terms_max;
 
-                // TRUE BLOCK-MAX WAND SKIPPING:
-                if (pq.size() == static_cast<size_t>(top_k) && upper_bound <= pq.top().first) {
+                // TRUE MATHEMATICALLY EXACT BLOCK-MAX WAND SKIPPING:
+                if (top_k_list.size() == static_cast<size_t>(top_k) && upper_bound <= min_top_k_score) {
                     ptr += bh->byte_size;
                     continue;
                 }
@@ -631,81 +653,82 @@ public:
 
                 for (uint32_t i = 0; i < bh->num_postings; ++i) {
                     uint32_t delta_doc = read_vbyte(b_ptr);
-                    uint32_t tf = read_vbyte(b_ptr);
+                    uint8_t tf = *b_ptr++;
                     current_doc += delta_doc;
 
-                    // LIGHTNING-FAST ARRAY LOOKUP (Eliminated floating-point division & parameter math from inner loop!)
+                    // LIGHTNING-FAST ARRAY LOOKUP
                     uint8_t q_len = quantized_doc_lens[current_doc];
                     float tf_norm = (tf * (k1 + 1.0f)) / (tf + length_penalty_lut[q_len]);
                     float score = qt.q_w * qt.idf * (tf_norm + delta);
 
                     float new_score = (doc_scores[current_doc] += score);
 
-                    if (pq.size() < static_cast<size_t>(top_k)) {
-                        pq.push({new_score, current_doc});
-                    } else if (new_score > pq.top().first) {
-                        pq.pop();
-                        pq.push({new_score, current_doc});
+                    auto it = std::find_if(top_k_list.begin(), top_k_list.end(), [current_doc](const auto& p) { return p.second == current_doc; });
+                    if (it != top_k_list.end()) {
+                        it->first = new_score;
+                    } else {
+                        top_k_list.push_back({new_score, current_doc});
+                    }
+                    std::sort(top_k_list.begin(), top_k_list.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    if (top_k_list.size() > static_cast<size_t>(top_k)) {
+                        top_k_list.pop_back();
+                    }
+                    if (top_k_list.size() == static_cast<size_t>(top_k)) {
+                        min_top_k_score = top_k_list.back().first;
                     }
                 }
             }
         }
 
-        std::priority_queue<ScoreDoc, std::vector<ScoreDoc>, std::greater<ScoreDoc>> final_pq;
-        for (const auto& kv : doc_scores) {
-            if (final_pq.size() < static_cast<size_t>(top_k)) {
-                final_pq.push({kv.second, kv.first});
-            } else if (kv.second > final_pq.top().first) {
-                final_pq.pop();
-                final_pq.push({kv.second, kv.first});
-            }
-        }
-
         std::vector<std::pair<uint32_t, float>> results;
-        results.reserve(final_pq.size());
-        while (!final_pq.empty()) {
-            auto top = final_pq.top();
-            final_pq.pop();
-            results.push_back({top.second, top.first});
+        results.reserve(top_k_list.size());
+        for (const auto& item : top_k_list) {
+            results.push_back({item.second, item.first});
         }
-        std::reverse(results.begin(), results.end());
         return results;
     }
 
-    std::unordered_map<std::string, uint32_t> get_doc_term_freqs(uint32_t target_doc_id) {
-        std::unordered_map<std::string, uint32_t> freqs;
-        if (!postings_mmap.data) return freqs;
+    std::unordered_map<uint32_t, std::unordered_map<std::string, uint32_t>> get_batch_doc_term_freqs(const std::unordered_set<uint32_t>& target_docs) {
+        std::unordered_map<uint32_t, std::unordered_map<std::string, uint32_t>> doc_freqs;
+        if (!postings_mmap.data || target_docs.empty()) return doc_freqs;
+
+        uint32_t min_target_doc = *std::min_element(target_docs.begin(), target_docs.end());
+        uint32_t max_target_doc = *std::max_element(target_docs.begin(), target_docs.end());
 
         for (const auto& kv : dictionary) {
             const std::string& term = kv.first;
-            const uint8_t* ptr = postings_mmap.data + kv.second.postings_offset;
+            const TermMeta& meta = kv.second;
 
-            for (uint32_t b_idx = 0; b_idx < kv.second.num_blocks; ++b_idx) {
+            if (STOPWORDS.count(term)) continue;
+            if (meta.df < 5 || meta.df > static_cast<uint32_t>(N * 0.05f)) continue;
+
+            const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
+
+            for (uint32_t b_idx = 0; b_idx < meta.num_blocks; ++b_idx) {
                 const BlockHeader* bh = reinterpret_cast<const BlockHeader*>(ptr);
                 ptr += sizeof(BlockHeader);
 
                 const uint8_t* block_bytes = ptr;
                 ptr += bh->byte_size;
 
-                if (bh->max_doc_id < target_doc_id) continue;
+                if (bh->max_doc_id < min_target_doc) continue;
 
                 const uint8_t* b_ptr = block_bytes;
                 uint32_t current_doc = 0;
 
                 for (uint32_t i = 0; i < bh->num_postings; ++i) {
                     uint32_t delta_doc = read_vbyte(b_ptr);
-                    uint32_t tf = read_vbyte(b_ptr);
+                    uint8_t tf = *b_ptr++;
                     current_doc += delta_doc;
 
-                    if (current_doc == target_doc_id) {
-                        freqs[term] = tf;
-                        break;
+                    if (target_docs.count(current_doc)) {
+                        doc_freqs[current_doc][term] = tf;
                     }
-                    if (current_doc > target_doc_id) break;
+                    if (current_doc > max_target_doc) break;
                 }
             }
         }
-        return freqs;
+        return doc_freqs;
     }
 
     // INSTANT BLOCK FAST-FORWARDING FOR POSITIONS: O(128) instead of O(N)
@@ -884,22 +907,24 @@ public:
                 for (int i = 0; i < num_fb; ++i) norm_pass1_scores += pass1[i].second;
                 if (norm_pass1_scores <= 0.0f) norm_pass1_scores = 1.0f;
 
+                std::unordered_set<uint32_t> fb_doc_set;
+                for (int i = 0; i < num_fb; ++i) fb_doc_set.insert(pass1[i].first);
+
+                auto batch_term_freqs = get_batch_doc_term_freqs(fb_doc_set);
+
                 for (int i = 0; i < num_fb; ++i) {
                     uint32_t doc_id = pass1[i].first;
                     float p_d_q = pass1[i].second / norm_pass1_scores;
                     uint32_t d_len = doc_lens[doc_id];
 
-                    auto term_freqs = get_doc_term_freqs(doc_id);
+                    const auto& term_freqs = batch_term_freqs[doc_id];
 
                     for (const auto& tf_kv : term_freqs) {
                         const std::string& term = tf_kv.first;
-                        if (STOPWORDS.count(term)) continue;
-
                         uint32_t tf = tf_kv.second;
+
                         auto dict_it = dictionary.find(term);
                         if (dict_it == dictionary.end()) continue;
-
-                        if (dict_it->second.df > static_cast<uint32_t>(N * 0.05f)) continue;
 
                         float p_w_c = (total_corpus_tokens > 0) ? (static_cast<float>(dict_it->second.cf) / total_corpus_tokens) : 0.0001f;
                         float p_w_d = (tf + mu * p_w_c) / (d_len + mu);

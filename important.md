@@ -105,3 +105,30 @@ The index uses a compact 5-file binary layout:
   ```bash
   .venv/bin/python scripts/error_analysis.py
   ```
+
+---
+
+## 4. Oral Defense Preparation & Theoretical Grounding
+
+> [!IMPORTANT]
+> The oral defense accounts for 50% of the leaderboard grade and tests deep conceptual understanding through live parameter perturbations.
+
+### Q1: Why does raising $k_1$ help on short/focused documents and hurt on long/verbose documents?
+- **Mathematical Role of $k_1$**: $k_1$ controls term frequency saturation. The term weight component is $\frac{\text{tf} \cdot (k_1 + 1)}{\text{tf} + K}$. As $\text{tf} \to \infty$, this score term approaches $k_1 + 1$.
+- **Short/Focused Documents**: Multiple occurrences of a query keyword in a short document represent intentional, concentrated topical focus. A higher $k_1$ (e.g., $1.6 - 2.0$) delays saturation, allowing documents with higher keyword repetitions to earn significantly higher scores.
+- **Long/Verbose Documents**: Long news articles or web pages frequently repeat words due to verbosity, background context, or keyword stuffing. High $k_1$ causes scores to scale excessively with repetition, allowing long noisy documents to dominate top ranks. A lower $k_1$ (e.g., $0.6 - 1.2$) saturates term frequency rapidly (so $\text{tf}=2$ vs $\text{tf}=10$ gives almost identical score), preventing verbosity from overpowering relevance.
+
+### Q2: What do $b=0$ and $b=1$ actually mean in BM25 length normalization?
+- **Document Length Normalization Penalty**: $K = k_1 \cdot \left(1 - b + b \cdot \frac{|D|}{\text{avgdl}}\right)$.
+- **$b=1.0$ (Full Length Normalization)**: Assumes document length variations are purely due to verbosity. A document 3x longer than average must contain 3x more keyword occurrences to achieve the same score contribution as an average-length document.
+- **$b=0.0$ (No Length Normalization)**: Ignores document length entirely ($K = k_1$). Assumes long documents cover multiple topics (scope hypothesis) and should not be penalized for overall length.
+
+### Q3: Why pick the center of the parameter plateau instead of the exact argmax?
+- Single-point `argmax` on a small dev topic set overfits to topic-specific evaluation noise.
+- Selecting the centroid (center of mass) of the top-scoring parameter region ($\text{nDCG} \ge \text{max} - 0.005$) chooses a stable parameter pair $(k_1, b)$ that generalizes to unseen held-out test topics.
+
+---
+
+## 5. AI Use Disclosure
+
+This conversation and codebase development utilized Antigravity AI assistant for architecture design, C++ engine optimization (VByte encoding, mmap zero-copy, Block-Max WAND, RM3 PRF, SDM reranking, S-stemming), and test verification.
