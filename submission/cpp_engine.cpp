@@ -48,7 +48,8 @@ static constexpr uint32_t BLOCK_SIZE            = 128;   // postings per block
 static constexpr uint32_t FWD_TERMS_PER_DOC     = 32;    // RM3 forward index width
 static constexpr uint32_t FWD_CANDIDATES        = 64;    // pre-df-filter margin
 static constexpr uint32_t MAX_POSITIONS_PER_DOC = 64;    // truncate long position lists
-static constexpr float    POSITIONS_DF_FRACTION = 0.05f; // store positions if df <= this * N
+static constexpr float    POSITIONS_DF_FRACTION = 0.0f;   // positions off
+static constexpr float    RM3_DF_FRACTION       = 0.05f;  // forward-index df ceiling
 static constexpr uint32_t SPIMI_BATCH_DOCS      = 50000;
 
 // ---------------------------------------------------------------------------
@@ -1013,7 +1014,7 @@ public:
 
         const uint32_t df_min = 5;
         const uint32_t df_max = std::max<uint32_t>(
-            df_min, static_cast<uint32_t>(POSITIONS_DF_FRACTION * static_cast<float>(N)));
+            df_min, static_cast<uint32_t>(RM3_DF_FRACTION * static_cast<float>(N)));
 
         uint32_t offset = 0;
         f_off.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
