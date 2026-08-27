@@ -62,7 +62,19 @@ PARAMS = dict(
     lambda_o=0.10,
     lambda_u=0.05,
     window_u=8,
+    sdm_normalise=True,
 )
+
+# The ANALYSIS CHAIN (stemmer + stopwords) is not here because it is not a
+# query-time choice: it is baked into the index at build time and read back
+# out of meta.bin, so query tokenisation always matches index tokenisation.
+# Set it with environment variables when build_index() runs:
+#
+#     IR_STEMMER=2   0 = none, 1 = light S-stemmer, 2 = Porter   (default 2)
+#     IR_STOPWORDS=1 0 = keep stopwords, 1 = remove them          (default 1)
+#
+# `python -m scripts.tune --sweep analysis` rebuilds and scores all four
+# combinations for you.
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
@@ -100,6 +112,9 @@ def load_index(index_dir: str) -> None:
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs, highest score first."""
+    # NOTE: PARAMS below are the textbook defaults and are almost certainly
+    # NOT the right values for this corpus. Run scripts/tune.py and paste the
+    # winning configuration in before submitting.
     if HAS_CPP:
         if _CPP_ENGINE is None:
             raise RuntimeError("load_index() must be called before retrieve()")

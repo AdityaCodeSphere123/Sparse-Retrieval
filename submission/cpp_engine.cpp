@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <sstream>
 #include <cctype>
 
@@ -153,45 +154,286 @@ static inline uint64_t read_vbyte64(const uint8_t*& ptr) {
 }
 
 // ---------------------------------------------------------------------------
-// Tokenisation: lowercase, alphanumeric runs, light S-stemmer (plural strip).
-// Must stay identical between index build and query time.
+// Tokenisation.
+//
+// Three things happen per token, in this order, and the order matters:
+//   1. lowercase + split on non-alphanumerics
+//   2. stopword test, on the RAW lowercased token
+//   3. stemming
+//
+// Step 2 must precede step 3: Porter maps "was" -> "wa", "this" -> "thi",
+// "his" -> "hi", so a stopword list checked after stemming silently stops
+// matching. Positions are the ORIGINAL token offsets and are assigned before
+// any removal, so dropping stopwords does not corrupt proximity distances.
+//
+// Whichever configuration built the index is recorded in meta.bin and reused
+// at query time, because query tokenisation must match index tokenisation
+// exactly or nothing retrieves.
 // ---------------------------------------------------------------------------
+
+
+class PorterStemmer {
+    std::string b;
+    int k = 0;   // index of the last character of the word
+    int j = 0;   // general offset used by the step helpers
+
+    bool cons(int i) const {
+        switch (b[i]) {
+            case 'a': case 'e': case 'i': case 'o': case 'u': return false;
+            case 'y': return (i == 0) ? true : !cons(i - 1);
+            default: return true;
+        }
+    }
+
+    // m() measures the number of vowel-consonant sequences in b[0..j]
+    int m() const {
+        int n = 0, i = 0;
+        for (;;) {
+            if (i > j) return n;
+            if (!cons(i)) break;
+            i++;
+        }
+        i++;
+        for (;;) {
+            for (;;) {
+                if (i > j) return n;
+                if (cons(i)) break;
+                i++;
+            }
+            i++;
+            n++;
+            for (;;) {
+                if (i > j) return n;
+                if (!cons(i)) break;
+                i++;
+            }
+            i++;
+        }
+    }
+
+    bool vowelinstem() const {
+        for (int i = 0; i <= j; i++) if (!cons(i)) return true;
+        return false;
+    }
+
+    bool doublec(int i) const {
+        if (i < 1) return false;
+        if (b[i] != b[i - 1]) return false;
+        return cons(i);
+    }
+
+    // cvc(i): consonant-vowel-consonant where the final consonant is not w, x or y
+    bool cvc(int i) const {
+        if (i < 2 || !cons(i) || cons(i - 1) || !cons(i - 2)) return false;
+        char ch = b[i];
+        if (ch == 'w' || ch == 'x' || ch == 'y') return false;
+        return true;
+    }
+
+    bool ends(const char* s) {
+        int len = static_cast<int>(std::strlen(s));
+        if (len > k + 1) return false;
+        if (b.compare(k - len + 1, len, s) != 0) return false;
+        j = k - len;
+        return true;
+    }
+
+    void setto(const char* s) {
+        int len = static_cast<int>(std::strlen(s));
+        b.replace(j + 1, k - j, s);
+        k = j + len;
+    }
+
+    void r(const char* s) { if (m() > 0) setto(s); }
+
+    void step1ab() {
+        if (b[k] == 's') {
+            if (ends("sses")) k -= 2;
+            else if (ends("ies")) setto("i");
+            else if (b[k - 1] != 's') k--;
+        }
+        if (ends("eed")) { if (m() > 0) k--; }
+        else if ((ends("ed") || ends("ing")) && vowelinstem()) {
+            k = j;
+            if (ends("at")) setto("ate");
+            else if (ends("bl")) setto("ble");
+            else if (ends("iz")) setto("ize");
+            else if (doublec(k)) {
+                k--;
+                char ch = b[k];
+                if (ch == 'l' || ch == 's' || ch == 'z') k++;
+            } else if (m() == 1 && cvc(k)) {
+                setto("e");
+            }
+        }
+    }
+
+    void step1c() {
+        if (ends("y") && vowelinstem()) b[k] = 'i';
+    }
+
+    void step2() {
+        if (k == 0) return;
+        switch (b[k - 1]) {
+            case 'a': if (ends("ational")) { r("ate"); break; }
+                      if (ends("tional"))  { r("tion"); break; }
+                      break;
+            case 'c': if (ends("enci"))    { r("ence"); break; }
+                      if (ends("anci"))    { r("ance"); break; }
+                      break;
+            case 'e': if (ends("izer"))    { r("ize"); break; }
+                      break;
+            case 'l': if (ends("abli"))    { r("able"); break; }
+                      if (ends("alli"))    { r("al"); break; }
+                      if (ends("entli"))   { r("ent"); break; }
+                      if (ends("eli"))     { r("e"); break; }
+                      if (ends("ousli"))   { r("ous"); break; }
+                      break;
+            case 'o': if (ends("ization")) { r("ize"); break; }
+                      if (ends("ation"))   { r("ate"); break; }
+                      if (ends("ator"))    { r("ate"); break; }
+                      break;
+            case 's': if (ends("alism"))   { r("al"); break; }
+                      if (ends("iveness")) { r("ive"); break; }
+                      if (ends("fulness")) { r("ful"); break; }
+                      if (ends("ousness")) { r("ous"); break; }
+                      break;
+            case 't': if (ends("aliti"))   { r("al"); break; }
+                      if (ends("iviti"))   { r("ive"); break; }
+                      if (ends("biliti"))  { r("ble"); break; }
+                      break;
+        }
+    }
+
+    void step3() {
+        switch (b[k]) {
+            case 'e': if (ends("icate")) { r("ic"); break; }
+                      if (ends("ative")) { r(""); break; }
+                      if (ends("alize")) { r("al"); break; }
+                      break;
+            case 'i': if (ends("iciti"))  { r("ic"); break; }
+                      break;
+            case 'l': if (ends("ical"))   { r("ic"); break; }
+                      if (ends("ful"))    { r(""); break; }
+                      break;
+            case 's': if (ends("ness"))   { r(""); break; }
+                      break;
+        }
+    }
+
+    void step4() {
+        if (k == 0) return;
+        switch (b[k - 1]) {
+            case 'a': if (ends("al")) break; return;
+            case 'c': if (ends("ance")) break; if (ends("ence")) break; return;
+            case 'e': if (ends("er")) break; return;
+            case 'i': if (ends("ic")) break; return;
+            case 'l': if (ends("able")) break; if (ends("ible")) break; return;
+            case 'n': if (ends("ant")) break; if (ends("ement")) break;
+                      if (ends("ment")) break; if (ends("ent")) break; return;
+            case 'o': if (ends("ion") && j >= 0 && (b[j] == 's' || b[j] == 't')) break;
+                      if (ends("ou")) break; return;
+            case 's': if (ends("ism")) break; return;
+            case 't': if (ends("ate")) break; if (ends("iti")) break; return;
+            case 'u': if (ends("ous")) break; return;
+            case 'v': if (ends("ive")) break; return;
+            case 'z': if (ends("ize")) break; return;
+            default: return;
+        }
+        if (m() > 1) k = j;
+    }
+
+    void step5() {
+        j = k;
+        if (b[k] == 'e') {
+            int a = m();
+            if (a > 1 || (a == 1 && !cvc(k - 1))) k--;
+        }
+        if (b[k] == 'l' && doublec(k) && m() > 1) k--;
+    }
+
+public:
+    std::string stem(const std::string& word) {
+        if (word.size() <= 2) return word;
+        b = word;
+        k = static_cast<int>(word.size()) - 1;
+        step1ab();
+        if (k > 0) step1c();
+        if (k > 0) step2();
+        if (k > 0) step3();
+        if (k > 0) step4();
+        if (k > 0) step5();
+        return b.substr(0, k + 1);
+    }
+};
+
+// Light S-stemmer (plural stripping only) — the previous default, kept so the
+// two stemmers can be compared for the report.
 static inline std::string s_stem(const std::string& word) {
     if (word.size() <= 3) return word;
     if (word.back() != 's') return word;
-    if (word.size() > 4 && word.compare(word.size() - 3, 3, "ies") == 0) {
+    if (word.size() > 4 && word.compare(word.size() - 3, 3, "ies") == 0)
         return word.substr(0, word.size() - 3) + "y";
-    }
     if (word.size() > 3 && word.compare(word.size() - 2, 2, "es") == 0) {
         char third_last = word[word.size() - 3];
         if (third_last == 's' || third_last == 'x' || third_last == 'z' ||
             (word.size() > 4 && word.compare(word.size() - 4, 2, "ch") == 0) ||
-            (word.size() > 4 && word.compare(word.size() - 4, 2, "sh") == 0)) {
+            (word.size() > 4 && word.compare(word.size() - 4, 2, "sh") == 0))
             return word.substr(0, word.size() - 2);
-        }
         return word.substr(0, word.size() - 1);
     }
-    if (word.back() == 's' && word[word.size() - 2] != 's' && word[word.size() - 2] != 'u') {
+    if (word.back() == 's' && word[word.size() - 2] != 's' && word[word.size() - 2] != 'u')
         return word.substr(0, word.size() - 1);
-    }
     return word;
 }
 
-static inline std::vector<std::string> cpp_tokenize(const std::string& text) {
-    std::vector<std::string> tokens;
-    tokens.reserve(text.size() / 5);
+// Standard short English stopword list (the Lucene/BEIR set). Deliberately
+// NOT the large INQUERY list above: that one drops "case", "state", "number",
+// "group", "point" and "work", which are content words in a biomedical or
+// newswire collection. The big list is still used for RM3 expansion
+// candidates, where being aggressive is appropriate.
+static const std::unordered_set<std::string> INDEX_STOPWORDS = {
+    "a","an","and","are","as","at","be","but","by","for","if","in","into","is","it",
+    "no","not","of","on","or","such","that","the","their","then","there","these",
+    "they","this","to","was","will","with"
+};
+
+struct TokenizerCfg {
+    uint8_t stemmer = 2;       // 0 = none, 1 = S-stemmer, 2 = Porter
+    uint8_t remove_stop = 1;   // 0 = keep stopwords, 1 = drop them
+};
+
+static thread_local PorterStemmer g_porter;
+
+static inline std::string apply_stem(const std::string& w, uint8_t stemmer) {
+    if (stemmer == 2) return g_porter.stem(w);
+    if (stemmer == 1) return s_stem(w);
+    return w;
+}
+
+// Returns (term, original_token_position) pairs.
+static inline std::vector<std::pair<std::string, uint32_t>>
+cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
+    std::vector<std::pair<std::string, uint32_t>> tokens;
+    tokens.reserve(text.size() / 6);
     std::string current;
+    uint32_t pos = 0;
+
+    auto emit = [&]() {
+        if (current.empty()) return;
+        uint32_t this_pos = pos++;                       // position counted first
+        if (!(cfg.remove_stop && INDEX_STOPWORDS.count(current)))
+            tokens.push_back({apply_stem(current, cfg.stemmer), this_pos});
+        current.clear();
+    };
+
     for (char c : text) {
-        if (std::isalnum(static_cast<unsigned char>(c))) {
+        if (std::isalnum(static_cast<unsigned char>(c)))
             current += std::tolower(static_cast<unsigned char>(c));
-        } else {
-            if (!current.empty()) {
-                tokens.push_back(s_stem(current));
-                current.clear();
-            }
-        }
+        else
+            emit();
     }
-    if (!current.empty()) tokens.push_back(s_stem(current));
+    emit();
     return tokens;
 }
 
@@ -311,6 +553,7 @@ public:
     float avg_doc_len = 0.0f;
     uint32_t N = 0;
     uint64_t total_corpus_tokens = 0;
+    TokenizerCfg tokcfg;          // read from meta.bin at load; must match build
 
     // ---- dictionary, held as parallel sorted arrays -------------------------
     // Sorted term array + binary search rather than a hash map: on a corpus
@@ -364,6 +607,16 @@ public:
         total_corpus_tokens = 0;
         N = 0;
 
+        // Analysis chain is chosen at build time and frozen into the index.
+        // Overridable from the environment so the two configurations can be
+        // A/B-ed without editing and recompiling:
+        //     IR_STEMMER=0|1|2   IR_STOPWORDS=0|1
+        tokcfg = TokenizerCfg{};
+        if (const char* e = std::getenv("IR_STEMMER"))
+            tokcfg.stemmer = static_cast<uint8_t>(std::atoi(e));
+        if (const char* e = std::getenv("IR_STOPWORDS"))
+            tokcfg.remove_stop = static_cast<uint8_t>(std::atoi(e));
+
         std::vector<std::string> run_files;
         uint32_t run_count = 0;
 
@@ -412,20 +665,21 @@ public:
         while (next_doc(ext_id, text)) {
             doc_ids.push_back(ext_id);
 
-            auto tokens = cpp_tokenize(text);
-            uint32_t d_len = tokens.size();
+            auto tokens = cpp_tokenize(text, tokcfg);
+            // Document length is the number of INDEXED tokens, so BM25's
+            // length normalisation is consistent with what is actually scored.
+            uint32_t d_len = static_cast<uint32_t>(tokens.size());
             doc_lens.push_back(d_len);
             total_corpus_tokens += d_len;
 
             // tf is counted in full; the position list is capped separately,
             // so truncating positions never corrupts the term frequency.
             std::unordered_map<std::string, std::pair<uint32_t, std::vector<uint32_t>>> term_data;
-            for (uint32_t pos = 0; pos < tokens.size(); ++pos) {
-                const auto& tok = tokens[pos];
-                auto& entry = term_data[tok];
+            for (const auto& tp : tokens) {
+                auto& entry = term_data[tp.first];
                 entry.first++;
-                if (entry.second.size() < MAX_POSITIONS_PER_DOC) entry.second.push_back(pos);
-                collection_freq[tok]++;
+                if (entry.second.size() < MAX_POSITIONS_PER_DOC) entry.second.push_back(tp.second);
+                collection_freq[tp.first]++;
             }
 
             // Forward-index candidates: the highest-tf non-stopword terms in
@@ -468,6 +722,15 @@ public:
         for (uint32_t i = 0; i < N; ++i) {
             float ratio = (avg_doc_len > 0) ? (static_cast<float>(doc_lens[i]) / avg_doc_len) : 1.0f;
             quantized_doc_lens[i] = quantize_doc_len(ratio);
+        }
+
+        // -------- meta.bin: analysis config, needed to tokenise queries -----
+        {
+            std::ofstream f(index_dir + "/meta.bin", std::ios::binary);
+            uint8_t version = 2;
+            f.write(reinterpret_cast<const char*>(&version), 1);
+            f.write(reinterpret_cast<const char*>(&tokcfg.stemmer), 1);
+            f.write(reinterpret_cast<const char*>(&tokcfg.remove_stop), 1);
         }
 
         // -------- docmap.bin / doclens.bin ---------------------------------
@@ -847,6 +1110,16 @@ public:
 
     void load_index(const std::string& index_dir) {
         {
+            // Query tokenisation must match index tokenisation exactly.
+            std::ifstream f(index_dir + "/meta.bin", std::ios::binary);
+            if (f.is_open()) {
+                uint8_t version = 0;
+                f.read(reinterpret_cast<char*>(&version), 1);
+                f.read(reinterpret_cast<char*>(&tokcfg.stemmer), 1);
+                f.read(reinterpret_cast<char*>(&tokcfg.remove_stop), 1);
+            }
+        }
+        {
             std::ifstream f(index_dir + "/docmap.bin", std::ios::binary);
             f.read(reinterpret_cast<char*>(&N), sizeof(N));
             doc_ids.assign(N, std::string());
@@ -1061,7 +1334,8 @@ public:
         const std::vector<int32_t>& query_tids,
         const std::vector<std::pair<uint32_t, float>>& candidates,
         int top_k,
-        float lambda_t, float lambda_o, float lambda_u, uint32_t window_u)
+        float lambda_t, float lambda_o, float lambda_u, uint32_t window_u,
+        bool normalise_signals)
     {
         if (candidates.empty()) return {};
 
@@ -1071,14 +1345,19 @@ public:
                 bigrams.push_back({query_tids[i], query_tids[i + 1]});
         }
 
-        std::vector<std::pair<uint32_t, float>> reranked;
-        reranked.reserve(candidates.size());
+        // Collect the three signals separately, then combine on a common
+        // scale. The previous version mixed a raw BM25 score (magnitude ~10-30)
+        // with log-counts (magnitude ~0-3) using lambda_o = 0.10, so the
+        // proximity evidence contributed well under 1% of the final score and
+        // the rerank was effectively a no-op. Min-max normalising each signal
+        // across the candidate pool makes the lambdas mean what they say.
+        std::vector<float> uni(candidates.size()), ord(candidates.size()), uno(candidates.size());
 
-        for (const auto& cand : candidates) {
-            uint32_t doc_id = cand.first;
-            float unigram_score = cand.second;
+        for (size_t ci = 0; ci < candidates.size(); ++ci) {
+            uint32_t doc_id = candidates[ci].first;
+            uni[ci] = candidates[ci].second;
+
             float ordered_score = 0.0f, unordered_score = 0.0f;
-
             for (const auto& bg : bigrams) {
                 auto pos1 = get_positions(bg.first, doc_id);
                 if (pos1.empty()) continue;
@@ -1098,9 +1377,25 @@ public:
                 if (ordered_cnt > 0) ordered_score += std::log(1.0f + ordered_cnt);
                 if (unordered_cnt > 0) unordered_score += std::log(1.0f + unordered_cnt);
             }
+            ord[ci] = ordered_score;
+            uno[ci] = unordered_score;
+        }
 
-            reranked.push_back({doc_id,
-                lambda_t * unigram_score + lambda_o * ordered_score + lambda_u * unordered_score});
+        auto normalise = [](std::vector<float>& v) {
+            if (v.empty()) return;
+            float lo = *std::min_element(v.begin(), v.end());
+            float hi = *std::max_element(v.begin(), v.end());
+            float range = hi - lo;
+            if (range <= 1e-9f) { for (auto& x : v) x = 0.0f; return; }
+            for (auto& x : v) x = (x - lo) / range;
+        };
+        if (normalise_signals) { normalise(uni); normalise(ord); normalise(uno); }
+
+        std::vector<std::pair<uint32_t, float>> reranked;
+        reranked.reserve(candidates.size());
+        for (size_t ci = 0; ci < candidates.size(); ++ci) {
+            reranked.push_back({candidates[ci].first,
+                lambda_t * uni[ci] + lambda_o * ord[ci] + lambda_u * uno[ci]});
         }
 
         size_t want = std::min(static_cast<size_t>(std::max(top_k, 0)), reranked.size());
@@ -1135,16 +1430,17 @@ public:
         int sdm_rerank_depth = 200,
         float lambda_o = 0.10f,
         float lambda_u = 0.05f,
-        uint32_t window_u = 8)
+        uint32_t window_u = 8,
+        bool sdm_normalise = true)
     {
-        auto tokens = cpp_tokenize(query);
+        auto tokens = cpp_tokenize(query, tokcfg);
         if (tokens.empty() || N == 0) return {};
 
         std::vector<int32_t> query_tids;
         query_tids.reserve(tokens.size());
         std::unordered_map<int32_t, float> qw;
-        for (const auto& t : tokens) {
-            int32_t tid = find_term(t);
+        for (const auto& tp : tokens) {
+            int32_t tid = find_term(tp.first);
             query_tids.push_back(tid);
             if (tid >= 0) qw[tid] += 1.0f;
         }
@@ -1232,7 +1528,8 @@ public:
         if (use_sdm && query_tids.size() > 1) {
             if (pool.size() > static_cast<size_t>(sdm_rerank_depth)) pool.resize(sdm_rerank_depth);
             float lambda_t = 1.0f - lambda_o - lambda_u;
-            return sdm_rerank(query_tids, pool, k, lambda_t, lambda_o, lambda_u, window_u);
+            return sdm_rerank(query_tids, pool, k, lambda_t, lambda_o, lambda_u,
+                              window_u, sdm_normalise);
         }
 
         std::vector<std::pair<std::string, float>> results;
@@ -1249,7 +1546,8 @@ public:
     std::vector<std::pair<std::string, float>> retrieve_bm25(
         const std::string& query, int k, float k1, float b, float delta)
     {
-        return retrieve(query, k, k1, b, delta, false, 0, 0, 1.0f, 1000.0f, false, 0);
+        return retrieve(query, k, k1, b, delta, false, 0, 0, 1.0f, 1000.0f, false, 0,
+                        0.0f, 0.0f, 8, true);
     }
 };
 
@@ -1267,7 +1565,8 @@ PYBIND11_MODULE(cpp_engine, m) {
              py::arg("use_rm3") = true, py::arg("fb_docs") = 10, py::arg("fb_terms") = 25,
              py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f,
              py::arg("use_sdm") = true, py::arg("sdm_rerank_depth") = 200,
-             py::arg("lambda_o") = 0.10f, py::arg("lambda_u") = 0.05f, py::arg("window_u") = 8)
+             py::arg("lambda_o") = 0.10f, py::arg("lambda_u") = 0.05f, py::arg("window_u") = 8,
+             py::arg("sdm_normalise") = true)
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f);
