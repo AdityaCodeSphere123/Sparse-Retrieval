@@ -64,8 +64,11 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     """Build index using C++ engine if available (or Python fallback) with streaming."""
     if HAS_CPP:
         engine = cpp_engine.CPPEngine()
-        corpus = load_corpus(corpus_path)
-        engine.build_index(corpus, index_dir)
+        if hasattr(engine, "build_index_from_file") and os.path.exists(corpus_path) and os.path.isfile(corpus_path):
+            engine.build_index_from_file(corpus_path, index_dir)
+        else:
+            corpus = load_corpus(corpus_path)
+            engine.build_index(corpus, index_dir)
     else:
         index = InvertedIndex()
         index.build(stream_corpus(corpus_path))
