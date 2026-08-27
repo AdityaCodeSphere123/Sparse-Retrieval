@@ -401,7 +401,7 @@ static const std::unordered_set<std::string> INDEX_STOPWORDS = {
 
 struct TokenizerCfg {
     uint8_t stemmer = 2;       // 0 = none, 1 = S-stemmer, 2 = Porter
-    uint8_t remove_stop = 0;   // 0 = keep stopwords, 1 = drop them
+    uint8_t remove_stop = 1;   // 0 = keep stopwords, 1 = drop them
 };
 
 static thread_local PorterStemmer g_porter;
