@@ -4,7 +4,7 @@ from pybind11.setup_helpers import Pybind11Extension, build_ext
 ext_modules = [
     Pybind11Extension(
         "cpp_engine",
-        ["src/cpp_engine.cpp"],
+        ["submission/cpp_engine.cpp"],
         cxx_std=17,
         extra_compile_args=["-O3", "-ffast-math", "-funroll-loops"],
 

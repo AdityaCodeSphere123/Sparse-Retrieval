@@ -54,7 +54,11 @@ try:
     import cpp_engine
     HAS_CPP = True
 except ImportError:
-    HAS_CPP = False
+    try:
+        from submission import cpp_engine
+        HAS_CPP = True
+    except ImportError:
+        HAS_CPP = False
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
