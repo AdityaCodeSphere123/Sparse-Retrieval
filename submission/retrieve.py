@@ -7,46 +7,18 @@ assignment spec, "Submission Interface & Conformance Checking") — do not
 rename them, change their signatures, or move them out of this file.
 
     build_index(corpus_path: str, index_dir: str) -> None
-        Called once, in its own process, with the path to a corpus.jsonl
-        file (see data/README.md) and a directory to write your index
-        into. Build whatever index and statistics you need, and WRITE
-        THEM TO index_dir. The harness runs build_index() and
-        load_index()/retrieve() in two SEPARATE processes on purpose (see
-        harness/run_harness.py's module docstring) — nothing you only
-        hold in memory here survives into load_index(). This call is
-        timed as your "index build time" efficiency metric. The harness
-        also measures the on-disk byte size of index_dir once this
-        returns — that's your "index size" score (assignment Section 7),
-        so write only what retrieve() actually needs, and consider
-        compressing it.
-
     load_index(index_dir: str) -> None
-        Called once, in a fresh process, before any retrieve() calls.
-        Reconstruct everything retrieve() needs by reading index_dir —
-        and only index_dir; there is no leftover state from
-        build_index() to fall back on. Timed as your "index load time".
-
     retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]
-        Called once per query, only after load_index() has run in the
-        same process. Return up to k (doc_id, score) pairs, sorted by
-        score descending (highest score = most relevant). This is exactly
-        the ranking the harness scores with nDCG@10 / MAP@10. doc_id values
-        must be ones that appeared in the corpus passed to build_index().
 
-This file ships with a trivial, fully-working baseline — return the first
-k documents in the order build_index() saw them, ignoring the query
-entirely — wired up below. It actually persists to disk and reloads
-correctly, so it exercises the full build -> disk -> fresh process -> load
--> query path end-to-end from your very first commit. Its scores will be
-close to zero; replace the logic, but keep the same
-persist-in-build / reconstruct-in-load shape.
+Scoring is a BM25+ first pass, RM3 pseudo-relevance feedback, then a
+Sequential Dependence Model proximity rerank of the candidate pool. All of
+that lives in the C++ extension (src/cpp_engine.cpp); the pure-Python path
+below is a correctness fallback for when the extension is not built.
 """
-import json
 import os
 from typing import List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
-
 from submission.corpus_utils import load_corpus, stream_corpus
 from submission.indexer import InvertedIndex
 
@@ -60,19 +32,54 @@ except ImportError:
     except ImportError:
         HAS_CPP = False
 
+# ---------------------------------------------------------------------------
+# All query-time tunables in one place. Sweep these on the dev set and report
+# the sweep (assignment Section 8); do NOT tune them on the held-out topics.
+#
+#   k1, b     BM25 term-frequency saturation / length normalisation
+#   delta     BM25+ lower-bound term (Lv & Zhai); 0.0 gives standard BM25
+#   use_rm3   pseudo-relevance feedback on/off
+#   fb_docs   number of first-pass documents treated as relevant
+#   fb_terms  number of expansion terms kept from the relevance model
+#   alpha     weight on the original query vs. the expansion (1.0 = no expansion)
+#   mu        Dirichlet smoothing for P(w|D) in the relevance model
+#   use_sdm   proximity rerank on/off
+#   lambda_o  weight on ordered (adjacent bigram) evidence
+#   lambda_u  weight on unordered-window evidence
+#   window_u  unordered window width in tokens
+# ---------------------------------------------------------------------------
+PARAMS = dict(
+    k1=1.2,
+    b=0.75,
+    delta=1.0,
+    use_rm3=True,
+    fb_docs=10,
+    fb_terms=25,
+    alpha=0.6,
+    mu=1000.0,
+    use_sdm=True,
+    sdm_rerank_depth=200,
+    lambda_o=0.10,
+    lambda_u=0.05,
+    window_u=8,
+)
+
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
-    """Build index using C++ engine if available (or Python fallback) with streaming."""
+    """Build the index and persist everything retrieve() needs into index_dir."""
+    os.makedirs(index_dir, exist_ok=True)
+
     if HAS_CPP:
         engine = cpp_engine.CPPEngine()
-        if hasattr(engine, "build_index_from_file") and os.path.exists(corpus_path) and os.path.isfile(corpus_path):
+        # Streaming straight off the file avoids materialising the whole corpus
+        # in Python memory; fall back to the list form for ir_datasets specifiers.
+        if os.path.isfile(corpus_path):
             engine.build_index_from_file(corpus_path, index_dir)
         else:
-            corpus = load_corpus(corpus_path)
-            engine.build_index(corpus, index_dir)
+            engine.build_index(load_corpus(corpus_path), index_dir)
     else:
         index = InvertedIndex()
         index.build(stream_corpus(corpus_path))
@@ -80,7 +87,7 @@ def build_index(corpus_path: str, index_dir: str) -> None:
 
 
 def load_index(index_dir: str) -> None:
-    """Reconstruct index from `index_dir` using C++ engine (or Python fallback)."""
+    """Reconstruct query-time state from index_dir, and only from index_dir."""
     global _INDEX, _CPP_ENGINE
     if HAS_CPP:
         _CPP_ENGINE = cpp_engine.CPPEngine()
@@ -92,12 +99,30 @@ def load_index(index_dir: str) -> None:
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs for `query`, ranked by BM25+."""
+    """Return up to k (doc_id, score) pairs, highest score first."""
     if HAS_CPP:
         if _CPP_ENGINE is None:
             raise RuntimeError("load_index() must be called before retrieve()")
-        return _CPP_ENGINE.retrieve(query, k, k1=1.2, b=0.75, delta=1.0)
-    else:
-        if _INDEX is None:
+        return _CPP_ENGINE.retrieve(query, k, **PARAMS)
+
+    if _INDEX is None:
+        raise RuntimeError("load_index() must be called before retrieve()")
+    return bm25.score(query, k, k1=PARAMS["k1"], b=PARAMS["b"], delta=PARAMS["delta"])
+
+
+def retrieve_bm25_only(query: str, k: int = 10) -> List[Tuple[str, float]]:
+    """Plain BM25+ with no expansion and no proximity rerank.
+
+    Not part of the harness interface — this is for the ablation table in the
+    report (Boolean/VSM vs. BM25 vs. full system) and for the k1/b sweep,
+    where you want to isolate BM25 from the RM3 and SDM stages.
+    """
+    if HAS_CPP:
+        if _CPP_ENGINE is None:
             raise RuntimeError("load_index() must be called before retrieve()")
-        return bm25.score(query, k, k1=1.2, b=0.75, delta=1.0)
+        return _CPP_ENGINE.retrieve_bm25(
+            query, k, PARAMS["k1"], PARAMS["b"], PARAMS["delta"]
+        )
+    if _INDEX is None:
+        raise RuntimeError("load_index() must be called before retrieve()")
+    return bm25.score(query, k, k1=PARAMS["k1"], b=PARAMS["b"], delta=PARAMS["delta"])
