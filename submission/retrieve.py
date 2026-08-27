@@ -49,18 +49,18 @@ except ImportError:
 #   window_u  unordered window width in tokens
 # ---------------------------------------------------------------------------
 PARAMS = dict(
-    k1=1.2,
+    k1=2.5,
     b=0.75,
-    delta=1.0,
+    delta=0.25,
     use_rm3=True,
-    fb_docs=10,
+    fb_docs=30,
     fb_terms=25,
-    alpha=0.6,
-    mu=1000.0,
+    alpha=0.7,
+    mu=2000.0,
     use_sdm=True,
     sdm_rerank_depth=200,
-    lambda_o=0.10,
-    lambda_u=0.05,
+    lambda_o=0.0,
+    lambda_u=0.0,
     window_u=8,
     sdm_normalise=True,
 )
