@@ -8,18 +8,35 @@ replace it if your index needs a different loading strategy (e.g.
 streaming instead of loading everything into memory).
 """
 import json
-from typing import List, Tuple
+import os
+from typing import Iterable, List, Tuple
+
+
+def stream_corpus(path: str) -> Iterable[Tuple[str, str]]:
+    """Read corpus line-by-line, yielding (doc_id, text) pairs.
+    
+    If `path` is an ir_datasets specifier (e.g. 'ir_datasets:beir/trec-covid' or 'beir/trec-covid'),
+    it streams directly from ir_datasets without requiring a local corpus.jsonl file.
+    Otherwise, it streams line-by-line from a .jsonl file.
+    """
+    if path.startswith("ir_datasets:") or (not os.path.exists(path) and "/" in path and not path.endswith(".jsonl")):
+        dataset_id = path.replace("ir_datasets:", "")
+        import ir_datasets
+        dataset = ir_datasets.load(dataset_id)
+        for doc in dataset.docs_iter():
+            text = doc.default_text() if hasattr(doc, "default_text") else getattr(doc, "text", "")
+            yield doc.doc_id, text
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                yield obj["doc_id"], obj["text"]
 
 
 def load_corpus(path: str) -> List[Tuple[str, str]]:
-    """Read a corpus.jsonl file (one {"doc_id": ..., "text": ...} object
-    per line) and return a list of (doc_id, text) pairs in file order."""
-    docs: List[Tuple[str, str]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            docs.append((obj["doc_id"], obj["text"]))
-    return docs
+    """Read a corpus and return a list of (doc_id, text) pairs in file order."""
+    return list(stream_corpus(path))
+

@@ -47,7 +47,7 @@ from typing import List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
 
-from submission.corpus_utils import load_corpus
+from submission.corpus_utils import load_corpus, stream_corpus
 from submission.indexer import InvertedIndex
 
 try:
@@ -61,14 +61,14 @@ _CPP_ENGINE: Optional[object] = None
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
-    """Load corpus, build index using C++ engine if available (or Python fallback), and save to disk."""
-    corpus = load_corpus(corpus_path)
+    """Build index using C++ engine if available (or Python fallback) with streaming."""
     if HAS_CPP:
         engine = cpp_engine.CPPEngine()
+        corpus = load_corpus(corpus_path)
         engine.build_index(corpus, index_dir)
     else:
         index = InvertedIndex()
-        index.build(corpus)
+        index.build(stream_corpus(corpus_path))
         index.save(index_dir)
 
 

@@ -30,7 +30,7 @@ import gzip
 import json
 import os
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -73,15 +73,16 @@ class InvertedIndex:
         self.N: int = 0  # number of documents
         self.avg_doc_len: float = 0.0
 
-    def build(self, corpus: List[Tuple[str, str]]) -> None:
-        """Build the inverted index and corpus statistics from a list of (doc_id, text) pairs."""
+    def build(self, corpus: Iterable[Tuple[str, str]]) -> None:
+        """Build the inverted index and corpus statistics from an iterable/generator of (doc_id, text) pairs."""
         self.postings = {}
         self.doc_len = {}
         self.doc_text = {}
-        self.N = len(corpus)
+        self.N = 0
         total_tokens = 0
 
         for doc_id, text in corpus:
+            self.N += 1
             tokens = tokenize(text)
             self.doc_len[doc_id] = len(tokens)
             total_tokens += len(tokens)
