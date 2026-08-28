@@ -44,7 +44,7 @@ namespace py = pybind11;
 // report: each trades index size against ranking quality or latency.
 // ---------------------------------------------------------------------------
 static constexpr uint32_t BLOCK_SIZE            = 128;   // postings per block
-static constexpr uint32_t FWD_TERMS_PER_DOC     = 48;    // RM3 forward index width
+static constexpr uint32_t FWD_TERMS_PER_DOC     = 24;    // RM3 forward index width; 48→24 keeps nDCG, cuts fwd.bin
 static constexpr uint32_t FWD_CANDIDATES        = 128;   // pre-df-filter margin (ranked later by tf*idf)
 static constexpr float    RM3_DF_FRACTION       = 0.05f;  // forward-index df ceiling
 static constexpr uint32_t SPIMI_BATCH_DOCS      = 50000;
