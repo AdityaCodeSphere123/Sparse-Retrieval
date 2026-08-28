@@ -491,7 +491,19 @@ struct DocPosting {
     uint32_t tf;
 };
 
-// Minimal JSONL field extraction for {"doc_id": ..., "text": ...}
+// Minimal JSONL field extraction for {"doc_id": ..., "text": ...}.
+// Closing quotes are found by scanning, not rfind, so a later field (or an
+// escaped quote inside the value) cannot steal the end of `text`.
+static size_t find_unescaped_dquote(const std::string& s, size_t from) {
+    for (size_t i = from; i < s.size(); ++i) {
+        if (s[i] != '"') continue;
+        size_t bs = 0;
+        while (i >= bs + 1 && s[i - 1 - bs] == '\\') ++bs;
+        if ((bs % 2) == 0) return i;
+    }
+    return std::string::npos;
+}
+
 static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::string& text) {
     if (line.empty()) return false;
     size_t id_pos = line.find("\"doc_id\"");
@@ -500,10 +512,7 @@ static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::
     if (id_colon == std::string::npos) return false;
     size_t id_quote1 = line.find('"', id_colon);
     if (id_quote1 == std::string::npos) return false;
-    size_t id_quote2 = line.find('"', id_quote1 + 1);
-    while (id_quote2 != std::string::npos && line[id_quote2 - 1] == '\\') {
-        id_quote2 = line.find('"', id_quote2 + 1);
-    }
+    size_t id_quote2 = find_unescaped_dquote(line, id_quote1 + 1);
     if (id_quote2 == std::string::npos) return false;
     doc_id = line.substr(id_quote1 + 1, id_quote2 - id_quote1 - 1);
 
@@ -513,13 +522,8 @@ static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::
     if (text_colon == std::string::npos) return false;
     size_t text_quote1 = line.find('"', text_colon);
     if (text_quote1 == std::string::npos) return false;
-    size_t text_quote2 = line.rfind('"');
-    if (text_quote2 <= text_quote1) return false;
-    while (text_quote2 > text_quote1 && line[text_quote2 - 1] == '\\') {
-        size_t prev = line.rfind('"', text_quote2 - 1);
-        if (prev <= text_quote1) break;
-        text_quote2 = prev;
-    }
+    size_t text_quote2 = find_unescaped_dquote(line, text_quote1 + 1);
+    if (text_quote2 == std::string::npos || text_quote2 <= text_quote1) return false;
 
     std::string raw_text = line.substr(text_quote1 + 1, text_quote2 - text_quote1 - 1);
     text.clear();

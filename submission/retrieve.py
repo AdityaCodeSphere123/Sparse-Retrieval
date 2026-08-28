@@ -44,8 +44,7 @@ except ImportError:
 #   alpha     weight on the original query vs. the expansion (1.0 = no expansion)
 #   mu        Dirichlet smoothing for P(w|D) in the relevance model
 # ---------------------------------------------------------------------------
-# Restored from f49fec1 (dev nDCG@10 0.6588). Later sweeps with RM3 off
-# or with auto-ascent from BASE did not beat this.
+
 PARAMS = dict(
     k1=2.5,
     b=0.5,
@@ -76,13 +75,22 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     """Build the index and persist everything retrieve() needs into index_dir."""
     os.makedirs(index_dir, exist_ok=True)
 
+    # Resolve to a single streamable .jsonl file when possible, so a
+    # directory-delivered corpus still goes through the C++ engine's
+    # streaming path instead of being materialised twice in Python.
+    stream_path = corpus_path
+    if os.path.isdir(corpus_path):
+        candidate = os.path.join(corpus_path, "corpus.jsonl")
+        if os.path.isfile(candidate):
+            stream_path = candidate
+
     if HAS_CPP:
         engine = cpp_engine.CPPEngine()
-        # Streaming straight off the file avoids materialising the whole corpus
-        # in Python memory; fall back to the list form for ir_datasets specifiers.
-        if os.path.isfile(corpus_path):
-            engine.build_index_from_file(corpus_path, index_dir)
+        if os.path.isfile(stream_path):
+            engine.build_index_from_file(stream_path, index_dir)
         else:
+            # Multi-file directory / ir_datasets specifier: no single
+            # streamable file, fall back to materialising the corpus.
             engine.build_index(load_corpus(corpus_path), index_dir)
     else:
         index = InvertedIndex()
