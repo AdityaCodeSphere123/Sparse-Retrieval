@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <queue>
 #include <cstdint>
 #include <cstdio>
@@ -45,10 +46,10 @@ namespace py = pybind11;
 // report: each trades index size against ranking quality or latency.
 // ---------------------------------------------------------------------------
 static constexpr uint32_t BLOCK_SIZE            = 128;   // postings per block
-static constexpr uint32_t FWD_TERMS_PER_DOC     = 32;    // RM3 forward index width
-static constexpr uint32_t FWD_CANDIDATES        = 64;    // pre-df-filter margin
-static constexpr uint32_t MAX_POSITIONS_PER_DOC = 64;    // truncate long position lists
-static constexpr float    POSITIONS_DF_FRACTION = 0.0f;   // positions off
+static constexpr uint32_t FWD_TERMS_PER_DOC     = 48;    // RM3 forward index width
+static constexpr uint32_t FWD_CANDIDATES        = 128;   // pre-df-filter margin (ranked later by tf*idf)
+static constexpr uint32_t MAX_POSITIONS_PER_DOC = 32;    // unused while POSITIONS_DF_FRACTION is 0
+static constexpr float    POSITIONS_DF_FRACTION = 0.0f;  // keep off: positions.bin would dominate index size
 static constexpr float    RM3_DF_FRACTION       = 0.05f;  // forward-index df ceiling
 static constexpr uint32_t SPIMI_BATCH_DOCS      = 50000;
 
@@ -1028,22 +1029,35 @@ public:
             f_in.read(reinterpret_cast<char*>(&n_cand), sizeof(n_cand));
             kept.clear();
 
+            // Read every candidate first (skipping would desynchronise f_in),
+            // drop stop/df-filtered terms, then keep the top FWD_TERMS_PER_DOC
+            // by tf*idf — not raw tf, which surfaces "patient/studi/result".
+            std::vector<std::pair<float, std::pair<uint32_t, uint32_t>>> scored;
+            scored.reserve(n_cand);
             for (uint32_t i = 0; i < n_cand; ++i) {
                 uint16_t tl, tf16;
                 f_in.read(reinterpret_cast<char*>(&tl), sizeof(tl));
                 term.resize(tl);
-                f_in.read(&term[0], tl);
+                if (tl > 0) f_in.read(&term[0], tl);
                 f_in.read(reinterpret_cast<char*>(&tf16), sizeof(tf16));
 
-                if (kept.size() >= FWD_TERMS_PER_DOC) continue;
                 int32_t tid = find_term(term);
                 if (tid < 0) continue;
                 uint32_t df = term_metas[tid].df;
                 if (df < df_min || df > df_max) continue;
-                kept.push_back({static_cast<uint32_t>(tid), tf16});
+                float idf = std::log(1.0f + static_cast<float>(N) / static_cast<float>(df));
+                float w = (1.0f + std::log(static_cast<float>(std::max<uint16_t>(tf16, 1)))) * idf;
+                scored.push_back({w, {static_cast<uint32_t>(tid), tf16}});
             }
-
-            std::sort(kept.begin(), kept.end());
+            size_t keep_n = std::min<size_t>(scored.size(), FWD_TERMS_PER_DOC);
+            if (keep_n > 0) {
+                std::partial_sort(scored.begin(), scored.begin() + keep_n, scored.end(),
+                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+            }
+            kept.clear();
+            kept.reserve(keep_n);
+            for (size_t i = 0; i < keep_n; ++i) kept.push_back(scored[i].second);
+            std::sort(kept.begin(), kept.end());  // tid-ascending for gap coding
 
             out.clear();
             write_vbyte(out, static_cast<uint32_t>(kept.size()));
@@ -1359,10 +1373,18 @@ public:
             uni[ci] = candidates[ci].second;
 
             float ordered_score = 0.0f, unordered_score = 0.0f;
+            std::map<std::pair<int32_t, uint32_t>, std::vector<uint32_t>> pos_cache;
+            auto cached_pos = [&](int32_t tid) -> const std::vector<uint32_t>& {
+                auto key = std::make_pair(tid, doc_id);
+                auto it = pos_cache.find(key);
+                if (it == pos_cache.end())
+                    it = pos_cache.emplace(key, get_positions(tid, doc_id)).first;
+                return it->second;
+            };
             for (const auto& bg : bigrams) {
-                auto pos1 = get_positions(bg.first, doc_id);
+                const auto& pos1 = cached_pos(bg.first);
                 if (pos1.empty()) continue;
-                auto pos2 = get_positions(bg.second, doc_id);
+                const auto& pos2 = cached_pos(bg.second);
                 if (pos2.empty()) continue;
 
                 uint32_t ordered_cnt = 0, unordered_cnt = 0;
@@ -1446,7 +1468,13 @@ public:
             if (tid >= 0) qw[tid] += 1.0f;
         }
         if (qw.empty()) return {};
-        for (auto& kv : qw) kv.second /= static_cast<float>(tokens.size());
+        // Normalise by the mass of in-vocabulary query terms, not token count.
+        // Dividing by tokens.size() shrinks the original query whenever any
+        // token is OOV, so alpha no longer means "weight on the original query".
+        float qsum = 0.0f;
+        for (const auto& kv : qw) qsum += kv.second;
+        if (qsum <= 0.0f) return {};
+        for (auto& kv : qw) kv.second /= qsum;
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
 

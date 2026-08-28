@@ -10,9 +10,9 @@ rename them, change their signatures, or move them out of this file.
     load_index(index_dir: str) -> None
     retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]
 
-Scoring is a BM25+ first pass, RM3 pseudo-relevance feedback, then a
-Sequential Dependence Model proximity rerank of the candidate pool. All of
-that lives in the C++ extension (src/cpp_engine.cpp); the pure-Python path
+Scoring is a BM25 first pass, RM3 pseudo-relevance feedback, then an
+optional Sequential Dependence Model proximity rerank. All of that lives
+in the C++ extension (`submission/cpp_engine.cpp`); the pure-Python path
 below is a correctness fallback for when the extension is not built.
 """
 import os
@@ -48,19 +48,17 @@ except ImportError:
 #   lambda_u  weight on unordered-window evidence
 #   window_u  unordered window width in tokens
 # ---------------------------------------------------------------------------
-# Chosen from the 50-query coordinate ascent, keeping only knobs that also
-# moved (or stayed put) on the 25/25 split. k1=2.1 not 2.5: the full-set
-# round 2 left the grid edge. fb_docs=10 not 40: both sweeps left it at 10.
-# SDM stays off — positions.bin is empty, so proximity is a no-op.
+# Restored from f49fec1 (dev nDCG@10 0.6588). Later sweeps with RM3 off
+# or with auto-ascent from BASE did not beat this. SDM stays off.
 PARAMS = dict(
-    k1=2.5,
-    b=0.5,
-    delta=0.0,
+    k1=2.1,
+    b=0.6,
+    delta=0.25,
     use_rm3=True,
-    fb_docs=5,
-    fb_terms=20,
+    fb_docs=10,
+    fb_terms=10,
     alpha=0.7,
-    mu=1000.0,
+    mu=2000.0,
     use_sdm=False,
     sdm_rerank_depth=200,
     lambda_o=0.0,

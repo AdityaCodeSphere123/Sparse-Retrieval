@@ -127,3 +127,25 @@ def test_retrieve_is_reasonably_fast_on_the_toy_set():
 
     assert build_time < 30, "Index build on a 20-document toy corpus took >30s — something is off."
     assert max(latencies) < 5, "A single query on a 20-document toy corpus took >5s — something is off."
+
+
+def test_build_index_accepts_a_corpus_directory():
+    """Held-out collection may arrive as a directory of documents."""
+    import shutil
+
+    from submission.corpus_utils import load_corpus
+
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus_dir = os.path.join(tmp, "collection")
+        os.makedirs(corpus_dir)
+        shutil.copy(CORPUS_PATH, os.path.join(corpus_dir, "corpus.jsonl"))
+        docs = load_corpus(corpus_dir)
+        assert len(docs) == len(load_corpus(CORPUS_PATH))
+
+        index_dir = os.path.join(tmp, "index")
+        submission_module.build_index(corpus_dir, index_dir)
+        submission_module.load_index(index_dir)
+        results = submission_module.retrieve("cat", 5)
+        assert results
+        assert len(results) <= 5
+

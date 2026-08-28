@@ -116,7 +116,7 @@ BASE = dict(
 
 # Fine 1-D grids used by --sweep one / auto / the polish pass after --sweep grid.
 GRIDS = {
-    "k1":       [0.6, 0.9, 1.2, 1.5, 1.8, 2.1, 2.5],
+    "k1":       [0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0],
     "b":        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.75, 0.9],
     "delta":    [0.0, 0.25, 0.5, 1.0, 1.5],
     "alpha":    [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
@@ -131,12 +131,12 @@ GRIDS = {
 # Default cartesian product for --sweep grid. Dead RM3 knobs are not expanded
 # when use_rm3=False, so this is every *distinct* ranking, not a naive product.
 JOINT = {
-    "k1":       [0.9, 1.2, 1.5, 1.8, 2.1, 2.5],
+    "k1":       [0.9, 1.2, 1.5, 1.8, 2.1, 2.5, 3.0],
     "b":        [0.4, 0.6, 0.75, 0.9],
     "delta":    [0.0, 0.25, 1.0],
     "alpha":    [0.5, 0.6, 0.7, 0.8],
     "fb_docs":  [5, 10, 20],
-    "fb_terms": [10, 25],
+    "fb_terms": [10, 25, 50],
     "mu":       [1000.0, 2000.0],
     "lambda_o": [0.05, 0.10, 0.20],
     "lambda_u": [0.0, 0.05, 0.10],
@@ -145,7 +145,7 @@ JOINT = {
 
 # --dense: more points, still skips identical RM3-off duplicates.
 DENSE = {
-    "k1":       [0.6, 0.9, 1.2, 1.5, 1.8, 2.1, 2.5],
+    "k1":       [0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0],
     "b":        [0.3, 0.4, 0.5, 0.6, 0.75, 0.9],
     "delta":    [0.0, 0.25, 0.5, 1.0],
     "alpha":    [0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
