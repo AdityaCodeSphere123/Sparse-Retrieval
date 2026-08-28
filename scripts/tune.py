@@ -31,9 +31,6 @@ Usage
     # denser cartesian product (more points, slower)
     python -m scripts.tune ... --index-dir /tmp/tune_index --dense
 
-    # also try SDM proximity weights (no-op unless positions.bin is populated)
-    python -m scripts.tune ... --index-dir /tmp/tune_index --include-sdm
-
     # nDCG@10 vs k1 and b only (the plot the report asks for)
     python -m scripts.tune ... --index-dir /tmp/tune_index --sweep k1b \
         --csv runs/sweep_k1b.csv
@@ -110,8 +107,6 @@ def evaluate(runner, queries, qrels, k=10) -> Tuple[float, float]:
 BASE = dict(
     k1=1.2, b=0.75, delta=1.0,
     use_rm3=True, fb_docs=10, fb_terms=25, alpha=0.6, mu=1000.0,
-    use_sdm=False, sdm_rerank_depth=200,
-    lambda_o=0.0, lambda_u=0.0, window_u=8, sdm_normalise=True,
 )
 
 # Fine 1-D grids used by --sweep one / auto / the polish pass after --sweep grid.
@@ -123,9 +118,6 @@ GRIDS = {
     "fb_docs":  [5, 10, 15, 20, 30],
     "fb_terms": [10, 20, 30, 50, 80],
     "mu":       [500.0, 1000.0, 2000.0],
-    "lambda_o": [0.0, 0.05, 0.10, 0.20, 0.30],
-    "lambda_u": [0.0, 0.05, 0.10, 0.20],
-    "window_u": [4, 8, 12],
 }
 
 # Default cartesian product for --sweep grid. Dead RM3 knobs are not expanded
@@ -138,9 +130,6 @@ JOINT = {
     "fb_docs":  [5, 10, 20],
     "fb_terms": [10, 25, 50],
     "mu":       [1000.0, 2000.0],
-    "lambda_o": [0.05, 0.10, 0.20],
-    "lambda_u": [0.0, 0.05, 0.10],
-    "window_u": [8],
 }
 
 # --dense: more points, still skips identical RM3-off duplicates.
@@ -152,13 +141,9 @@ DENSE = {
     "fb_docs":  [5, 10, 15, 20],
     "fb_terms": [10, 20, 30],
     "mu":       [500.0, 1000.0, 2000.0],
-    "lambda_o": [0.0, 0.05, 0.10, 0.20],
-    "lambda_u": [0.0, 0.05, 0.10],
-    "window_u": [4, 8],
 }
 
-ASCENT_ORDER = ["b", "k1", "delta", "alpha", "fb_terms", "fb_docs",
-                "mu", "lambda_o", "lambda_u", "window_u"]
+ASCENT_ORDER = ["b", "k1", "delta", "alpha", "fb_terms", "fb_docs", "mu"]
 
 
 def make_runner(engine, params):
@@ -167,48 +152,29 @@ def make_runner(engine, params):
     return run
 
 
-def pack(k1, b, delta, use_rm3=False, fb_docs=10, fb_terms=25, alpha=0.6, mu=1000.0,
-         use_sdm=False, lambda_o=0.0, lambda_u=0.0, window_u=8) -> dict:
+def pack(k1, b, delta, use_rm3=False, fb_docs=10, fb_terms=25, alpha=0.6, mu=1000.0) -> dict:
     return dict(
         k1=k1, b=b, delta=delta,
         use_rm3=use_rm3, fb_docs=fb_docs, fb_terms=fb_terms, alpha=alpha, mu=mu,
-        use_sdm=use_sdm, sdm_rerank_depth=200,
-        lambda_o=lambda_o, lambda_u=lambda_u, window_u=window_u, sdm_normalise=True,
     )
 
 
-def iter_grid(space: dict, include_sdm: bool) -> Iterable[dict]:
-    """Yield every distinct (BM25 × optional RM3 × optional SDM) configuration."""
+def iter_grid(space: dict) -> Iterable[dict]:
+    """Yield every distinct (BM25 × optional RM3) configuration."""
     bm25 = itertools.product(space["k1"], space["b"], space["delta"])
     rm3 = itertools.product(space["alpha"], space["fb_docs"], space["fb_terms"], space["mu"])
-    sdm = itertools.product(space["lambda_o"], space["lambda_u"], space["window_u"])
-    # Materialise RM3/SDM once; BM25 is cheap to restream.
     rm3_list = list(rm3)
-    sdm_list = list(sdm)
     for k1, b, delta in bm25:
-        yield pack(k1, b, delta, use_rm3=False, use_sdm=False)
+        yield pack(k1, b, delta, use_rm3=False)
         for alpha, fb_docs, fb_terms, mu in rm3_list:
-            yield pack(k1, b, delta, True, fb_docs, fb_terms, alpha, mu,
-                       use_sdm=False)
-            if include_sdm:
-                for lambda_o, lambda_u, window_u in sdm_list:
-                    if lambda_o == 0.0 and lambda_u == 0.0:
-                        continue
-                    yield pack(k1, b, delta, True, fb_docs, fb_terms, alpha, mu,
-                               True, lambda_o, lambda_u, window_u)
+            yield pack(k1, b, delta, True, fb_docs, fb_terms, alpha, mu)
 
 
-def count_grid(space: dict, include_sdm: bool) -> int:
+def count_grid(space: dict) -> int:
     n_bm25 = len(space["k1"]) * len(space["b"]) * len(space["delta"])
     n_rm3 = (len(space["alpha"]) * len(space["fb_docs"])
              * len(space["fb_terms"]) * len(space["mu"]))
-    n_sdm_live = sum(1 for lo, lu, _ in itertools.product(
-        space["lambda_o"], space["lambda_u"], space["window_u"])
-                     if not (lo == 0.0 and lu == 0.0))
-    total = n_bm25 * (1 + n_rm3)
-    if include_sdm:
-        total += n_bm25 * n_rm3 * n_sdm_live
-    return total
+    return n_bm25 * (1 + n_rm3)
 
 
 def print_params(params: dict) -> None:
@@ -224,8 +190,6 @@ def coordinate_ascent(start: dict, score_fn, rounds: int = 2) -> Tuple[dict, flo
     for rnd in range(rounds):
         improved = False
         for name in ASCENT_ORDER:
-            if name in ("lambda_o", "lambda_u", "window_u") and not cur.get("use_sdm"):
-                continue
             trial_best, trial_val = best_nd, cur[name]
             for v in GRIDS[name]:
                 if v == cur[name]:
@@ -240,7 +204,7 @@ def coordinate_ascent(start: dict, score_fn, rounds: int = 2) -> Tuple[dict, flo
                 cur[name] = trial_val
                 best_nd = trial_best
                 improved = True
-        for flag in ("use_rm3", "use_sdm"):
+        for flag in ("use_rm3",):
             p = dict(cur, **{flag: not cur[flag]})
             nd, _ = score_fn(p)
             if nd > best_nd + 1e-6:
@@ -254,17 +218,16 @@ def coordinate_ascent(start: dict, score_fn, rounds: int = 2) -> Tuple[dict, flo
     return cur, best_nd
 
 
-def run_cartesian(score_fn, space: dict, include_sdm: bool, top_n: int,
+def run_cartesian(score_fn, space: dict, top_n: int,
                   polish: bool, polish_starts: int) -> Tuple[dict, float, float, list]:
-    n_total = count_grid(space, include_sdm)
-    print(f"\ncartesian grid: {n_total} distinct configurations"
-          + ("  (including SDM)" if include_sdm else "  (SDM off)"))
+    n_total = count_grid(space)
+    print(f"\ncartesian grid: {n_total} distinct configurations")
     print("scoring with harness nDCG@10  ((2^rel-1) / log2(rank+1))")
 
     ranked: List[Tuple[float, float, dict]] = []
     best: Optional[Tuple[float, float, dict]] = None
     t0 = time.time()
-    for i, params in enumerate(iter_grid(space, include_sdm), start=1):
+    for i, params in enumerate(iter_grid(space), start=1):
         nd, mp = score_fn(params)
         ranked.append((nd, mp, params))
         if best is None or nd > best[0] + 1e-12 or (abs(nd - best[0]) <= 1e-12 and mp > best[1]):
@@ -284,11 +247,11 @@ def run_cartesian(score_fn, space: dict, include_sdm: bool, top_n: int,
     top = ranked[:top_n]
 
     print(f"\n--- top {len(top)} of {n_total} ---")
-    print(f"{'nDCG@10':>9} {'MAP@10':>8}  k1    b   delta  rm3  fb_d fb_t  alpha     mu  sdm")
+    print(f"{'nDCG@10':>9} {'MAP@10':>8}  k1    b   delta  rm3  fb_d fb_t  alpha     mu")
     for nd, mp, p in top:
         print(f"{nd:>9.4f} {mp:>8.4f}  {p['k1']:<5} {p['b']:<4} {p['delta']:<6} "
               f"{str(p['use_rm3']):<4} {p['fb_docs']:<4} {p['fb_terms']:<4} "
-              f"{p['alpha']:<6} {p['mu']:<6} {p['use_sdm']}")
+              f"{p['alpha']:<6} {p['mu']:<6}")
 
     winner, best_nd, best_mp = top[0][2], top[0][0], top[0][1]
     if polish:
@@ -316,8 +279,6 @@ def main():
                      help="grid = all combinations (default). auto = coordinate ascent only.")
     ap_.add_argument("--dense", action="store_true",
                      help="with --sweep grid, use the denser cartesian product")
-    ap_.add_argument("--include-sdm", action="store_true",
-                     help="also enumerate SDM weights (skip if positions.bin is empty)")
     ap_.add_argument("--no-polish", action="store_true",
                      help="skip the coordinate-ascent refinement after the grid")
     ap_.add_argument("--top", type=int, default=10, help="how many grid hits to print")
@@ -402,12 +363,9 @@ def main():
 
     if args.sweep == "ablation":
         variants = {
-            "BM25 only":                dict(BASE, use_rm3=False, use_sdm=False),
-            "BM25 + RM3":               dict(BASE, use_rm3=True, use_sdm=False),
-            "BM25 + SDM":               dict(BASE, use_rm3=False, use_sdm=True),
-            "BM25 + RM3 + SDM (full)":  dict(BASE, use_rm3=True, use_sdm=True,
-                                             lambda_o=0.10, lambda_u=0.05),
-            "BM25 (delta=0, plain)":    dict(BASE, use_rm3=False, use_sdm=False, delta=0.0),
+            "BM25 only":                dict(BASE, use_rm3=False),
+            "BM25 + RM3":               dict(BASE, use_rm3=True),
+            "BM25 (delta=0, plain)":    dict(BASE, use_rm3=False, delta=0.0),
         }
         print(f"\n{'configuration':<26} {'nDCG@10':>9} {'MAP@10':>9}")
         for name, p in variants.items():
@@ -416,10 +374,10 @@ def main():
             rows.append(dict(config=name, ndcg=nd, map=mp))
 
     elif args.sweep == "k1b":
-        print(f"\n{'k1':>5} {'b':>6} {'nDCG@10':>9} {'MAP@10':>9}   (RM3/SDM off)")
+        print(f"\n{'k1':>5} {'b':>6} {'nDCG@10':>9} {'MAP@10':>9}   (RM3 off)")
         best = None
         for k1, b in itertools.product(GRIDS["k1"], GRIDS["b"]):
-            p = pack(k1, b, 0.0, use_rm3=False, use_sdm=False)
+            p = pack(k1, b, 0.0, use_rm3=False)
             nd, mp = score(p)
             rows.append(dict(k1=k1, b=b, ndcg=nd, map=mp))
             print(f"{k1:>5.2f} {b:>6.2f} {nd:>9.4f} {mp:>9.4f}")
@@ -458,7 +416,7 @@ def main():
     else:  # grid — every combination, then polish the winners
         space = DENSE if args.dense else JOINT
         winner, nd_t, mp_t, top = run_cartesian(
-            score, space, args.include_sdm, args.top,
+            score, space, args.top,
             polish=not args.no_polish, polish_starts=args.polish_starts,
         )
         print("\n--- best configuration found ---")

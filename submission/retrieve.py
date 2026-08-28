@@ -10,10 +10,10 @@ rename them, change their signatures, or move them out of this file.
     load_index(index_dir: str) -> None
     retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]
 
-Scoring is a BM25 first pass, RM3 pseudo-relevance feedback, then an
-optional Sequential Dependence Model proximity rerank. All of that lives
-in the C++ extension (`submission/cpp_engine.cpp`); the pure-Python path
-below is a correctness fallback for when the extension is not built.
+Scoring is a BM25 first pass plus optional RM3 pseudo-relevance feedback.
+All of that lives in the C++ extension (`submission/cpp_engine.cpp`); the
+pure-Python path below is a correctness fallback for when the extension is
+not built.
 """
 import os
 from typing import List, Optional, Tuple
@@ -43,13 +43,9 @@ except ImportError:
 #   fb_terms  number of expansion terms kept from the relevance model
 #   alpha     weight on the original query vs. the expansion (1.0 = no expansion)
 #   mu        Dirichlet smoothing for P(w|D) in the relevance model
-#   use_sdm   proximity rerank on/off
-#   lambda_o  weight on ordered (adjacent bigram) evidence
-#   lambda_u  weight on unordered-window evidence
-#   window_u  unordered window width in tokens
 # ---------------------------------------------------------------------------
 # Restored from f49fec1 (dev nDCG@10 0.6588). Later sweeps with RM3 off
-# or with auto-ascent from BASE did not beat this. SDM stays off.
+# or with auto-ascent from BASE did not beat this.
 PARAMS = dict(
     k1=2.5,
     b=0.5,
@@ -59,13 +55,7 @@ PARAMS = dict(
     fb_terms=20,
     alpha=0.7,
     mu=1000.0,
-    use_sdm=False,
-    sdm_rerank_depth=200,
-    lambda_o=0.0,
-    lambda_u=0.0,
-    window_u=8,
-    sdm_normalise=True,
-    )
+)
 
 # The ANALYSIS CHAIN (stemmer + stopwords) is not here because it is not a
 # query-time choice: it is baked into the index at build time and read back
@@ -125,11 +115,11 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
 
 
 def retrieve_bm25_only(query: str, k: int = 10) -> List[Tuple[str, float]]:
-    """Plain BM25+ with no expansion and no proximity rerank.
+    """Plain BM25+ with no expansion.
 
     Not part of the harness interface — this is for the ablation table in the
     report (Boolean/VSM vs. BM25 vs. full system) and for the k1/b sweep,
-    where you want to isolate BM25 from the RM3 and SDM stages.
+    where you want to isolate BM25 from the RM3 stage.
     """
     if HAS_CPP:
         if _CPP_ENGINE is None:

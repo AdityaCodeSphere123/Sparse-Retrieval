@@ -1,5 +1,5 @@
 // ===========================================================================
-// cpp_engine.cpp — from-scratch inverted index + BM25+/RM3/SDM retrieval.
+// cpp_engine.cpp — from-scratch inverted index + BM25+ / RM3 retrieval.
 //
 // On-disk layout (v2). Everything is little-endian, written by build_*() and
 // read back by load_index(); nothing survives between the two processes
@@ -10,7 +10,6 @@
 //                 length ratios (log-quantised, see quantize_doc_len)
 //   dict.bin      terms in sorted order, front-coded, varint fields
 //   postings.bin  per term: optional block skip table + gap/varint postings
-//   positions.bin per term: gap/varint position lists (selected terms only)
 //   fwd.bin       pruned forward index (doc -> top terms), for RM3
 //   fwdoff.bin    N+1 x uint32 offsets into fwd.bin
 //
@@ -25,7 +24,6 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
-#include <map>
 #include <queue>
 #include <cstdint>
 #include <cstdio>
@@ -48,8 +46,6 @@ namespace py = pybind11;
 static constexpr uint32_t BLOCK_SIZE            = 128;   // postings per block
 static constexpr uint32_t FWD_TERMS_PER_DOC     = 48;    // RM3 forward index width
 static constexpr uint32_t FWD_CANDIDATES        = 128;   // pre-df-filter margin (ranked later by tf*idf)
-static constexpr uint32_t MAX_POSITIONS_PER_DOC = 32;    // unused while POSITIONS_DF_FRACTION is 0
-static constexpr float    POSITIONS_DF_FRACTION = 0.0f;  // keep off: positions.bin would dominate index size
 static constexpr float    RM3_DF_FRACTION       = 0.05f;  // forward-index df ceiling
 static constexpr uint32_t SPIMI_BATCH_DOCS      = 50000;
 
@@ -440,7 +436,7 @@ cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// mmap wrapper: postings/positions/forward index are read straight out of the
+// mmap wrapper: postings and the forward index are read straight out of the
 // page cache, so load_index() does no parsing of the bulk data at all.
 // ---------------------------------------------------------------------------
 struct MmapBuffer {
@@ -485,16 +481,14 @@ struct TermMeta {
     uint32_t df = 0;
     uint64_t cf = 0;
     uint64_t postings_offset = 0;
-    uint64_t positions_offset = 0;
     uint8_t  max_tf = 0;
     uint8_t  min_qlen = 0;
-    uint8_t  has_positions = 0;
+    uint8_t  has_positions = 0;  // always 0; kept so older indexes still load
 };
 
 struct DocPosting {
     uint32_t doc_id;
     uint32_t tf;
-    std::vector<uint32_t> positions;
 };
 
 // Minimal JSONL field extraction for {"doc_id": ..., "text": ...}
@@ -565,7 +559,6 @@ public:
     std::vector<TermMeta> term_metas;
 
     MmapBuffer postings_mmap;
-    MmapBuffer positions_mmap;
     MmapBuffer fwd_mmap;
     MmapBuffer fwdoff_mmap;
 
@@ -592,7 +585,7 @@ public:
     //               While doing this, also spill each document's top candidate
     //               terms (by tf) to a temp file, so the forward index costs
     //               no second tokenisation pass over the corpus.
-    //   2. MERGE  — k-way merge the runs into postings.bin / positions.bin,
+    //   2. MERGE  — k-way merge the runs into postings.bin,
     //               writing dict.bin front-coded in the same sorted pass.
     //   3. FWD    — map the buffered candidate terms to term ids, drop the
     //               ones the df filter rejects, write fwd.bin / fwdoff.bin.
@@ -600,7 +593,6 @@ public:
     template <typename Supplier>
     void build_common(Supplier&& next_doc, const std::string& index_dir) {
         postings_mmap.unmap();
-        positions_mmap.unmap();
         fwd_mmap.unmap();
         fwdoff_mmap.unmap();
 
@@ -652,9 +644,6 @@ public:
                 for (const auto& p : plist) {
                     f.write(reinterpret_cast<const char*>(&p.doc_id), sizeof(p.doc_id));
                     f.write(reinterpret_cast<const char*>(&p.tf), sizeof(p.tf));
-                    uint32_t num_pos = p.positions.size();
-                    f.write(reinterpret_cast<const char*>(&num_pos), sizeof(num_pos));
-                    f.write(reinterpret_cast<const char*>(p.positions.data()), num_pos * sizeof(uint32_t));
                 }
             }
             temp_postings.clear();
@@ -674,13 +663,9 @@ public:
             doc_lens.push_back(d_len);
             total_corpus_tokens += d_len;
 
-            // tf is counted in full; the position list is capped separately,
-            // so truncating positions never corrupts the term frequency.
-            std::unordered_map<std::string, std::pair<uint32_t, std::vector<uint32_t>>> term_data;
+            std::unordered_map<std::string, uint32_t> term_data;
             for (const auto& tp : tokens) {
-                auto& entry = term_data[tp.first];
-                entry.first++;
-                if (entry.second.size() < MAX_POSITIONS_PER_DOC) entry.second.push_back(tp.second);
+                term_data[tp.first]++;
                 collection_freq[tp.first]++;
             }
 
@@ -690,7 +675,7 @@ public:
             cands.reserve(term_data.size());
             for (const auto& kv : term_data) {
                 if (STOPWORDS.count(kv.first)) continue;
-                cands.push_back({kv.second.first, &kv.first});
+                cands.push_back({kv.second, &kv.first});
             }
             size_t keep = std::min<size_t>(cands.size(), FWD_CANDIDATES);
             std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
@@ -706,8 +691,7 @@ public:
             }
 
             for (auto& kv : term_data) {
-                temp_postings[kv.first].push_back(
-                    DocPosting{doc_int_id, kv.second.first, std::move(kv.second.second)});
+                temp_postings[kv.first].push_back(DocPosting{doc_int_id, kv.second});
             }
 
             doc_int_id++;
@@ -785,27 +769,21 @@ public:
         }
 
         std::ofstream f_postings(index_dir + "/postings.bin", std::ios::binary);
-        std::ofstream f_positions(index_dir + "/positions.bin", std::ios::binary);
         std::ofstream f_dict(index_dir + "/dict.bin", std::ios::binary | std::ios::out);
 
         uint32_t placeholder = 0;
         f_dict.write(reinterpret_cast<const char*>(&placeholder), sizeof(placeholder));
 
         uint64_t current_postings_offset = 0;
-        uint64_t current_positions_offset = 0;
         uint64_t prev_postings_offset = 0;
-        uint64_t prev_positions_offset = 0;
         std::string prev_term;
         uint32_t num_written_terms = 0;
-
-        const uint32_t positions_df_cap =
-            static_cast<uint32_t>(POSITIONS_DF_FRACTION * static_cast<float>(N));
 
         std::vector<uint8_t> dict_buf;
         dict_buf.reserve(1 << 20);
 
         std::vector<DocPosting> merged;
-        std::vector<uint8_t> block_data, pos_data, hdr_buf;
+        std::vector<uint8_t> block_data, hdr_buf;
 
         while (true) {
             const std::string* min_term = nullptr;
@@ -816,12 +794,8 @@ public:
             if (!min_term) break;
             std::string term = *min_term;
 
-            // df is known before we read any postings, so we can decide up
-            // front whether positions are worth keeping and skip reading them
-            // entirely for very common terms.
             uint32_t df = 0;
             for (auto& r : readers) if (r.active && r.curr_term == term) df += r.curr_df;
-            uint8_t has_positions = (df <= positions_df_cap) ? 1 : 0;
 
             merged.clear();
             merged.reserve(df);
@@ -833,18 +807,8 @@ public:
                     DocPosting dp;
                     r.file.read(reinterpret_cast<char*>(&dp.doc_id), sizeof(dp.doc_id));
                     r.file.read(reinterpret_cast<char*>(&dp.tf), sizeof(dp.tf));
-                    uint32_t num_pos;
-                    r.file.read(reinterpret_cast<char*>(&num_pos), sizeof(num_pos));
-                    if (has_positions) {
-                        dp.positions.resize(num_pos);
-                        r.file.read(reinterpret_cast<char*>(dp.positions.data()),
-                                    num_pos * sizeof(uint32_t));
-                    } else {
-                        r.file.seekg(static_cast<std::streamoff>(num_pos) * sizeof(uint32_t),
-                                     std::ios::cur);
-                    }
                     merged_cf += dp.tf;
-                    merged.push_back(std::move(dp));
+                    merged.push_back(dp);
                 }
                 r.read_next_term();
             }
@@ -853,7 +817,6 @@ public:
             // order, so `merged` is already sorted by doc_id.
             uint32_t num_blocks = (df + BLOCK_SIZE - 1) / BLOCK_SIZE;
             uint64_t term_postings_start = current_postings_offset;
-            uint64_t term_positions_start = current_positions_offset;
 
             uint8_t global_max_tf = 0;
             uint8_t global_min_qlen = 255;
@@ -864,12 +827,10 @@ public:
                 uint32_t end_i = std::min(start_i + BLOCK_SIZE, df);
 
                 block_data.clear();
-                pos_data.clear();
 
                 uint8_t block_max_tf = 0;
                 uint8_t block_min_qlen = 255;
                 uint32_t prev_doc_id = (b_idx == 0) ? 0 : prev_block_last_doc;
-                uint32_t pos_prev_doc = prev_doc_id;
 
                 for (uint32_t i = start_i; i < end_i; ++i) {
                     uint32_t d_id = merged[i].doc_id;
@@ -883,17 +844,6 @@ public:
                     write_vbyte(block_data, d_id - prev_doc_id);
                     block_data.push_back(tf_byte);
                     prev_doc_id = d_id;
-
-                    if (has_positions) {
-                        write_vbyte(pos_data, d_id - pos_prev_doc);
-                        pos_prev_doc = d_id;
-                        write_vbyte(pos_data, static_cast<uint32_t>(merged[i].positions.size()));
-                        uint32_t prev_pos = 0;
-                        for (uint32_t p : merged[i].positions) {
-                            write_vbyte(pos_data, p - prev_pos);
-                            prev_pos = p;
-                        }
-                    }
                 }
 
                 if (block_max_tf > global_max_tf) global_max_tf = block_max_tf;
@@ -909,7 +859,6 @@ public:
                     hdr_buf.push_back(block_max_tf);
                     hdr_buf.push_back(block_min_qlen);
                     write_vbyte(hdr_buf, static_cast<uint32_t>(block_data.size()));
-                    if (has_positions) write_vbyte(hdr_buf, static_cast<uint32_t>(pos_data.size()));
                     f_postings.write(reinterpret_cast<const char*>(hdr_buf.data()), hdr_buf.size());
                     current_postings_offset += hdr_buf.size();
                 }
@@ -918,11 +867,6 @@ public:
 
                 f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
                 current_postings_offset += block_data.size();
-
-                if (has_positions && !pos_data.empty()) {
-                    f_positions.write(reinterpret_cast<const char*>(pos_data.data()), pos_data.size());
-                    current_positions_offset += pos_data.size();
-                }
             }
 
             // -------- dict entry, front-coded against the previous term ----
@@ -939,11 +883,7 @@ public:
             dict_buf.push_back(global_max_tf);
             dict_buf.push_back(global_min_qlen);
             write_vbyte64(dict_buf, term_postings_start - prev_postings_offset);
-            dict_buf.push_back(has_positions);
-            if (has_positions) {
-                write_vbyte64(dict_buf, term_positions_start - prev_positions_offset);
-                prev_positions_offset = term_positions_start;
-            }
+            dict_buf.push_back(0);  // has_positions
             prev_postings_offset = term_postings_start;
             prev_term = term;
             num_written_terms++;
@@ -962,7 +902,6 @@ public:
         f_dict.write(reinterpret_cast<const char*>(&num_written_terms), sizeof(num_written_terms));
         f_dict.close();
         f_postings.close();
-        f_positions.close();
 
         for (auto& r : readers) r.file.close();
         for (const auto& rfile : run_files) std::remove(rfile.c_str());
@@ -1095,7 +1034,6 @@ public:
         const uint8_t* p = buf.data() + sizeof(num_terms);
         std::string prev_term;
         uint64_t prev_postings_offset = 0;
-        uint64_t prev_positions_offset = 0;
 
         for (uint32_t i = 0; i < num_terms; ++i) {
             uint32_t prefix = read_vbyte(p);
@@ -1113,8 +1051,7 @@ public:
             prev_postings_offset = m.postings_offset;
             m.has_positions = *p++;
             if (m.has_positions) {
-                m.positions_offset = prev_positions_offset + read_vbyte64(p);
-                prev_positions_offset = m.positions_offset;
+                (void)read_vbyte64(p);  // skip unused position-offset field
             }
 
             terms_sorted.push_back(term);
@@ -1165,7 +1102,6 @@ public:
         load_dictionary(index_dir);
 
         postings_mmap.map_file(index_dir + "/postings.bin");
-        positions_mmap.map_file(index_dir + "/positions.bin");
         fwd_mmap.map_file(index_dir + "/fwd.bin");
         fwdoff_mmap.map_file(index_dir + "/fwdoff.bin");
 
@@ -1281,160 +1217,6 @@ public:
         return out;
     }
 
-    // -----------------------------------------------------------------------
-    // Positions for one (term, doc), used by the SDM proximity rerank.
-    // Walks the skip table to find the block containing target_doc_id, then
-    // decodes only that block's position payload.
-    // -----------------------------------------------------------------------
-    std::vector<uint32_t> get_positions(int32_t tid, uint32_t target_doc_id) {
-        if (tid < 0 || tid >= static_cast<int32_t>(term_metas.size())) return {};
-        const TermMeta& meta = term_metas[tid];
-        if (!meta.has_positions || !positions_mmap.data || !postings_mmap.data) return {};
-
-        uint32_t num_blocks = (meta.df + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
-        uint64_t pos_off = meta.positions_offset;
-        uint32_t block_first_doc = 0;   // running doc id at the start of a block
-        uint32_t last_doc = 0;
-        uint32_t remaining = meta.df;
-
-        for (uint32_t b_idx = 0; b_idx < num_blocks; ++b_idx) {
-            uint32_t n_in_block = std::min(BLOCK_SIZE, remaining);
-            remaining -= n_in_block;
-
-            uint32_t payload_bytes = 0, pos_bytes = 0;
-            if (num_blocks > 1) {
-                last_doc += read_vbyte(ptr);
-                ptr += 2;
-                payload_bytes = read_vbyte(ptr);
-                pos_bytes = read_vbyte(ptr);
-            } else {
-                last_doc = 0xFFFFFFFFu;   // single block necessarily contains it
-            }
-
-            if (last_doc >= target_doc_id) {
-                const uint8_t* pp = positions_mmap.data + pos_off;
-                uint32_t doc = block_first_doc;
-                for (uint32_t i = 0; i < n_in_block; ++i) {
-                    doc += read_vbyte(pp);
-                    uint32_t num_pos = read_vbyte(pp);
-                    if (doc == target_doc_id) {
-                        std::vector<uint32_t> res;
-                        res.reserve(num_pos);
-                        uint32_t cur = 0;
-                        for (uint32_t j = 0; j < num_pos; ++j) {
-                            cur += read_vbyte(pp);
-                            res.push_back(cur);
-                        }
-                        return res;
-                    }
-                    if (doc > target_doc_id) return {};
-                    for (uint32_t j = 0; j < num_pos; ++j) read_vbyte(pp);
-                }
-                return {};
-            }
-
-            ptr += payload_bytes;
-            pos_off += pos_bytes;
-            block_first_doc = last_doc;
-        }
-        return {};
-    }
-
-    // -----------------------------------------------------------------------
-    // Sequential Dependence Model rerank: unigram score plus ordered-bigram
-    // and unordered-window proximity evidence over the candidate pool.
-    // -----------------------------------------------------------------------
-    std::vector<std::pair<std::string, float>> sdm_rerank(
-        const std::vector<int32_t>& query_tids,
-        const std::vector<std::pair<uint32_t, float>>& candidates,
-        int top_k,
-        float lambda_t, float lambda_o, float lambda_u, uint32_t window_u,
-        bool normalise_signals)
-    {
-        if (candidates.empty()) return {};
-
-        std::vector<std::pair<int32_t, int32_t>> bigrams;
-        for (size_t i = 0; i + 1 < query_tids.size(); ++i) {
-            if (query_tids[i] >= 0 && query_tids[i + 1] >= 0)
-                bigrams.push_back({query_tids[i], query_tids[i + 1]});
-        }
-
-        // Collect the three signals separately, then combine on a common
-        // scale. The previous version mixed a raw BM25 score (magnitude ~10-30)
-        // with log-counts (magnitude ~0-3) using lambda_o = 0.10, so the
-        // proximity evidence contributed well under 1% of the final score and
-        // the rerank was effectively a no-op. Min-max normalising each signal
-        // across the candidate pool makes the lambdas mean what they say.
-        std::vector<float> uni(candidates.size()), ord(candidates.size()), uno(candidates.size());
-
-        for (size_t ci = 0; ci < candidates.size(); ++ci) {
-            uint32_t doc_id = candidates[ci].first;
-            uni[ci] = candidates[ci].second;
-
-            float ordered_score = 0.0f, unordered_score = 0.0f;
-            std::map<std::pair<int32_t, uint32_t>, std::vector<uint32_t>> pos_cache;
-            auto cached_pos = [&](int32_t tid) -> const std::vector<uint32_t>& {
-                auto key = std::make_pair(tid, doc_id);
-                auto it = pos_cache.find(key);
-                if (it == pos_cache.end())
-                    it = pos_cache.emplace(key, get_positions(tid, doc_id)).first;
-                return it->second;
-            };
-            for (const auto& bg : bigrams) {
-                const auto& pos1 = cached_pos(bg.first);
-                if (pos1.empty()) continue;
-                const auto& pos2 = cached_pos(bg.second);
-                if (pos2.empty()) continue;
-
-                uint32_t ordered_cnt = 0, unordered_cnt = 0;
-                size_t i1 = 0, i2 = 0;
-                while (i1 < pos1.size() && i2 < pos2.size()) {
-                    long diff = static_cast<long>(pos2[i2]) - static_cast<long>(pos1[i1]);
-                    if (diff == 1) { ordered_cnt++; unordered_cnt++; i1++; i2++; }
-                    else if (diff > 1 && diff <= static_cast<long>(window_u)) { unordered_cnt++; i2++; }
-                    else if (diff > static_cast<long>(window_u)) { i1++; }
-                    else if (diff < 0 && -diff <= static_cast<long>(window_u)) { unordered_cnt++; i1++; }
-                    else { i2++; }
-                }
-                if (ordered_cnt > 0) ordered_score += std::log(1.0f + ordered_cnt);
-                if (unordered_cnt > 0) unordered_score += std::log(1.0f + unordered_cnt);
-            }
-            ord[ci] = ordered_score;
-            uno[ci] = unordered_score;
-        }
-
-        auto normalise = [](std::vector<float>& v) {
-            if (v.empty()) return;
-            float lo = *std::min_element(v.begin(), v.end());
-            float hi = *std::max_element(v.begin(), v.end());
-            float range = hi - lo;
-            if (range <= 1e-9f) { for (auto& x : v) x = 0.0f; return; }
-            for (auto& x : v) x = (x - lo) / range;
-        };
-        if (normalise_signals) { normalise(uni); normalise(ord); normalise(uno); }
-
-        std::vector<std::pair<uint32_t, float>> reranked;
-        reranked.reserve(candidates.size());
-        for (size_t ci = 0; ci < candidates.size(); ++ci) {
-            reranked.push_back({candidates[ci].first,
-                lambda_t * uni[ci] + lambda_o * ord[ci] + lambda_u * uno[ci]});
-        }
-
-        size_t want = std::min(static_cast<size_t>(std::max(top_k, 0)), reranked.size());
-        std::partial_sort(reranked.begin(), reranked.begin() + want, reranked.end(),
-                          [](const auto& a, const auto& b) {
-                              if (a.second != b.second) return a.second > b.second;
-                              return a.first < b.first;
-                          });
-
-        std::vector<std::pair<std::string, float>> results;
-        results.reserve(want);
-        for (size_t i = 0; i < want; ++i)
-            results.push_back({doc_ids[reranked[i].first], reranked[i].second});
-        return results;
-    }
-
     // =======================================================================
     // ENTRY POINT
     // =======================================================================
@@ -1448,29 +1230,18 @@ public:
         int fb_docs = 10,
         int fb_terms = 25,
         float alpha = 0.6f,
-        float mu = 1000.0f,
-        bool use_sdm = true,
-        int sdm_rerank_depth = 200,
-        float lambda_o = 0.10f,
-        float lambda_u = 0.05f,
-        uint32_t window_u = 8,
-        bool sdm_normalise = true)
+        float mu = 1000.0f)
     {
         auto tokens = cpp_tokenize(query, tokcfg);
         if (tokens.empty() || N == 0) return {};
 
-        std::vector<int32_t> query_tids;
-        query_tids.reserve(tokens.size());
         std::unordered_map<int32_t, float> qw;
         for (const auto& tp : tokens) {
             int32_t tid = find_term(tp.first);
-            query_tids.push_back(tid);
             if (tid >= 0) qw[tid] += 1.0f;
         }
         if (qw.empty()) return {};
         // Normalise by the mass of in-vocabulary query terms, not token count.
-        // Dividing by tokens.size() shrinks the original query whenever any
-        // token is OOV, so alpha no longer means "weight on the original query".
         float qsum = 0.0f;
         for (const auto& kv : qw) qsum += kv.second;
         if (qsum <= 0.0f) return {};
@@ -1478,8 +1249,7 @@ public:
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
 
-        int pass1_depth = std::max(fb_docs, use_sdm ? sdm_rerank_depth : k);
-        auto pass1 = raw_retrieve(q_vec, pass1_depth, k1, b, delta);
+        auto pass1 = raw_retrieve(q_vec, std::max(fb_docs, k), k1, b, delta);
         if (pass1.empty()) return {};
 
         std::vector<std::pair<uint32_t, float>> pool;
@@ -1489,8 +1259,6 @@ public:
         } else {
             int num_fb = std::min(static_cast<int>(pass1.size()), fb_docs);
 
-            // If the top results are indistinguishable, feedback has nothing
-            // to learn from; fall back to the first-pass ranking.
             float mean = 0.0f;
             for (int i = 0; i < num_fb; ++i) mean += pass1[i].second;
             mean /= num_fb;
@@ -1513,8 +1281,6 @@ public:
                 for (int i = 0; i < num_fb; ++i) fb_docs_vec.push_back(pass1[i].first);
                 auto batch = get_batch_doc_term_freqs(fb_docs_vec);
 
-                // RM3 relevance model: P(w|R) = sum_D P(w|D) P(D|Q), with
-                // P(w|D) Dirichlet-smoothed against the collection model.
                 std::unordered_map<int32_t, float> p_w_r;
                 for (int i = 0; i < num_fb; ++i) {
                     uint32_t doc_id = pass1[i].first;
@@ -1549,16 +1315,8 @@ public:
                 for (const auto& kv : expansion) final_w[kv.first] += (1.0f - alpha) * (kv.second / esum);
 
                 std::vector<std::pair<int32_t, float>> final_vec(final_w.begin(), final_w.end());
-                pool = raw_retrieve(final_vec, std::max(use_sdm ? sdm_rerank_depth : k, k),
-                                    k1, b, delta);
+                pool = raw_retrieve(final_vec, k, k1, b, delta);
             }
-        }
-
-        if (use_sdm && query_tids.size() > 1) {
-            if (pool.size() > static_cast<size_t>(sdm_rerank_depth)) pool.resize(sdm_rerank_depth);
-            float lambda_t = 1.0f - lambda_o - lambda_u;
-            return sdm_rerank(query_tids, pool, k, lambda_t, lambda_o, lambda_u,
-                              window_u, sdm_normalise);
         }
 
         std::vector<std::pair<std::string, float>> results;
@@ -1568,20 +1326,15 @@ public:
         return results;
     }
 
-    // -----------------------------------------------------------------------
-    // Plain BM25+ with no RM3 and no SDM. Needed for the report's ablation
-    // table and for the unit tests that check BM25 in isolation.
-    // -----------------------------------------------------------------------
     std::vector<std::pair<std::string, float>> retrieve_bm25(
         const std::string& query, int k, float k1, float b, float delta)
     {
-        return retrieve(query, k, k1, b, delta, false, 0, 0, 1.0f, 1000.0f, false, 0,
-                        0.0f, 0.0f, 8, true);
+        return retrieve(query, k, k1, b, delta, false, 0, 0, 1.0f, 1000.0f);
     }
 };
 
 PYBIND11_MODULE(cpp_engine, m) {
-    m.doc() = "From-scratch inverted index with BM25+, RM3 expansion and SDM proximity rerank";
+    m.doc() = "From-scratch inverted index with BM25+ and RM3 expansion";
     py::class_<CPPEngine>(m, "CPPEngine")
         .def(py::init<>())
         .def("build_index", &CPPEngine::build_index, py::arg("corpus"), py::arg("index_dir"))
@@ -1592,10 +1345,7 @@ PYBIND11_MODULE(cpp_engine, m) {
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
              py::arg("use_rm3") = true, py::arg("fb_docs") = 10, py::arg("fb_terms") = 25,
-             py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f,
-             py::arg("use_sdm") = true, py::arg("sdm_rerank_depth") = 200,
-             py::arg("lambda_o") = 0.10f, py::arg("lambda_u") = 0.05f, py::arg("window_u") = 8,
-             py::arg("sdm_normalise") = true)
+             py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f)
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f);
