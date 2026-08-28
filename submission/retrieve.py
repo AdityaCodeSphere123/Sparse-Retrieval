@@ -51,21 +51,21 @@ except ImportError:
 # Restored from f49fec1 (dev nDCG@10 0.6588). Later sweeps with RM3 off
 # or with auto-ascent from BASE did not beat this. SDM stays off.
 PARAMS = dict(
-    k1=2.1,
-    b=0.6,
-    delta=0.25,
+    k1=2.5,
+    b=0.5,
+    delta=0.0,
     use_rm3=True,
-    fb_docs=10,
-    fb_terms=10,
+    fb_docs=5,
+    fb_terms=20,
     alpha=0.7,
-    mu=2000.0,
+    mu=1000.0,
     use_sdm=False,
     sdm_rerank_depth=200,
     lambda_o=0.0,
     lambda_u=0.0,
     window_u=8,
     sdm_normalise=True,
-)
+    )
 
 # The ANALYSIS CHAIN (stemmer + stopwords) is not here because it is not a
 # query-time choice: it is baked into the index at build time and read back
