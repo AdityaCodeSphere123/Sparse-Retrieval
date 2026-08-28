@@ -136,8 +136,7 @@ def retrieve_bm25_only(query: str, k: int = 10) -> List[Tuple[str, float]]:
         if _CPP_ENGINE is None:
             raise RuntimeError("load_index() must be called before retrieve()")
         return _CPP_ENGINE.retrieve_bm25(
-            query, k, PARAMS["k1"], PARAMS["b"], PARAMS["delta"],
-            PARAMS.get("title_bonus", 0.0),
+            query, k, PARAMS["k1"], PARAMS["b"], PARAMS["delta"], 0.0,
         )
     if _INDEX is None:
         raise RuntimeError("load_index() must be called before retrieve()")

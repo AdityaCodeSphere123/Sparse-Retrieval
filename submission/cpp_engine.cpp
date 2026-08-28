@@ -684,6 +684,8 @@ public:
 
         std::string ext_id, text;
         uint32_t doc_int_id = 0;
+        uint64_t over_63 = 0;   // (doc, term) pairs whose body tf saturates the 6-bit field
+        uint32_t max_body_tf = 0;
 
         while (next_doc(ext_id, text)) {
             doc_ids.push_back(ext_id);
@@ -725,6 +727,8 @@ public:
             }
 
             for (auto& kv : term_data) {
+                if (kv.second.first > max_body_tf) max_body_tf = kv.second.first;
+                if (kv.second.first > 63) ++over_63;
                 temp_postings[kv.first].push_back(
                     DocPosting{doc_int_id, kv.second.first, kv.second.second});
             }
@@ -738,6 +742,9 @@ public:
 
         N = doc_int_id;
         avg_doc_len = (N > 0) ? static_cast<float>(static_cast<double>(total_corpus_tokens) / N) : 0.0f;
+        std::cerr << "[cpp_engine] body tf>63: " << over_63
+                  << " (doc,term) pairs; max body tf=" << max_body_tf
+                  << " over N=" << N << " docs\n";
 
         quantized_doc_lens.resize(N);
         for (uint32_t i = 0; i < N; ++i) {
