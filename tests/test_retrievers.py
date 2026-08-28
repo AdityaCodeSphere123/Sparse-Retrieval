@@ -87,6 +87,83 @@ def test_boolean_and_or_on_known_set():
     assert boolean_vsm.boolean_search("", mode="and") == []
 
 
+def test_boolean_rejects_invalid_mode():
+    boolean_vsm.build(_tiny_index())
+    with pytest.raises(ValueError, match="mode"):
+        boolean_vsm.boolean_search("cat", mode="xor")
+    with pytest.raises(ValueError, match="mode"):
+        boolean_vsm.boolean_search("cat", mode="AND NOT")
+
+
+def test_boolean_and_or_results_are_sorted():
+    boolean_vsm.build(_tiny_index())
+    assert boolean_vsm.boolean_search("cat dog", mode="or") == ["dA", "dB", "dC"]
+    assert boolean_vsm.boolean_search("cat", mode="and") == ["dA", "dB"]
+
+
+def test_vsm_returns_at_most_k_and_empty_on_oov():
+    boolean_vsm.build(_tiny_index())
+    assert boolean_vsm.vsm_score("cat", k=1) == [
+        boolean_vsm.vsm_score("cat", k=10)[0]
+    ]
+    assert boolean_vsm.vsm_score("", k=10) == []
+    assert boolean_vsm.vsm_score("unicorn", k=10) == []
+
+
+def test_vsm_tie_break_is_doc_id_ascending():
+    # Need df(cat) < N so ln(N/df) is nonzero; otherwise every weight is 0
+    # and cosine returns no documents.
+    index = InvertedIndex()
+    index.build([("z_doc", "cat"), ("a_doc", "cat"), ("other", "dog")])
+    boolean_vsm.build(index)
+    ranking = boolean_vsm.vsm_score("cat", k=10)
+    assert [doc_id for doc_id, _ in ranking] == ["a_doc", "z_doc"]
+    assert ranking[0][1] == pytest.approx(ranking[1][1])
+
+
+def test_bm25_empty_query_and_oov_are_empty():
+    bm25.build(_tiny_index())
+    assert bm25.score("", k=10) == []
+    assert bm25.score("unicorn", k=10) == []
+
+
+def test_bm25_multi_term_is_sum_of_idf_weighted_tfs():
+    """Two-term query: score(d) = BM25(cat) + BM25(dog) on that document."""
+    index = _tiny_index()
+    bm25.build(index)
+    k1, b = 1.2, 0.75
+    N, avgdl = 3, (3 + 1 + 2) / 3.0
+
+    def idf(df):
+        return math.log(1.0 + (N - df + 0.5) / (df + 0.5))
+
+    def sat(tf, doc_len):
+        K = k1 * (1.0 - b + b * (doc_len / avgdl))
+        return (tf * (k1 + 1.0)) / (tf + K)
+
+    # dA: cat tf=2, dog tf=1, |D|=3
+    expected = idf(2) * sat(2, 3) + idf(2) * sat(1, 3)
+    got = dict(bm25.score("cat dog", k=10, k1=k1, b=b, delta=0.0))
+    assert got["dA"] == pytest.approx(expected, rel=1e-12)
+    assert "dB" in got  # cat only
+    assert "dC" in got  # dog only
+
+    boolean_vsm.build(_tiny_index())
+
+    # AND: only dA has both cat and dog.
+    assert set(boolean_vsm.boolean_search("cat dog", mode="and")) == {"dA"}
+    # AND with a term that exists only in dC should be empty vs cat.
+    assert boolean_vsm.boolean_search("cat bird", mode="and") == []
+    # Missing term: conjunction is empty.
+    assert boolean_vsm.boolean_search("cat unicorn", mode="and") == []
+    # OR: cat OR bird hits all three.
+    assert set(boolean_vsm.boolean_search("cat bird", mode="or")) == {"dA", "dB", "dC"}
+    # OR of unknown terms is empty.
+    assert boolean_vsm.boolean_search("unicorn griffin", mode="or") == []
+    # Empty query.
+    assert boolean_vsm.boolean_search("", mode="and") == []
+
+
 def test_vsm_and_bm25_scoring():
     index = InvertedIndex()
     index.build(CORPUS)
