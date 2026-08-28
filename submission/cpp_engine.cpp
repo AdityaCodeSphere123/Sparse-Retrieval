@@ -9,7 +9,9 @@
 //   doclens.bin   N, avg_doc_len, total_tokens, then N x uint8 quantised
 //                 length ratios (log-quantised, see quantize_doc_len)
 //   dict.bin      terms in sorted order, front-coded, varint fields
-//   postings.bin  per term: optional block skip table + gap/varint postings
+//   postings.bin  per term: optional block skip table + gap/varint postings.
+//                 The tf byte is packed: high 2 bits = title tf (0–3) in the
+//                 leading TITLE_WINDOW tokens, low 6 bits = body tf (0–63).
 //   fwd.bin       pruned forward index (doc -> top terms), for RM3
 //   fwdoff.bin    N+1 x uint32 offsets into fwd.bin
 //
@@ -46,8 +48,19 @@ namespace py = pybind11;
 static constexpr uint32_t BLOCK_SIZE            = 128;   // postings per block
 static constexpr uint32_t FWD_TERMS_PER_DOC     = 24;    // RM3 forward index width; 48→24 keeps nDCG, cuts fwd.bin
 static constexpr uint32_t FWD_CANDIDATES        = 128;   // pre-df-filter margin (ranked later by tf*idf)
-static constexpr float    RM3_DF_FRACTION       = 0.05f;  // forward-index df ceiling
+static constexpr float    RM3_DF_FRACTION       = 0.13f; // mid-frequency clinical vocab; 5% was too tight
+static constexpr uint32_t TITLE_WINDOW          = 12;    // leading tokens treated as title (CORD-19 median)
 static constexpr uint32_t SPIMI_BATCH_DOCS      = 50000;
+
+// Pack body tf in the low 6 bits (saturates at 63; BM25 is flat there anyway)
+// and title tf in the high 2 bits (0–3). Same one-byte posting as before.
+static inline uint8_t pack_tf_byte(uint32_t body_tf, uint32_t title_tf) {
+    uint8_t b = static_cast<uint8_t>(std::min(body_tf, 63u));
+    uint8_t t = static_cast<uint8_t>(std::min(title_tf, 3u));
+    return static_cast<uint8_t>((t << 6) | b);
+}
+static inline uint32_t unpack_body_tf(uint8_t packed) { return packed & 63u; }
+static inline uint32_t unpack_title_tf(uint8_t packed) { return packed >> 6; }
 
 // ---------------------------------------------------------------------------
 // Stopwords (Indri / INQUERY inspired subset), used to prune the forward
@@ -385,15 +398,28 @@ static inline std::string s_stem(const std::string& word) {
     return word;
 }
 
-// Standard short English stopword list (the Lucene/BEIR set). Deliberately
-// NOT the large INQUERY list above: that one drops "case", "state", "number",
-// "group", "point" and "work", which are content words in a biomedical or
-// newswire collection. The big list is still used for RM3 expansion
-// candidates, where being aggressive is appropriate.
+// NLTK English stopwords, applied to the RAW lowercased token (before Porter).
+// Carve-outs vs the stock list:
+//   - single letters stay indexed (vitamin D, T cells → tokens "d"/"t")
+//   - "don" stays indexed (Porter stem of "donning", not just "don't")
+// Question words (what/how/which/who/does/from) ARE stopped: they had
+// non-trivial IDF on this collection and polluted NL-question rankings.
+// Content words (case/state/work/group) are not on this list.
 static const std::unordered_set<std::string> INDEX_STOPWORDS = {
-    "a","an","and","are","as","at","be","but","by","for","if","in","into","is","it",
-    "no","not","of","on","or","such","that","the","their","then","there","these",
-    "they","this","to","was","will","with"
+    "me","my","myself","we","our","ours","ourselves","you","your","yours",
+    "yourself","yourselves","he","him","his","himself","she","her","hers",
+    "herself","it","its","itself","they","them","their","theirs","themselves",
+    "what","which","who","whom","this","that","these","those","am","is","are",
+    "was","were","be","been","being","have","has","had","having","do","does",
+    "did","doing","an","the","and","but","if","or","because","as","until",
+    "while","of","at","by","for","with","about","against","between","into",
+    "through","during","before","after","above","below","to","from","up",
+    "down","in","out","on","off","over","under","again","further","then",
+    "once","here","there","when","where","why","how","all","any","both",
+    "each","few","more","most","other","some","such","no","nor","not","only",
+    "own","same","so","than","too","very","can","will","just","should","now",
+    "ain","aren","couldn","didn","doesn","hadn","hasn","haven","isn","ma",
+    "mightn","mustn","needn","shan","shouldn","wasn","weren","won","wouldn"
 };
 
 struct TokenizerCfg {
@@ -489,6 +515,7 @@ struct TermMeta {
 struct DocPosting {
     uint32_t doc_id;
     uint32_t tf;
+    uint32_t title_tf = 0;
 };
 
 // Minimal JSONL field extraction for {"doc_id": ..., "text": ...}.
@@ -648,6 +675,7 @@ public:
                 for (const auto& p : plist) {
                     f.write(reinterpret_cast<const char*>(&p.doc_id), sizeof(p.doc_id));
                     f.write(reinterpret_cast<const char*>(&p.tf), sizeof(p.tf));
+                    f.write(reinterpret_cast<const char*>(&p.title_tf), sizeof(p.title_tf));
                 }
             }
             temp_postings.clear();
@@ -667,9 +695,11 @@ public:
             doc_lens.push_back(d_len);
             total_corpus_tokens += d_len;
 
-            std::unordered_map<std::string, uint32_t> term_data;
+            std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> term_data;  // tf, title_tf
             for (const auto& tp : tokens) {
-                term_data[tp.first]++;
+                auto& slot = term_data[tp.first];
+                slot.first++;
+                if (tp.second < TITLE_WINDOW) slot.second++;
                 collection_freq[tp.first]++;
             }
 
@@ -679,7 +709,7 @@ public:
             cands.reserve(term_data.size());
             for (const auto& kv : term_data) {
                 if (STOPWORDS.count(kv.first)) continue;
-                cands.push_back({kv.second, &kv.first});
+                cands.push_back({kv.second.first, &kv.first});
             }
             size_t keep = std::min<size_t>(cands.size(), FWD_CANDIDATES);
             std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
@@ -695,7 +725,8 @@ public:
             }
 
             for (auto& kv : term_data) {
-                temp_postings[kv.first].push_back(DocPosting{doc_int_id, kv.second});
+                temp_postings[kv.first].push_back(
+                    DocPosting{doc_int_id, kv.second.first, kv.second.second});
             }
 
             doc_int_id++;
@@ -811,6 +842,7 @@ public:
                     DocPosting dp;
                     r.file.read(reinterpret_cast<char*>(&dp.doc_id), sizeof(dp.doc_id));
                     r.file.read(reinterpret_cast<char*>(&dp.tf), sizeof(dp.tf));
+                    r.file.read(reinterpret_cast<char*>(&dp.title_tf), sizeof(dp.title_tf));
                     merged_cf += dp.tf;
                     merged.push_back(dp);
                 }
@@ -838,9 +870,7 @@ public:
 
                 for (uint32_t i = start_i; i < end_i; ++i) {
                     uint32_t d_id = merged[i].doc_id;
-                    uint32_t tf = merged[i].tf;
-
-                    uint8_t tf_byte = static_cast<uint8_t>(std::min(tf, 255u));
+                    uint8_t tf_byte = pack_tf_byte(merged[i].tf, merged[i].title_tf);
                     if (tf_byte > block_max_tf) block_max_tf = tf_byte;
                     uint8_t ql = quantized_doc_lens[d_id];
                     if (ql < block_min_qlen) block_min_qlen = ql;
@@ -1126,7 +1156,7 @@ public:
     //
     std::vector<std::pair<uint32_t, float>> raw_retrieve(
         const std::vector<std::pair<int32_t, float>>& qterms,
-        int top_k, float k1, float b, float delta)
+        int top_k, float k1, float b, float delta, float title_bonus)
     {
         if (qterms.empty() || N == 0 || !postings_mmap.data) return {};
 
@@ -1166,11 +1196,17 @@ public:
 
                 for (uint32_t i = 0; i < n_in_block; ++i) {
                     current_doc += read_vbyte(ptr);
-                    uint8_t tf = *ptr++;
+                    uint8_t packed = *ptr++;
+                    float tf = static_cast<float>(unpack_body_tf(packed));
+                    float title_tf = static_cast<float>(unpack_title_tf(packed));
 
                     float tf_norm = (tf * (k1 + 1.0f)) /
                                     (tf + length_penalty_lut[quantized_doc_lens[current_doc]]);
+                    // Title hit: same additive shape as BM25+ delta, but only
+                    // if the term occurs in the leading TITLE_WINDOW tokens.
                     float contrib = w * (tf_norm + delta);
+                    if (title_tf > 0.0f && title_bonus != 0.0f)
+                        contrib += w * title_bonus;
 
                     if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
                     acc[current_doc] += contrib;
@@ -1234,7 +1270,8 @@ public:
         int fb_docs = 10,
         int fb_terms = 25,
         float alpha = 0.6f,
-        float mu = 1000.0f)
+        float mu = 1000.0f,
+        float title_bonus = 1.0f)
     {
         auto tokens = cpp_tokenize(query, tokcfg);
         if (tokens.empty() || N == 0) return {};
@@ -1253,7 +1290,7 @@ public:
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
 
-        auto pass1 = raw_retrieve(q_vec, std::max(fb_docs, k), k1, b, delta);
+        auto pass1 = raw_retrieve(q_vec, std::max(fb_docs, k), k1, b, delta, title_bonus);
         if (pass1.empty()) return {};
 
         std::vector<std::pair<uint32_t, float>> pool;
@@ -1319,7 +1356,7 @@ public:
                 for (const auto& kv : expansion) final_w[kv.first] += (1.0f - alpha) * (kv.second / esum);
 
                 std::vector<std::pair<int32_t, float>> final_vec(final_w.begin(), final_w.end());
-                pool = raw_retrieve(final_vec, k, k1, b, delta);
+                pool = raw_retrieve(final_vec, k, k1, b, delta, title_bonus);
             }
         }
 
@@ -1331,9 +1368,9 @@ public:
     }
 
     std::vector<std::pair<std::string, float>> retrieve_bm25(
-        const std::string& query, int k, float k1, float b, float delta)
+        const std::string& query, int k, float k1, float b, float delta, float title_bonus = 0.0f)
     {
-        return retrieve(query, k, k1, b, delta, false, 0, 0, 1.0f, 1000.0f);
+        return retrieve(query, k, k1, b, delta, false, 0, 0, 1.0f, 1000.0f, title_bonus);
     }
 };
 
@@ -1349,8 +1386,10 @@ PYBIND11_MODULE(cpp_engine, m) {
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
              py::arg("use_rm3") = true, py::arg("fb_docs") = 10, py::arg("fb_terms") = 25,
-             py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f)
+             py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f,
+             py::arg("title_bonus") = 1.0f)
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
-             py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f);
+             py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
+             py::arg("title_bonus") = 0.0f);
 }

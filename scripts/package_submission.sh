@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 # Usage: bash scripts/package_submission.sh ENTRY_NO
 # Example: bash scripts/package_submission.sh 2022CS10999
+#
+# Packs the Moodle zip so that it inflates to:
+#   ENTRY_NO/
+#     assignment1.tex
+#     conftest.py
+#     data/README.md
+#     data/toy/
+#     Dockerfile
+#     docs/
+#     harness/
+#     README.md
+#     requirements.txt
+#     runs/
+#     scripts/
+#     submission/
+#     tests/
+#
 
 set -e
 
@@ -21,12 +38,12 @@ echo "Packaging submission for Entry No: ${ENTRY_NO}..."
 rm -rf "${BUILD_DIR}" "${ROOT_DIR}/${ZIP_NAME}"
 mkdir -p "${BUILD_DIR}"
 
-# Copy required assignment files into entry folder
+cp "${ROOT_DIR}/assignment1.tex" "${BUILD_DIR}/"
 cp "${ROOT_DIR}/conftest.py" "${BUILD_DIR}/"
 cp "${ROOT_DIR}/Dockerfile" "${BUILD_DIR}/"
 cp "${ROOT_DIR}/README.md" "${BUILD_DIR}/"
+cp "${ROOT_DIR}/report.md" "${BUILD_DIR}/"
 cp "${ROOT_DIR}/requirements.txt" "${BUILD_DIR}/"
-cp "${ROOT_DIR}/setup.py" "${BUILD_DIR}/"
 
 cp -r "${ROOT_DIR}/docs" "${BUILD_DIR}/"
 cp -r "${ROOT_DIR}/harness" "${BUILD_DIR}/"
@@ -34,20 +51,31 @@ cp -r "${ROOT_DIR}/scripts" "${BUILD_DIR}/"
 cp -r "${ROOT_DIR}/submission" "${BUILD_DIR}/"
 cp -r "${ROOT_DIR}/tests" "${BUILD_DIR}/"
 
-# Copy data/toy only (do NOT include data/full)
 mkdir -p "${BUILD_DIR}/data"
 cp "${ROOT_DIR}/data/README.md" "${BUILD_DIR}/data/"
 cp -r "${ROOT_DIR}/data/toy" "${BUILD_DIR}/data/"
 
-# Clean up unwanted binaries, caches, and temp files inside the package
+mkdir -p "${BUILD_DIR}/runs"
+if [ -d "${ROOT_DIR}/runs" ]; then
+  # Starter-tracked run artifacts only; skip local sweep dumps.
+  for f in dev_run.trec dev_report.json; do
+    if [ -f "${ROOT_DIR}/runs/${f}" ]; then
+      cp "${ROOT_DIR}/runs/${f}" "${BUILD_DIR}/runs/"
+    fi
+  done
+fi
+
 find "${BUILD_DIR}" -name "*.so" -delete
 find "${BUILD_DIR}" -name "*.dylib" -delete
 find "${BUILD_DIR}" -name "*.pyc" -delete
 find "${BUILD_DIR}" -name ".DS_Store" -delete
 find "${BUILD_DIR}" -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-rm -rf "${BUILD_DIR}/build" "${BUILD_DIR}/.pytest_cache"
+rm -rf "${BUILD_DIR}/build" "${BUILD_DIR}/.pytest_cache" "${BUILD_DIR}/submission/build"
 
-# Create the zip archive
+# Guard: never ship the assignment PDF or the full corpus.
+rm -f "${BUILD_DIR}/assignment1.pdf"
+rm -rf "${BUILD_DIR}/data/full"
+
 (cd /tmp && zip -r "${ZIP_NAME}" "${ENTRY_NO}")
 mv "/tmp/${ZIP_NAME}" "${ROOT_DIR}/${ZIP_NAME}"
 rm -rf "${BUILD_DIR}"

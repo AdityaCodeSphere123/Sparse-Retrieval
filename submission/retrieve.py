@@ -43,17 +43,20 @@ except ImportError:
 #   fb_terms  number of expansion terms kept from the relevance model
 #   alpha     weight on the original query vs. the expansion (1.0 = no expansion)
 #   mu        Dirichlet smoothing for P(w|D) in the relevance model
+#   title_bonus  additive IDF-weighted boost when a query term hits the
+#                leading TITLE_WINDOW tokens (packed in the existing tf byte)
 # ---------------------------------------------------------------------------
 
 PARAMS = dict(
-    k1=2.5,
-    b=0.5,
-    delta=0.0,
+    k1=2.1,
+    b=0.6,
+    delta=0.25,
     use_rm3=True,
-    fb_docs=5,
+    fb_docs=30,
     fb_terms=20,
     alpha=0.7,
     mu=1000.0,
+    title_bonus=0.75,
 )
 
 # The ANALYSIS CHAIN (stemmer + stopwords) is not here because it is not a
@@ -133,7 +136,8 @@ def retrieve_bm25_only(query: str, k: int = 10) -> List[Tuple[str, float]]:
         if _CPP_ENGINE is None:
             raise RuntimeError("load_index() must be called before retrieve()")
         return _CPP_ENGINE.retrieve_bm25(
-            query, k, PARAMS["k1"], PARAMS["b"], PARAMS["delta"]
+            query, k, PARAMS["k1"], PARAMS["b"], PARAMS["delta"],
+            PARAMS.get("title_bonus", 0.0),
         )
     if _INDEX is None:
         raise RuntimeError("load_index() must be called before retrieve()")
