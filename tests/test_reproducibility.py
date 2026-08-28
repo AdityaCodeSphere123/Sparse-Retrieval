@@ -53,3 +53,25 @@ def test_retrieve_is_deterministic_after_reload():
             assert len(doc_ids) == len(set(doc_ids))
             scores = [score for _doc_id, score in ranking]
             assert scores == sorted(scores, reverse=True)
+
+
+def test_cpp_tie_break_is_external_doc_id_not_insertion_order():
+    """Competition retrieve() must match bm25.py: score desc, then doc_id asc."""
+    import pytest
+    from submission import retrieve as r
+
+    if not r.HAS_CPP:
+        pytest.skip("cpp_engine not built")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = os.path.join(tmp, "corpus.jsonl")
+        with open(corpus, "w", encoding="utf-8") as f:
+            f.write('{"doc_id": "docZ", "text": "cat cat cat"}\n')
+            f.write('{"doc_id": "docA", "text": "cat cat cat"}\n')
+        index_dir = os.path.join(tmp, "index")
+        r.build_index(corpus, index_dir)
+        r.load_index(index_dir)
+        ranking = r.retrieve_bm25_only("cat", k=10)
+        ids = [doc_id for doc_id, _ in ranking]
+        assert ids[:2] == ["docA", "docZ"], ids
+        assert ranking[0][1] == pytest.approx(ranking[1][1])
