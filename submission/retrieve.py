@@ -18,7 +18,7 @@ below is a correctness fallback for when the extension is not built.
 import os
 from typing import List, Optional, Tuple
 
-from submission import bm25, boolean_vsm
+from submission import bm25, custom_scorer
 from submission.corpus_utils import load_corpus, stream_corpus
 from submission.indexer import InvertedIndex
 
@@ -53,14 +53,14 @@ except ImportError:
 # round 2 left the grid edge. fb_docs=10 not 40: both sweeps left it at 10.
 # SDM stays off — positions.bin is empty, so proximity is a no-op.
 PARAMS = dict(
-    k1=2.1,
-    b=0.6,
-    delta=0.25,
+    k1=2.5,
+    b=0.5,
+    delta=0.0,
     use_rm3=True,
-    fb_docs=10,
-    fb_terms=10,
+    fb_docs=5,
+    fb_terms=20,
     alpha=0.7,
-    mu=2000.0,
+    mu=1000.0,
     use_sdm=False,
     sdm_rerank_depth=200,
     lambda_o=0.0,
@@ -110,8 +110,7 @@ def load_index(index_dir: str) -> None:
         _CPP_ENGINE.load_index(index_dir)
     else:
         _INDEX = InvertedIndex.load(index_dir)
-        bm25.build(_INDEX)
-        boolean_vsm.build(_INDEX)
+        custom_scorer.build(_INDEX)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
@@ -124,7 +123,7 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
 
     if _INDEX is None:
         raise RuntimeError("load_index() must be called before retrieve()")
-    return bm25.score(query, k, k1=PARAMS["k1"], b=PARAMS["b"], delta=PARAMS["delta"])
+    return custom_scorer.score(query, k)
 
 
 def retrieve_bm25_only(query: str, k: int = 10) -> List[Tuple[str, float]]:

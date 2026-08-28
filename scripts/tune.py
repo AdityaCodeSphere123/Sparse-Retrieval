@@ -5,58 +5,54 @@ Why this exists
 ---------------
 Every scoring parameter in this system is a QUERY-TIME argument, so a full
 sweep needs the index built exactly once and then re-queries it in-process.
-A 400-point grid over 50 dev queries takes seconds, not hours.
 
 The two exceptions are the analysis-chain choices (stemmer, stopwords), which
 are baked into the index at build time. Those are swept by rebuilding, which
 this script does for you with --sweep analysis.
 
+nDCG@10 here uses the harness formula ((2^rel - 1) / log2(rank+1)), so the
+number you see is the one the leaderboard uses — not the linear-gain variant.
+
 Usage
 -----
-    # one-off: build the index once, reuse it for every sweep below
+    # build the index once, then reuse it
     python -m scripts.tune --corpus data/full/corpus.jsonl \
         --queries data/full/queries_dev.tsv --qrels data/full/qrels_dev.txt \
         --index-dir /tmp/tune_index --build
 
-    # the sweep the report asks for (Section 8): nDCG@10 vs k1 and b
-    python -m scripts.tune --queries ... --qrels ... --index-dir /tmp/tune_index \
-        --sweep k1b --csv runs/sweep_k1b.csv
+    # default: every combination of k1,b,delta,RM3 knobs; print the winner
+    python -m scripts.tune \
+        --queries data/full/queries_dev.tsv --qrels data/full/qrels_dev.txt \
+        --index-dir /tmp/tune_index
 
-    # is RM3 / SDM earning its place at all?
-    python -m scripts.tune --queries ... --qrels ... --index-dir /tmp/tune_index \
-        --sweep ablation
+    # same, but tune on half the queries and report the other half
+    python -m scripts.tune ... --index-dir /tmp/tune_index --split
 
-    # greedy coordinate ascent over everything, honest about overfitting
-    python -m scripts.tune --queries ... --qrels ... --index-dir /tmp/tune_index \
-        --sweep auto --split
+    # denser cartesian product (more points, slower)
+    python -m scripts.tune ... --index-dir /tmp/tune_index --dense
 
-    # does Porter + stopword removal actually help on THIS corpus?
-    python -m scripts.tune --corpus data/full/corpus.jsonl --queries ... --qrels ... \
-        --sweep analysis
+    # also try SDM proximity weights (no-op unless positions.bin is populated)
+    python -m scripts.tune ... --index-dir /tmp/tune_index --include-sdm
 
-A warning that is worth taking seriously
-----------------------------------------
-Assignment Section 1.1 lists "experience, first-hand, how leaderboard-driven
-tuning can overfit to a public dev set" as a learning objective, and the
-private held-out set exists to punish exactly that. --split tunes on half the
-queries and reports the score on the other half. If tune-half and
-validate-half disagree sharply, the gain is noise and will not survive to the
-held-out topics. Report the validation number, not the tuning number.
+    # nDCG@10 vs k1 and b only (the plot the report asks for)
+    python -m scripts.tune ... --index-dir /tmp/tune_index --sweep k1b \
+        --csv runs/sweep_k1b.csv
 
-The metrics here are for RANKING CONFIGURATIONS AGAINST EACH OTHER. Once you
-have a winner, confirm it by running the real harness, which is the code that
-actually grades you.
+    python -m scripts.tune ... --index-dir /tmp/tune_index --sweep ablation
+    python -m scripts.tune ... --index-dir /tmp/tune_index --sweep auto --split
+    python -m scripts.tune --corpus data/full/corpus.jsonl ... --sweep analysis
 """
 import argparse
 import csv
 import itertools
-import json
-import math
 import os
 import shutil
 import subprocess
 import sys
-from typing import Dict, List, Tuple
+import time
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from harness.metrics import average_precision, ndcg_at_k
 
 
 # ---------------------------------------------------------------------------
@@ -94,36 +90,8 @@ def read_qrels(path: str) -> Dict[str, Dict[str, int]]:
     return qrels
 
 
-# ---------------------------------------------------------------------------
-# Metrics (trec_eval conventions: linear gain, log2(rank+1) discount)
-# ---------------------------------------------------------------------------
-def ndcg_at_k(ranked: List[str], rel: Dict[str, int], k: int) -> float:
-    dcg = 0.0
-    for i, doc in enumerate(ranked[:k]):
-        g = rel.get(doc, 0)
-        if g > 0:
-            dcg += g / math.log2(i + 2)
-    ideal = sorted([v for v in rel.values() if v > 0], reverse=True)[:k]
-    idcg = sum(g / math.log2(i + 2) for i, g in enumerate(ideal))
-    return dcg / idcg if idcg > 0 else 0.0
-
-
-def ap_at_k(ranked: List[str], rel: Dict[str, int], k: int) -> float:
-    """Average Precision over the top k, normalised by the TRUE total number
-    of relevant documents (assignment Section 4's definition of MAP@10)."""
-    total_rel = sum(1 for v in rel.values() if v > 0)
-    if total_rel == 0:
-        return 0.0
-    hits = 0
-    s = 0.0
-    for i, doc in enumerate(ranked[:k]):
-        if rel.get(doc, 0) > 0:
-            hits += 1
-            s += hits / (i + 1)
-    return s / total_rel
-
-
 def evaluate(runner, queries, qrels, k=10) -> Tuple[float, float]:
+    """Macro-average nDCG@k / MAP@k with the same formulae as the harness."""
     nd, ap, n = 0.0, 0.0, 0
     for qid, text in queries:
         rel = qrels.get(qid, {})
@@ -131,7 +99,7 @@ def evaluate(runner, queries, qrels, k=10) -> Tuple[float, float]:
             continue
         ranked = [d for d, _ in runner(text, k)]
         nd += ndcg_at_k(ranked, rel, k)
-        ap += ap_at_k(ranked, rel, k)
+        ap += average_precision(ranked[:k], rel)
         n += 1
     return (nd / n, ap / n) if n else (0.0, 0.0)
 
@@ -142,10 +110,11 @@ def evaluate(runner, queries, qrels, k=10) -> Tuple[float, float]:
 BASE = dict(
     k1=1.2, b=0.75, delta=1.0,
     use_rm3=True, fb_docs=10, fb_terms=25, alpha=0.6, mu=1000.0,
-    use_sdm=True, sdm_rerank_depth=200,
-    lambda_o=0.10, lambda_u=0.05, window_u=8, sdm_normalise=True,
+    use_sdm=False, sdm_rerank_depth=200,
+    lambda_o=0.0, lambda_u=0.0, window_u=8, sdm_normalise=True,
 )
 
+# Fine 1-D grids used by --sweep one / auto / the polish pass after --sweep grid.
 GRIDS = {
     "k1":       [0.6, 0.9, 1.2, 1.5, 1.8, 2.1, 2.5],
     "b":        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.75, 0.9],
@@ -159,7 +128,35 @@ GRIDS = {
     "window_u": [4, 8, 12],
 }
 
-# Order matters: BM25 first (it dominates), then expansion, then proximity.
+# Default cartesian product for --sweep grid. Dead RM3 knobs are not expanded
+# when use_rm3=False, so this is every *distinct* ranking, not a naive product.
+JOINT = {
+    "k1":       [0.9, 1.2, 1.5, 1.8, 2.1, 2.5],
+    "b":        [0.4, 0.6, 0.75, 0.9],
+    "delta":    [0.0, 0.25, 1.0],
+    "alpha":    [0.5, 0.6, 0.7, 0.8],
+    "fb_docs":  [5, 10, 20],
+    "fb_terms": [10, 25],
+    "mu":       [1000.0, 2000.0],
+    "lambda_o": [0.05, 0.10, 0.20],
+    "lambda_u": [0.0, 0.05, 0.10],
+    "window_u": [8],
+}
+
+# --dense: more points, still skips identical RM3-off duplicates.
+DENSE = {
+    "k1":       [0.6, 0.9, 1.2, 1.5, 1.8, 2.1, 2.5],
+    "b":        [0.3, 0.4, 0.5, 0.6, 0.75, 0.9],
+    "delta":    [0.0, 0.25, 0.5, 1.0],
+    "alpha":    [0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    "fb_docs":  [5, 10, 15, 20],
+    "fb_terms": [10, 20, 30],
+    "mu":       [500.0, 1000.0, 2000.0],
+    "lambda_o": [0.0, 0.05, 0.10, 0.20],
+    "lambda_u": [0.0, 0.05, 0.10],
+    "window_u": [4, 8],
+}
+
 ASCENT_ORDER = ["b", "k1", "delta", "alpha", "fb_terms", "fb_docs",
                 "mu", "lambda_o", "lambda_u", "window_u"]
 
@@ -170,6 +167,142 @@ def make_runner(engine, params):
     return run
 
 
+def pack(k1, b, delta, use_rm3=False, fb_docs=10, fb_terms=25, alpha=0.6, mu=1000.0,
+         use_sdm=False, lambda_o=0.0, lambda_u=0.0, window_u=8) -> dict:
+    return dict(
+        k1=k1, b=b, delta=delta,
+        use_rm3=use_rm3, fb_docs=fb_docs, fb_terms=fb_terms, alpha=alpha, mu=mu,
+        use_sdm=use_sdm, sdm_rerank_depth=200,
+        lambda_o=lambda_o, lambda_u=lambda_u, window_u=window_u, sdm_normalise=True,
+    )
+
+
+def iter_grid(space: dict, include_sdm: bool) -> Iterable[dict]:
+    """Yield every distinct (BM25 × optional RM3 × optional SDM) configuration."""
+    bm25 = itertools.product(space["k1"], space["b"], space["delta"])
+    rm3 = itertools.product(space["alpha"], space["fb_docs"], space["fb_terms"], space["mu"])
+    sdm = itertools.product(space["lambda_o"], space["lambda_u"], space["window_u"])
+    # Materialise RM3/SDM once; BM25 is cheap to restream.
+    rm3_list = list(rm3)
+    sdm_list = list(sdm)
+    for k1, b, delta in bm25:
+        yield pack(k1, b, delta, use_rm3=False, use_sdm=False)
+        for alpha, fb_docs, fb_terms, mu in rm3_list:
+            yield pack(k1, b, delta, True, fb_docs, fb_terms, alpha, mu,
+                       use_sdm=False)
+            if include_sdm:
+                for lambda_o, lambda_u, window_u in sdm_list:
+                    if lambda_o == 0.0 and lambda_u == 0.0:
+                        continue
+                    yield pack(k1, b, delta, True, fb_docs, fb_terms, alpha, mu,
+                               True, lambda_o, lambda_u, window_u)
+
+
+def count_grid(space: dict, include_sdm: bool) -> int:
+    n_bm25 = len(space["k1"]) * len(space["b"]) * len(space["delta"])
+    n_rm3 = (len(space["alpha"]) * len(space["fb_docs"])
+             * len(space["fb_terms"]) * len(space["mu"]))
+    n_sdm_live = sum(1 for lo, lu, _ in itertools.product(
+        space["lambda_o"], space["lambda_u"], space["window_u"])
+                     if not (lo == 0.0 and lu == 0.0))
+    total = n_bm25 * (1 + n_rm3)
+    if include_sdm:
+        total += n_bm25 * n_rm3 * n_sdm_live
+    return total
+
+
+def print_params(params: dict) -> None:
+    print("PARAMS = dict(")
+    for kk, vv in params.items():
+        print(f"    {kk}={vv!r},")
+    print(")")
+
+
+def coordinate_ascent(start: dict, score_fn, rounds: int = 2) -> Tuple[dict, float]:
+    cur = dict(start)
+    best_nd, _ = score_fn(cur)
+    for rnd in range(rounds):
+        improved = False
+        for name in ASCENT_ORDER:
+            if name in ("lambda_o", "lambda_u", "window_u") and not cur.get("use_sdm"):
+                continue
+            trial_best, trial_val = best_nd, cur[name]
+            for v in GRIDS[name]:
+                if v == cur[name]:
+                    continue
+                p = dict(cur, **{name: v})
+                nd, _ = score_fn(p)
+                if nd > trial_best + 1e-6:
+                    trial_best, trial_val = nd, v
+            if trial_val != cur[name]:
+                print(f"  polish {rnd+1}: {name} {cur[name]} -> {trial_val}"
+                      f"   nDCG {best_nd:.4f} -> {trial_best:.4f}")
+                cur[name] = trial_val
+                best_nd = trial_best
+                improved = True
+        for flag in ("use_rm3", "use_sdm"):
+            p = dict(cur, **{flag: not cur[flag]})
+            nd, _ = score_fn(p)
+            if nd > best_nd + 1e-6:
+                print(f"  polish {rnd+1}: {flag} {cur[flag]} -> {not cur[flag]}"
+                      f"   nDCG {best_nd:.4f} -> {nd:.4f}")
+                cur[flag] = not cur[flag]
+                best_nd = nd
+                improved = True
+        if not improved:
+            break
+    return cur, best_nd
+
+
+def run_cartesian(score_fn, space: dict, include_sdm: bool, top_n: int,
+                  polish: bool, polish_starts: int) -> Tuple[dict, float, float, list]:
+    n_total = count_grid(space, include_sdm)
+    print(f"\ncartesian grid: {n_total} distinct configurations"
+          + ("  (including SDM)" if include_sdm else "  (SDM off)"))
+    print("scoring with harness nDCG@10  ((2^rel-1) / log2(rank+1))")
+
+    ranked: List[Tuple[float, float, dict]] = []
+    best: Optional[Tuple[float, float, dict]] = None
+    t0 = time.time()
+    for i, params in enumerate(iter_grid(space, include_sdm), start=1):
+        nd, mp = score_fn(params)
+        ranked.append((nd, mp, params))
+        if best is None or nd > best[0] + 1e-12 or (abs(nd - best[0]) <= 1e-12 and mp > best[1]):
+            best = (nd, mp, params)
+            print(f"  [{i:>6}/{n_total}] NEW BEST  nDCG@10={nd:.4f}  "
+                  f"k1={params['k1']} b={params['b']} delta={params['delta']}  "
+                  f"rm3={params['use_rm3']} fb_docs={params['fb_docs']} "
+                  f"fb_terms={params['fb_terms']} alpha={params['alpha']} mu={params['mu']}")
+        elif i % 50 == 0 or i == n_total:
+            elapsed = time.time() - t0
+            rate = elapsed / i
+            eta = rate * (n_total - i)
+            print(f"  [{i:>6}/{n_total}] nDCG={nd:.4f}  best={best[0]:.4f}  "
+                  f"elapsed {elapsed/60:.1f}m  eta {eta/60:.1f}m")
+
+    ranked.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    top = ranked[:top_n]
+
+    print(f"\n--- top {len(top)} of {n_total} ---")
+    print(f"{'nDCG@10':>9} {'MAP@10':>8}  k1    b   delta  rm3  fb_d fb_t  alpha     mu  sdm")
+    for nd, mp, p in top:
+        print(f"{nd:>9.4f} {mp:>8.4f}  {p['k1']:<5} {p['b']:<4} {p['delta']:<6} "
+              f"{str(p['use_rm3']):<4} {p['fb_docs']:<4} {p['fb_terms']:<4} "
+              f"{p['alpha']:<6} {p['mu']:<6} {p['use_sdm']}")
+
+    winner, best_nd, best_mp = top[0][2], top[0][0], top[0][1]
+    if polish:
+        print(f"\npolishing the top {min(polish_starts, len(top))} grid hits "
+              f"with 1-D coordinate ascent ...")
+        for nd0, _, start in top[:polish_starts]:
+            print(f"\n  start nDCG@10={nd0:.4f}")
+            cur, nd1 = coordinate_ascent(start, score_fn, rounds=2)
+            mp1 = score_fn(cur)[1]
+            if nd1 > best_nd + 1e-6:
+                winner, best_nd, best_mp = cur, nd1, mp1
+    return winner, best_nd, best_mp, top
+
+
 def main():
     ap_ = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -178,11 +311,21 @@ def main():
     ap_.add_argument("--index-dir", default="/tmp/tune_index")
     ap_.add_argument("--corpus", default=None, help="required with --build or --sweep analysis")
     ap_.add_argument("--build", action="store_true", help="(re)build the index first")
-    ap_.add_argument("--sweep", default="auto",
-                     choices=["auto", "k1b", "ablation", "analysis", "one"])
+    ap_.add_argument("--sweep", default="grid",
+                     choices=["grid", "auto", "k1b", "ablation", "analysis", "one"],
+                     help="grid = all combinations (default). auto = coordinate ascent only.")
+    ap_.add_argument("--dense", action="store_true",
+                     help="with --sweep grid, use the denser cartesian product")
+    ap_.add_argument("--include-sdm", action="store_true",
+                     help="also enumerate SDM weights (skip if positions.bin is empty)")
+    ap_.add_argument("--no-polish", action="store_true",
+                     help="skip the coordinate-ascent refinement after the grid")
+    ap_.add_argument("--top", type=int, default=10, help="how many grid hits to print")
+    ap_.add_argument("--polish-starts", type=int, default=3,
+                     help="run coordinate ascent from this many top grid configs")
     ap_.add_argument("--param", default=None, help="parameter name for --sweep one")
     ap_.add_argument("--split", action="store_true",
-                     help="tune on odd queries, report on even queries")
+                     help="tune on even queries, report on odd queries")
     ap_.add_argument("--csv", default=None)
     ap_.add_argument("--k", type=int, default=10)
     args = ap_.parse_args()
@@ -222,7 +365,8 @@ def main():
                      f"r.build_index({args.corpus!r}, {d!r})"],
                     env=env, check=True)
                 sub.load_index(d)
-                size = sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)) / 1e6
+                size = sum(os.path.getsize(os.path.join(d, f)) / 1e6
+                           for f in os.listdir(d))
                 nd, mp = evaluate(make_runner(sub._CPP_ENGINE, BASE), tune_q, qrels, args.k)
                 name = {1: "s-stem", 2: "porter"}[stemmer]
                 print(f"{name:>8} {stop:>10} {nd:>9.4f} {mp:>9.4f} {size:>9.1f}")
@@ -251,22 +395,23 @@ def main():
         raise SystemExit("C++ extension not loaded — sweeping the Python fallback "
                          "would measure the wrong system.")
 
-    def score(params, qs):
-        return evaluate(make_runner(engine, params), qs, qrels, args.k)
+    def score(params):
+        return evaluate(make_runner(engine, params), tune_q, qrels, args.k)
 
-    rows = []
+    rows: list = []
 
     if args.sweep == "ablation":
         variants = {
             "BM25 only":                dict(BASE, use_rm3=False, use_sdm=False),
             "BM25 + RM3":               dict(BASE, use_rm3=True, use_sdm=False),
             "BM25 + SDM":               dict(BASE, use_rm3=False, use_sdm=True),
-            "BM25 + RM3 + SDM (full)":  dict(BASE),
+            "BM25 + RM3 + SDM (full)":  dict(BASE, use_rm3=True, use_sdm=True,
+                                             lambda_o=0.10, lambda_u=0.05),
             "BM25 (delta=0, plain)":    dict(BASE, use_rm3=False, use_sdm=False, delta=0.0),
         }
         print(f"\n{'configuration':<26} {'nDCG@10':>9} {'MAP@10':>9}")
         for name, p in variants.items():
-            nd, mp = score(p, tune_q)
+            nd, mp = score(p)
             print(f"{name:<26} {nd:>9.4f} {mp:>9.4f}")
             rows.append(dict(config=name, ndcg=nd, map=mp))
 
@@ -274,8 +419,8 @@ def main():
         print(f"\n{'k1':>5} {'b':>6} {'nDCG@10':>9} {'MAP@10':>9}   (RM3/SDM off)")
         best = None
         for k1, b in itertools.product(GRIDS["k1"], GRIDS["b"]):
-            p = dict(BASE, k1=k1, b=b, use_rm3=False, use_sdm=False)
-            nd, mp = score(p, tune_q)
+            p = pack(k1, b, 0.0, use_rm3=False, use_sdm=False)
+            nd, mp = score(p)
             rows.append(dict(k1=k1, b=b, ndcg=nd, map=mp))
             print(f"{k1:>5.2f} {b:>6.2f} {nd:>9.4f} {mp:>9.4f}")
             if best is None or nd > best[0]:
@@ -288,60 +433,47 @@ def main():
         print(f"\n{args.param:>10} {'nDCG@10':>9} {'MAP@10':>9}")
         for v in GRIDS[args.param]:
             p = dict(BASE, **{args.param: v})
-            nd, mp = score(p, tune_q)
+            nd, mp = score(p)
             rows.append({args.param: v, "ndcg": nd, "map": mp})
             print(f"{v:>10} {nd:>9.4f} {mp:>9.4f}")
 
-    else:  # auto — greedy coordinate ascent
+    elif args.sweep == "auto":
         cur = dict(BASE)
-        base_nd, _ = score(cur, tune_q)
+        base_nd, _ = score(cur)
         print(f"\nstart nDCG@10 = {base_nd:.4f}")
-        best_nd = base_nd
-        for rounds in range(2):
-            improved = False
-            for name in ASCENT_ORDER:
-                trial_best, trial_val = best_nd, cur[name]
-                for v in GRIDS[name]:
-                    if v == cur[name]:
-                        continue
-                    p = dict(cur, **{name: v})
-                    nd, _ = score(p, tune_q)
-                    if nd > trial_best + 1e-6:
-                        trial_best, trial_val = nd, v
-                if trial_val != cur[name]:
-                    print(f"  round {rounds+1}: {name} {cur[name]} -> {trial_val}"
-                          f"   nDCG {best_nd:.4f} -> {trial_best:.4f}")
-                    cur[name] = trial_val
-                    best_nd = trial_best
-                    improved = True
-            # RM3 and SDM are worth testing as switches, not just as weights
-            for flag in ("use_rm3", "use_sdm"):
-                p = dict(cur, **{flag: not cur[flag]})
-                nd, _ = score(p, tune_q)
-                if nd > best_nd + 1e-6:
-                    print(f"  round {rounds+1}: {flag} {cur[flag]} -> {not cur[flag]}"
-                          f"   nDCG {best_nd:.4f} -> {nd:.4f}")
-                    cur[flag] = not cur[flag]
-                    best_nd = nd
-                    improved = True
-            if not improved:
-                break
-
+        cur, _ = coordinate_ascent(cur, score, rounds=2)
+        nd_t, mp_t = score(cur)
         print("\n--- best configuration found ---")
-        print("PARAMS = dict(")
-        for kk, vv in cur.items():
-            print(f"    {kk}={vv!r},")
-        print(")")
-        nd_t, mp_t = score(cur, tune_q)
-        print(f"\ntune half:     nDCG@10={nd_t:.4f}  MAP@10={mp_t:.4f}")
+        print_params(cur)
+        print(f"\ntune nDCG@10={nd_t:.4f}  MAP@10={mp_t:.4f}")
         if val_q:
-            nd_v, mp_v = score(cur, val_q)
-            nd_b, _ = score(BASE, val_q)
-            print(f"validate half: nDCG@10={nd_v:.4f}  MAP@10={mp_v:.4f}"
+            nd_v, mp_v = evaluate(make_runner(engine, cur), val_q, qrels, args.k)
+            nd_b, _ = evaluate(make_runner(engine, BASE), val_q, qrels, args.k)
+            print(f"validate nDCG@10={nd_v:.4f}  MAP@10={mp_v:.4f}"
                   f"   (defaults on the same half: {nd_b:.4f})")
             print("\nIf the validate-half gain is much smaller than the tune-half gain,\n"
                   "the extra points are dev-set noise and will not transfer.")
         rows.append(dict(cur, ndcg=nd_t, map=mp_t))
+
+    else:  # grid — every combination, then polish the winners
+        space = DENSE if args.dense else JOINT
+        winner, nd_t, mp_t, top = run_cartesian(
+            score, space, args.include_sdm, args.top,
+            polish=not args.no_polish, polish_starts=args.polish_starts,
+        )
+        print("\n--- best configuration found ---")
+        print_params(winner)
+        print(f"\ntune nDCG@10={nd_t:.4f}  MAP@10={mp_t:.4f}")
+        if val_q:
+            nd_v, mp_v = evaluate(make_runner(engine, winner), val_q, qrels, args.k)
+            nd_b, _ = evaluate(make_runner(engine, BASE), val_q, qrels, args.k)
+            print(f"validate nDCG@10={nd_v:.4f}  MAP@10={mp_v:.4f}"
+                  f"   (defaults on the same half: {nd_b:.4f})")
+            print("\nIf the validate-half gain is much smaller than the tune-half gain,\n"
+                  "the extra points are dev-set noise and will not transfer.")
+        for nd, mp, p in top:
+            rows.append(dict(p, ndcg=nd, map=mp))
+        rows.append(dict(winner, ndcg=nd_t, map=mp_t, polished=True))
 
     if args.csv and rows:
         keys = sorted({k for r in rows for k in r})
