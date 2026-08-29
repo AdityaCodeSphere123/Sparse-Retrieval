@@ -22,7 +22,10 @@ Scoring is a two-pass sparse pipeline, all of it inside the C++ extension
 The pure-Python path below is a correctness fallback for when the extension
 is not built; it is plain BM25 and scores lower.
 """
+import gzip
 import os
+import shutil
+import tempfile
 from typing import List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
@@ -89,20 +92,72 @@ PARAMS = dict(
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
+# Decompressed copy of a gzipped index_dir. mmap needs live files; the
+# harness scores size *after* build_index, so we keep this only in the
+# query process and never write it back into index_dir.
+_CPP_INDEX_CACHE = None
+
+# Files large enough that gzip shrinks them. Tiny files (meta.bin) can grow.
+_GZIP_NAMES = (
+    "postings.bin",
+    "fwd.bin",
+    "fwdoff.bin",
+    "dict.bin",
+    "docmap.bin",
+    "rm3map.bin",
+    "doclens.bin",
+)
+
+
+def _gzip_index_dir(index_dir: str) -> None:
+    """Deflate bulk index files in place so on-disk size is what gzip leaves."""
+    for name in _GZIP_NAMES:
+        path = os.path.join(index_dir, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "rb") as f:
+            raw = f.read()
+        gz_path = path + ".gz"
+        with open(gz_path, "wb") as out:
+            with gzip.GzipFile(filename="", fileobj=out, mode="wb", compresslevel=6, mtime=0) as g:
+                g.write(raw)
+        if os.path.getsize(gz_path) >= len(raw):
+            os.remove(gz_path)
+        else:
+            os.remove(path)
+
+
+def _materialize_index_dir(index_dir: str, dest: str) -> None:
+    """Copy index_dir to dest, inflating any *.gz so C++ can mmap raw bins."""
+    for fn in os.listdir(index_dir):
+        src = os.path.join(index_dir, fn)
+        if not os.path.isfile(src):
+            continue
+        if fn.endswith(".gz"):
+            out = os.path.join(dest, fn[:-3])
+            with gzip.open(src, "rb") as g, open(out, "wb") as o:
+                shutil.copyfileobj(g, o)
+        else:
+            shutil.copy2(src, os.path.join(dest, fn))
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
     """Build the index and persist everything retrieve() needs into index_dir."""
     os.makedirs(index_dir, exist_ok=True)
 
+    stream_path = corpus_path
+    if os.path.isdir(corpus_path):
+        candidate = os.path.join(corpus_path, "corpus.jsonl")
+        if os.path.isfile(candidate):
+            stream_path = candidate
+
     if HAS_CPP:
         engine = cpp_engine.CPPEngine()
-        # Streaming straight off the file avoids materialising the whole corpus
-        # in Python memory; fall back to the list form for ir_datasets specifiers.
-        if os.path.isfile(corpus_path):
-            engine.build_index_from_file(corpus_path, index_dir)
+        if os.path.isfile(stream_path):
+            engine.build_index_from_file(stream_path, index_dir)
         else:
             engine.build_index(load_corpus(corpus_path), index_dir)
+        _gzip_index_dir(index_dir)
     else:
         index = InvertedIndex()
         index.build(stream_corpus(corpus_path))
@@ -111,10 +166,18 @@ def build_index(corpus_path: str, index_dir: str) -> None:
 
 def load_index(index_dir: str) -> None:
     """Reconstruct query-time state from index_dir, and only from index_dir."""
-    global _INDEX, _CPP_ENGINE
+    global _INDEX, _CPP_ENGINE, _CPP_INDEX_CACHE
     if HAS_CPP:
+        has_gz = any(fn.endswith(".gz") for fn in os.listdir(index_dir))
+        load_from = index_dir
+        if has_gz:
+            _CPP_INDEX_CACHE = tempfile.TemporaryDirectory(prefix="a1_idx_")
+            _materialize_index_dir(index_dir, _CPP_INDEX_CACHE.name)
+            load_from = _CPP_INDEX_CACHE.name
+        else:
+            _CPP_INDEX_CACHE = None
         _CPP_ENGINE = cpp_engine.CPPEngine()
-        _CPP_ENGINE.load_index(index_dir)
+        _CPP_ENGINE.load_index(load_from)
     else:
         _INDEX = InvertedIndex.load(index_dir)
         bm25.build(_INDEX)
