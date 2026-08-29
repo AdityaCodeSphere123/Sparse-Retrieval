@@ -85,7 +85,7 @@ PARAMS = dict(
 #
 # `python -m scripts.sweep_build --var IR_STEMMER --values 0,1,2` rebuilds and
 # scores each setting for you; the same script sweeps IR_TITLE_WINDOW,
-# IR_FWD_TERMS (default 24) and IR_RM3_DF_FRAC, which are baked in at build.
+# IR_FWD_TERMS (default 20) and IR_RM3_DF_FRAC, which are baked in at build.
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None

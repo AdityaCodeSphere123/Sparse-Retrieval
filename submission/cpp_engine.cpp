@@ -1,7 +1,7 @@
 // ===========================================================================
 // cpp_engine.cpp — from-scratch inverted index + BM25F+/RM3 retrieval.
 //
-// On-disk layout (v6). Everything is little-endian, written by build_*() and
+// On-disk layout (v7). Everything is little-endian, written by build_*() and
 // read back by load_index(); nothing survives between the two processes
 // except these files.
 //
@@ -9,13 +9,14 @@
 //                 with the length written once; variable ids are front-coded.
 //   doclens.bin   N, avg_doc_len, total_tokens, then N x uint8 quantised
 //                 length ratios (log-quantised, see quantize_doc_len)
-//   dict.bin      terms in sorted order, front-coded: prefix, suffix, df,
-//                 delta postings offset. Collection frequency is NOT here.
-//   postings.bin  per term, flags byte: bit0=Elias-Fano (else vbyte),
-//                 bit1=title-tf stream present (EF path only). Short lists
-//                 (df<16) stay vbyte+plain-tf. Longer lists: Simple-9 tfs,
-//                 Simple-9 tfs, optional Simple-9 title tfs, then Elias-Fano
-//                 doc ids (l + interleaved unary/low bits).
+//   dict.bin      terms in sorted order, front-coded: prefix, suffix,
+//                 (df << 1) | has_title, delta postings offset. Codec is
+//                 implied by df (vbyte iff df < POST_VBYTE_DF).
+//   postings.bin  short lists: vbyte gaps with packed tf. Longer lists:
+//                 Simple-9 (tf-1), optional sparse title hits (count +
+//                 vbyte gaps with 2-bit title_tf), then Elias-Fano doc ids.
+//                 Eight zero bytes are appended after the last list so
+//                 bit_get cannot read past the mmap on the final EF decode.
 //   fwd.bin       pruned forward index (doc -> top RM3-candidate terms).
 //   fwdoff.bin    N, stride, then ceil(N/stride) x uint32 offsets (stride=8)
 //   rm3map.bin    M, then M x (tid gap, cf-df) varints — cf only for RM3 terms
@@ -62,7 +63,7 @@ static constexpr uint32_t SPIMI_BATCH_DOCS = 50000;  // docs buffered per spill
 static constexpr uint32_t FWD_OFF_STRIDE   = 8;      // checkpoint every 8 docs in fwdoff.bin
 static constexpr uint32_t FWD_TF_MAX       = 7;      // 3 bits, packed into tid gap
 static constexpr int      RM3_POOL         = 250;    // first-pass docs re-scored with RM3
-static constexpr uint8_t  INDEX_VERSION    = 6;
+static constexpr uint8_t  INDEX_VERSION    = 7;
 
 // ---------------------------------------------------------------------------
 // Build-time settings that are swept rather than derived. Each is a plain
@@ -79,10 +80,10 @@ struct BuildCfg {
     // and the flat top of the sweep (8-16 are all within noise of each other,
     // 24+ falls away as abstract text starts leaking into the "title").
     uint32_t title_window   = 12;
-    // 24: enough RM3 signal to hold nDCG, small enough that dense+packed
-    // fwd.bin stays inside the 20–30 MB band. 16 leaked ~0.005 nDCG on
-    // a handful of expansion-sensitive topics; 32 overshoots the size budget.
-    uint32_t fwd_terms      = 24;
+    // 20: the 16–24 band is essentially flat on nDCG (~0.005 drop at 16).
+    // fwd.bin is ~50 bytes/doc at 24; 20 trims that without leaving the
+    // plateau. Override with IR_FWD_TERMS.
+    uint32_t fwd_terms      = 20;
     // rm3_df_frac = 0.13: a term may be an RM3 expansion candidate if it occurs
     // in at most 13% of documents. The old 5% ceiling was too aggressive for a
     // single-topic collection — it threw away exactly the mid-frequency
@@ -175,7 +176,10 @@ static inline float dequantize_doc_len(uint8_t q) {
 // ---------------------------------------------------------------------------
 static constexpr uint32_t TF_MAX       = 63;   // 6 bits
 static constexpr uint32_t TITLE_TF_MAX = 3;    // 2 bits
-static constexpr uint32_t POST_VBYTE_DF = 16;  // below this, vbyte beats EF overhead
+// Crossover: vbyte for df < this, Elias-Fano otherwise. At N≈171k, df=8
+// already has EF at ~17 B for the ids vs ~24 B of 3-byte gaps; df=4 is a
+// wash once Simple-9 tfs are counted. 8 is the size minimum of {4,8,16,32}.
+static constexpr uint32_t POST_VBYTE_DF = 8;
 
 static inline uint8_t pack_tf(uint32_t body_tf, uint32_t title_tf) {
     uint32_t b = std::min(body_tf, TF_MAX);
@@ -736,6 +740,7 @@ struct MmapBuffer {
 // ---------------------------------------------------------------------------
 struct TermMeta {
     uint32_t df = 0;
+    uint8_t  has_title = 0;     // 1 iff the EF list has a sparse title-hit stream
     uint64_t cf = 0;
     uint64_t postings_offset = 0;
 };
@@ -1116,27 +1121,35 @@ public:
             scratch_tfs.resize(df);
             scratch_titles.resize(df);
             uint8_t has_title = 0;
+            uint32_t n_title_hits = 0;
             for (uint32_t i = 0; i < df; ++i) {
                 scratch_gaps[i] = merged[i].doc_id;
-                scratch_tfs[i] = std::min(merged[i].tf, TF_MAX);
+                uint32_t tf = std::min(merged[i].tf, TF_MAX);
+                scratch_tfs[i] = tf ? tf - 1 : 0;   // Simple-9 stores tf-1
                 scratch_titles[i] = std::min(merged[i].title_tf, TITLE_TF_MAX);
-                if (scratch_titles[i]) has_title = 1;
+                if (scratch_titles[i]) { has_title = 1; ++n_title_hits; }
             }
             if (df < POST_VBYTE_DF) {
-                block_data.push_back(0);
                 uint32_t prev_doc_id = 0;
                 for (uint32_t i = 0; i < df; ++i) {
                     uint32_t gap = scratch_gaps[i] - prev_doc_id;
-                    uint8_t packed = pack_tf(scratch_tfs[i], scratch_titles[i]);
+                    uint8_t packed = pack_tf(merged[i].tf, scratch_titles[i]);
                     uint32_t plain = (packed == 1) ? 1u : 0u;
                     write_vbyte(block_data, (gap << 1) | plain);
                     if (!plain) block_data.push_back(packed);
                     prev_doc_id = scratch_gaps[i];
                 }
             } else {
-                block_data.push_back(static_cast<uint8_t>(1u | (has_title << 1)));
                 simple9_pack(block_data, scratch_tfs.data(), df);
-                if (has_title) simple9_pack(block_data, scratch_titles.data(), df);
+                if (has_title) {
+                    write_vbyte(block_data, n_title_hits);
+                    uint32_t prev = 0;
+                    for (uint32_t i = 0; i < df; ++i) {
+                        if (!scratch_titles[i]) continue;
+                        write_vbyte(block_data, ((i - prev) << 2) | scratch_titles[i]);
+                        prev = i;
+                    }
+                }
                 ef_pack(block_data, scratch_gaps.data(), df);
             }
             f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
@@ -1152,7 +1165,7 @@ public:
             write_vbyte(dict_buf, static_cast<uint32_t>(prefix));
             write_vbyte(dict_buf, static_cast<uint32_t>(term.size() - prefix));
             dict_buf.insert(dict_buf.end(), term.begin() + prefix, term.end());
-            write_vbyte(dict_buf, df);
+            write_vbyte(dict_buf, (df << 1) | has_title);
             write_vbyte64(dict_buf, term_postings_start - prev_postings_offset);
             prev_postings_offset = term_postings_start;
             prev_term = term;
@@ -1171,6 +1184,10 @@ public:
         f_dict.seekp(0);
         f_dict.write(reinterpret_cast<const char*>(&num_written_terms), sizeof(num_written_terms));
         f_dict.close();
+        // Pad so the last Elias-Fano list can over-read up to 7 bytes in
+        // bit_get without walking off the mmap (page-multiple postings.bin).
+        const uint8_t pad[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        f_postings.write(reinterpret_cast<const char*>(pad), 8);
         f_postings.close();
 
         for (auto& r : readers) r.file.close();
@@ -1359,7 +1376,9 @@ public:
             p += suffix_len;
 
             TermMeta m;
-            m.df = read_vbyte(p);
+            uint32_t df_coded = read_vbyte(p);
+            m.df = df_coded >> 1;
+            m.has_title = static_cast<uint8_t>(df_coded & 1u);
             m.postings_offset = prev_postings_offset + read_vbyte64(p);
             prev_postings_offset = m.postings_offset;
 
@@ -1509,8 +1528,7 @@ public:
             const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
             const float k1p1 = k1 + 1.0f;
             const uint32_t df = meta.df;
-            uint8_t flags = *ptr++;
-            if ((flags & 1u) == 0) {
+            if (df < POST_VBYTE_DF) {
                 uint32_t current_doc = 0;
                 for (uint32_t i = 0; i < df; ++i) {
                     uint32_t coded = read_vbyte(ptr);
@@ -1528,17 +1546,28 @@ public:
             } else {
                 scratch_tfs.resize(df);
                 simple9_unpack(ptr, scratch_tfs.data(), df);
-                uint8_t has_title = (flags >> 1) & 1u;
-                if (has_title) {
-                    scratch_titles.resize(df);
-                    simple9_unpack(ptr, scratch_titles.data(), df);
+                uint32_t n_title_hits = 0;
+                if (meta.has_title) {
+                    n_title_hits = read_vbyte(ptr);
+                    scratch_titles.resize(n_title_hits);
+                    uint32_t prev = 0;
+                    for (uint32_t h = 0; h < n_title_hits; ++h) {
+                        uint32_t coded = read_vbyte(ptr);
+                        prev += coded >> 2;
+                        scratch_titles[h] = (prev << 2) | (coded & 3u);
+                    }
                 }
                 scratch_gaps.resize(df);
                 ef_unpack_docs(ptr, scratch_gaps.data(), df);
+                uint32_t hi = 0;
                 for (uint32_t i = 0; i < df; ++i) {
                     uint32_t current_doc = scratch_gaps[i];
-                    uint8_t ttf = has_title ? static_cast<uint8_t>(scratch_titles[i]) : 0;
-                    float tf_eff = static_cast<float>(scratch_tfs[i]) +
+                    uint8_t ttf = 0;
+                    if (hi < n_title_hits && (scratch_titles[hi] >> 2) == i) {
+                        ttf = static_cast<uint8_t>(scratch_titles[hi] & 3u);
+                        ++hi;
+                    }
+                    float tf_eff = static_cast<float>(scratch_tfs[i] + 1u) +
                                    w_title * static_cast<float>(ttf);
                     float tf_norm = (tf_eff * k1p1) /
                                     (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
