@@ -11,14 +11,14 @@
 //                 length ratios (log-quantised, see quantize_doc_len)
 //   dict.bin      terms in sorted order, front-coded, varint fields.
 //                 Collection frequency is stored as (cf - df).
-//   postings.bin  per term: optional block skip table + gap/varint postings.
+//   postings.bin  per term: contiguous gap/varint postings (no skip table).
 //                 The gap's low bit flags the common (tf=1, title_tf=0) case
 //                 so that posting skips the tf byte. Otherwise the tf byte
 //                 packs body tf (low 6 bits) and title tf (high 2 bits).
 //   fwd.bin       pruned forward index (doc -> top RM3-candidate terms).
 //                 Term ids are a dense 0..M-1 space; each entry is
 //                 ((gap << 3) | min(tf, 7)), plus an extra vbyte when tf >= 7.
-//   fwdoff.bin    N, stride, then ceil(N/stride) x uint32 checkpoints
+//   fwdoff.bin    N, stride, then ceil(N/stride) x uint32 offsets (stride=1)
 //   rm3map.bin    M, then M varint-gapped global term ids (rm3_id -> tid)
 //
 // ===========================================================================
@@ -58,11 +58,11 @@ namespace py = pybind11;
 // Fixed structural constants. Unlike BuildCfg below, these are not swept:
 // they trade memory against I/O during the build, not ranking quality.
 // ---------------------------------------------------------------------------
-static constexpr uint32_t BLOCK_SIZE       = 128;    // postings per skip block
 static constexpr uint32_t FWD_CANDIDATES   = 64;     // pre-df-filter margin
 static constexpr uint32_t SPIMI_BATCH_DOCS = 50000;  // docs buffered per spill
-static constexpr uint32_t FWD_OFF_STRIDE   = 8;      // checkpoint every 8th doc
+static constexpr uint32_t FWD_OFF_STRIDE   = 1;      // one offset per doc (O(1) RM3 lookup)
 static constexpr uint32_t FWD_TF_MAX       = 7;      // 3 bits, packed into tid gap
+static constexpr int      RM3_POOL         = 250;    // first-pass docs re-scored with RM3
 
 // ---------------------------------------------------------------------------
 // Build-time settings that are swept rather than derived. Each is a plain
@@ -181,8 +181,6 @@ static inline uint8_t pack_tf(uint32_t body_tf, uint32_t title_tf) {
     uint32_t t = std::min(title_tf, TITLE_TF_MAX);
     return static_cast<uint8_t>(b | (t << 6));
 }
-static inline uint8_t unpack_body_tf(uint8_t packed)  { return packed & 0x3F; }
-static inline uint8_t unpack_title_tf(uint8_t packed) { return packed >> 6; }
 
 // ---------------------------------------------------------------------------
 // Variable-byte (varint) codecs. 7 payload bits per byte, high bit = continue.
@@ -950,7 +948,7 @@ public:
         dict_buf.reserve(1 << 20);
 
         std::vector<DocPosting> merged;
-        std::vector<uint8_t> block_data, hdr_buf;
+        std::vector<uint8_t> block_data;
 
         while (true) {
             const std::string* min_term = nullptr;
@@ -983,47 +981,23 @@ public:
 
             // Runs are produced in increasing doc_id order and merged in run
             // order, so `merged` is already sorted by doc_id.
-            uint32_t num_blocks = (df + BLOCK_SIZE - 1) / BLOCK_SIZE;
             uint64_t term_postings_start = current_postings_offset;
-            uint32_t prev_block_last_doc = 0;
-
-            for (uint32_t b_idx = 0; b_idx < num_blocks; ++b_idx) {
-                uint32_t start_i = b_idx * BLOCK_SIZE;
-                uint32_t end_i = std::min(start_i + BLOCK_SIZE, df);
-
-                block_data.clear();
-                uint32_t prev_doc_id = (b_idx == 0) ? 0 : prev_block_last_doc;
-
-                for (uint32_t i = start_i; i < end_i; ++i) {
-                    uint32_t d_id = merged[i].doc_id;
-                    uint8_t tf_byte = pack_tf(merged[i].tf, merged[i].title_tf);
-                    // Fold the common posting (tf=1, no title hit) into the
-                    // gap's low bit so that posting pays no tf byte.
-                    bool plain = (tf_byte == pack_tf(1, 0));
-                    write_vbyte(block_data, ((d_id - prev_doc_id) << 1) | (plain ? 1u : 0u));
-                    if (!plain) block_data.push_back(tf_byte);
-                    prev_doc_id = d_id;
-                }
-
-                // Skip-table entry, written only when the term actually spans
-                // more than one block. A single-block term (the overwhelming
-                // majority, by Zipf) pays zero header bytes: df in the
-                // dictionary already tells us how many postings to decode.
-                // Header is last-doc gap + payload size only — max_tf /
-                // min_qlen were never consulted (no WAND), so they are gone.
-                if (num_blocks > 1) {
-                    hdr_buf.clear();
-                    write_vbyte(hdr_buf, merged[end_i - 1].doc_id - prev_block_last_doc);
-                    write_vbyte(hdr_buf, static_cast<uint32_t>(block_data.size()));
-                    f_postings.write(reinterpret_cast<const char*>(hdr_buf.data()), hdr_buf.size());
-                    current_postings_offset += hdr_buf.size();
-                }
-
-                prev_block_last_doc = merged[end_i - 1].doc_id;
-
-                f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
-                current_postings_offset += block_data.size();
+            block_data.clear();
+            uint32_t prev_doc_id = 0;
+            for (uint32_t i = 0; i < df; ++i) {
+                uint32_t d_id = merged[i].doc_id;
+                uint8_t tf_byte = pack_tf(merged[i].tf, merged[i].title_tf);
+                // Fold the common posting (tf=1, no title hit) into the
+                // gap's low bit so that posting pays no tf byte.
+                bool plain = (tf_byte == pack_tf(1, 0));
+                write_vbyte(block_data, ((d_id - prev_doc_id) << 1) | (plain ? 1u : 0u));
+                if (!plain) block_data.push_back(tf_byte);
+                prev_doc_id = d_id;
             }
+            // No skip table: it was written and then ignored at query time,
+            // so it only cost decode branches on the long lists.
+            f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
+            current_postings_offset += block_data.size();
 
             // -------- dict entry, front-coded against the previous term ----
             size_t prefix = 0;
@@ -1345,7 +1319,7 @@ public:
 
         acc.assign(N, 0.0f);
         touched.clear();
-        touched.reserve(1 << 16);
+        touched.reserve(N);
     }
 
     // =======================================================================
@@ -1382,62 +1356,41 @@ public:
             float w = qt.second * idf;
             if (w <= 0.0f) continue;
 
-            uint32_t num_blocks = (meta.df + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
             uint32_t current_doc = 0;
-            uint32_t remaining = meta.df;
+            const float k1p1 = k1 + 1.0f;
+            const uint32_t npost = meta.df;
 
-            for (uint32_t b_idx = 0; b_idx < num_blocks; ++b_idx) {
-                uint32_t n_in_block = std::min(BLOCK_SIZE, remaining);
-                remaining -= n_in_block;
+            for (uint32_t i = 0; i < npost; ++i) {
+                uint32_t coded = read_vbyte(ptr);
+                current_doc += coded >> 1;
+                uint8_t packed = (coded & 1u) ? static_cast<uint8_t>(1) : *ptr++;
 
-                if (num_blocks > 1) {          // consume the skip-table entry
-                    read_vbyte(ptr);           // last doc id gap
-                    read_vbyte(ptr);           // payload byte size
-                }
+                uint8_t ttf = packed >> 6;
+                float tf_eff = static_cast<float>(packed & 0x3F) +
+                               w_title * static_cast<float>(ttf);
+                float tf_norm = (tf_eff * k1p1) /
+                                (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
+                float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
 
-                for (uint32_t i = 0; i < n_in_block; ++i) {
-                    uint32_t coded = read_vbyte(ptr);
-                    current_doc += coded >> 1;
-                    uint8_t packed = (coded & 1u) ? pack_tf(1, 0) : *ptr++;
-
-                    // BM25F, in its pseudo-term-frequency form (Robertson,
-                    // Zaragoza & Taylor 2004): the fields are combined into one
-                    // effective tf BEFORE saturation, not scored separately and
-                    // added afterwards. Combining after saturation would let a
-                    // title match and a body match each saturate on their own
-                    // and double-count; combining before keeps one saturation
-                    // curve over the document as a whole.
-                    uint8_t ttf = unpack_title_tf(packed);
-                    float tf_eff = static_cast<float>(unpack_body_tf(packed)) +
-                                   w_title * static_cast<float>(ttf);
-
-                    float tf_norm = (tf_eff * (k1 + 1.0f)) /
-                                    (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
-
-                    // title_bonus is the second, *unsaturated* half of the field
-                    // model: a flat IDF-weighted credit for the term appearing in
-                    // the title at all. It is the same shape as BM25+'s delta —
-                    // a lower bound on the contribution of a matched term — but
-                    // conditioned on the title rather than granted to every
-                    // match. Where w_title asks "how much more does a title
-                    // occurrence count", this asks "how much is being in the
-                    // title worth on its own", which is what actually separates
-                    // an on-topic paper from one that merely mentions the term.
-                    float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
-
-                    if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
-                    acc[current_doc] += contrib;
-                }
+                if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
+                acc[current_doc] += contrib;
             }
         }
 
         size_t want = std::min(static_cast<size_t>(std::max(top_k, 0)), touched.size());
+        // Integer compare only — string doc_id ties are resolved on the
+        // tiny top-k, not on every comparison against the full candidate pool.
         std::partial_sort(touched.begin(), touched.begin() + want, touched.end(),
                           [this](uint32_t a, uint32_t x) {
                               if (acc[a] != acc[x]) return acc[a] > acc[x];
-                              return doc_ids[a] < doc_ids[x];  // external id, not insertion order
+                              return a < x;
                           });
+        std::sort(touched.begin(), touched.begin() + want,
+                  [this](uint32_t a, uint32_t x) {
+                      if (acc[a] != acc[x]) return acc[a] > acc[x];
+                      return doc_ids[a] < doc_ids[x];
+                  });
 
         std::vector<std::pair<uint32_t, float>> results;
         results.reserve(want);
@@ -1457,37 +1410,37 @@ public:
         std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> out;
         if (!fwd_mmap.data || !fwdoff_mmap.data || fwdoff_mmap.length < 8) return out;
 
-        // fwdoff.bin: N, stride, then ceil(N/stride) checkpoints. Each fwd
-        // record is self-delimiting, so we land on the nearest checkpoint
-        // and skip at most (stride-1) records.
         const uint32_t* offs = reinterpret_cast<const uint32_t*>(
             fwdoff_mmap.data + 2 * sizeof(uint32_t));
         const uint32_t n_chk = static_cast<uint32_t>(
             (fwdoff_mmap.length - 2 * sizeof(uint32_t)) / sizeof(uint32_t));
         const uint32_t stride = fwd_off_stride ? fwd_off_stride : 1;
 
+        auto read_fwd_entry = [](const uint8_t*& p) {
+            uint32_t packed = read_vbyte(p);
+            uint32_t tf = packed & FWD_TF_MAX;
+            if (tf == FWD_TF_MAX) tf += read_vbyte(p);
+            return std::pair<uint32_t, uint32_t>{packed >> 3, tf};
+        };
+
         for (uint32_t d : target_docs) {
             if (d >= N) continue;
             uint32_t chk = d / stride;
             if (chk >= n_chk) continue;
             const uint8_t* p = fwd_mmap.data + offs[chk];
-            uint32_t skip = d % stride;
-            auto read_fwd_entry = [&p]() {
-                uint32_t packed = read_vbyte(p);
-                uint32_t tf = packed & FWD_TF_MAX;
-                if (tf == FWD_TF_MAX) tf += read_vbyte(p);
-                return std::pair<uint32_t, uint32_t>{packed >> 3, tf};
-            };
-            for (uint32_t s = 0; s < skip; ++s) {
-                uint32_t cnt_skip = read_vbyte(p);
-                for (uint32_t i = 0; i < cnt_skip; ++i) read_fwd_entry();
+            if (stride > 1) {
+                uint32_t skip = d % stride;
+                for (uint32_t s = 0; s < skip; ++s) {
+                    uint32_t cnt_skip = read_vbyte(p);
+                    for (uint32_t i = 0; i < cnt_skip; ++i) read_fwd_entry(p);
+                }
             }
             uint32_t cnt = read_vbyte(p);
             std::vector<std::pair<uint32_t, uint32_t>> v;
             v.reserve(cnt);
             uint32_t rid = 0;
             for (uint32_t i = 0; i < cnt; ++i) {
-                auto [gap, tf] = read_fwd_entry();
+                auto [gap, tf] = read_fwd_entry(p);
                 rid += gap;
                 if (rid >= rm3_to_tid.size()) continue;
                 v.push_back({rm3_to_tid[rid], tf});
@@ -1527,8 +1480,10 @@ public:
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
 
-        // Pass 1 only has to go deep enough to feed the relevance model.
-        int pass1_depth = std::max(fb_docs, k);
+        // Deep enough for the RM3 re-rank pool. The second pass used to
+        // re-scan every expansion-term postings list (~4 ms); we now
+        // re-score only these first-pass documents from the forward index.
+        int pass1_depth = std::max(std::max(fb_docs, k), use_rm3 ? RM3_POOL : k);
         auto pass1 = raw_retrieve(q_vec, pass1_depth, k1, b, delta, w_title, title_bonus);
         if (pass1.empty()) return {};
 
@@ -1558,10 +1513,10 @@ public:
                 for (int i = 0; i < num_fb; ++i) norm += pass1[i].second;
                 if (norm <= 0.0f) norm = 1.0f;
 
-                std::vector<uint32_t> fb_docs_vec;
-                fb_docs_vec.reserve(num_fb);
-                for (int i = 0; i < num_fb; ++i) fb_docs_vec.push_back(pass1[i].first);
-                auto batch = get_batch_doc_term_freqs(fb_docs_vec);
+                std::vector<uint32_t> pool_ids;
+                pool_ids.reserve(pass1.size());
+                for (const auto& p : pass1) pool_ids.push_back(p.first);
+                auto batch = get_batch_doc_term_freqs(pool_ids);
 
                 // RM3 relevance model: P(w|R) = sum_D P(w|D) P(D|Q), with
                 // P(w|D) Dirichlet-smoothed against the collection model.
@@ -1594,12 +1549,50 @@ public:
                 for (const auto& kv : expansion) esum += kv.second;
                 if (esum <= 0.0f) esum = 1.0f;
 
-                std::unordered_map<int32_t, float> final_w;
-                for (const auto& kv : qw) final_w[kv.first] += alpha * kv.second;
-                for (const auto& kv : expansion) final_w[kv.first] += (1.0f - alpha) * (kv.second / esum);
+                // Expansion-only BM25 weights. Query-term contribution is
+                // recovered as alpha * first-pass score (BM25 is linear in
+                // the query weight), so we never re-scan those postings.
+                std::unordered_map<uint32_t, float> exp_w;
+                exp_w.reserve(expansion.size() * 2);
+                for (const auto& kv : expansion) {
+                    int32_t tid = kv.first;
+                    if (tid < 0 || tid >= static_cast<int32_t>(term_metas.size())) continue;
+                    float idf = std::log(1.0f + (static_cast<float>(N) - term_metas[tid].df + 0.5f)
+                                                / (term_metas[tid].df + 0.5f));
+                    exp_w[static_cast<uint32_t>(tid)] = (1.0f - alpha) * (kv.second / esum) * idf;
+                }
 
-                std::vector<std::pair<int32_t, float>> final_vec(final_w.begin(), final_w.end());
-                pool = raw_retrieve(final_vec, k, k1, b, delta, w_title, title_bonus);
+                float length_penalty_lut[256];
+                for (int q = 0; q < 256; ++q) {
+                    float ratio = dequantize_doc_len(static_cast<uint8_t>(q));
+                    length_penalty_lut[q] = k1 * (1.0f - b + b * ratio);
+                }
+                const float k1p1 = k1 + 1.0f;
+
+                pool.clear();
+                pool.reserve(pass1.size());
+                for (const auto& p1 : pass1) {
+                    uint32_t d = p1.first;
+                    float s = alpha * p1.second;
+                    auto it = batch.find(d);
+                    if (it != batch.end()) {
+                        float lp = length_penalty_lut[quantized_doc_lens[d]];
+                        for (const auto& tf_kv : it->second) {
+                            auto e = exp_w.find(tf_kv.first);
+                            if (e == exp_w.end()) continue;
+                            float tf_eff = static_cast<float>(tf_kv.second);
+                            float tf_norm = (tf_eff * k1p1) / (tf_eff + lp);
+                            s += e->second * (tf_norm + delta);
+                        }
+                    }
+                    pool.push_back({d, s});
+                }
+                std::sort(pool.begin(), pool.end(),
+                          [this](const auto& a, const auto& b) {
+                              if (a.second != b.second) return a.second > b.second;
+                              return doc_ids[a.first] < doc_ids[b.first];
+                          });
+                if (static_cast<int>(pool.size()) > k) pool.resize(static_cast<size_t>(std::max(k, 0)));
             }
         }
 
