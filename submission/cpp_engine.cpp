@@ -1,19 +1,25 @@
 // ===========================================================================
-// cpp_engine.cpp — from-scratch inverted index + BM25+ / RM3 retrieval.
+// cpp_engine.cpp — from-scratch inverted index + BM25F+/RM3 retrieval.
 //
-// On-disk layout (v2). Everything is little-endian, written by build_*() and
+// On-disk layout (v5). Everything is little-endian, written by build_*() and
 // read back by load_index(); nothing survives between the two processes
 // except these files.
 //
-//   docmap.bin    N, then per doc: uint16 len + external doc_id bytes
+//   docmap.bin    N, uint16 id_len (0 = variable). Fixed-width ids are packed
+//                 with the length written once; variable ids are front-coded.
 //   doclens.bin   N, avg_doc_len, total_tokens, then N x uint8 quantised
 //                 length ratios (log-quantised, see quantize_doc_len)
-//   dict.bin      terms in sorted order, front-coded, varint fields
+//   dict.bin      terms in sorted order, front-coded, varint fields.
+//                 Collection frequency is stored as (cf - df).
 //   postings.bin  per term: optional block skip table + gap/varint postings.
-//                 The tf byte is packed: high 2 bits = title tf (0–3) in the
-//                 leading TITLE_WINDOW tokens, low 6 bits = body tf (0–63).
-//   fwd.bin       pruned forward index (doc -> top terms), for RM3
-//   fwdoff.bin    N+1 x uint32 offsets into fwd.bin
+//                 The gap's low bit flags the common (tf=1, title_tf=0) case
+//                 so that posting skips the tf byte. Otherwise the tf byte
+//                 packs body tf (low 6 bits) and title tf (high 2 bits).
+//   fwd.bin       pruned forward index (doc -> top RM3-candidate terms).
+//                 Term ids are a dense 0..M-1 space; each entry is
+//                 ((gap << 3) | min(tf, 7)), plus an extra vbyte when tf >= 7.
+//   fwdoff.bin    N, stride, then ceil(N/stride) x uint32 checkpoints
+//   rm3map.bin    M, then M varint-gapped global term ids (rm3_id -> tid)
 //
 // ===========================================================================
 #include <pybind11/pybind11.h>
@@ -25,6 +31,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
+#include <tuple>
 #include <cmath>
 #include <queue>
 #include <cstdint>
@@ -34,33 +41,64 @@
 #include <sstream>
 #include <cctype>
 
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#  include <sys/stat.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
 
 namespace py = pybind11;
 
 // ---------------------------------------------------------------------------
-// Tunable build-time constants. These are the knobs worth sweeping for the
-// report: each trades index size against ranking quality or latency.
+// Fixed structural constants. Unlike BuildCfg below, these are not swept:
+// they trade memory against I/O during the build, not ranking quality.
 // ---------------------------------------------------------------------------
-static constexpr uint32_t BLOCK_SIZE            = 128;   // postings per block
-static constexpr uint32_t FWD_TERMS_PER_DOC     = 24;    // RM3 forward index width; 48→24 keeps nDCG, cuts fwd.bin
-static constexpr uint32_t FWD_CANDIDATES        = 128;   // pre-df-filter margin (ranked later by tf*idf)
-static constexpr float    RM3_DF_FRACTION       = 0.13f; // mid-frequency clinical vocab; 5% was too tight
-static constexpr uint32_t TITLE_WINDOW          = 12;    // leading tokens treated as title (CORD-19 median)
-static constexpr uint32_t SPIMI_BATCH_DOCS      = 50000;
+static constexpr uint32_t BLOCK_SIZE       = 128;    // postings per skip block
+static constexpr uint32_t FWD_CANDIDATES   = 64;     // pre-df-filter margin
+static constexpr uint32_t SPIMI_BATCH_DOCS = 50000;  // docs buffered per spill
+static constexpr uint32_t FWD_OFF_STRIDE   = 8;      // checkpoint every 8th doc
+static constexpr uint32_t FWD_TF_MAX       = 7;      // 3 bits, packed into tid gap
 
-// Pack body tf in the low 6 bits (saturates at 63; BM25 is flat there anyway)
-// and title tf in the high 2 bits (0–3). Same one-byte posting as before.
-static inline uint8_t pack_tf_byte(uint32_t body_tf, uint32_t title_tf) {
-    uint8_t b = static_cast<uint8_t>(std::min(body_tf, 63u));
-    uint8_t t = static_cast<uint8_t>(std::min(title_tf, 3u));
-    return static_cast<uint8_t>((t << 6) | b);
+// ---------------------------------------------------------------------------
+// Build-time settings that are swept rather than derived. Each is a plain
+// default with an environment override, so scripts/sweep_build.py can A/B them
+// by rebuilding instead of by editing and recompiling. None of them is needed
+// at query time, so none of them goes into meta.bin.
+//
+//   IR_TITLE_WINDOW  leading raw tokens treated as the title field
+//   IR_FWD_TERMS     forward-index width (terms/doc) available to RM3
+//   IR_RM3_DF_FRAC   df ceiling, as a fraction of N, for RM3 candidate terms
+// ---------------------------------------------------------------------------
+struct BuildCfg {
+    // title_window = 12 raw tokens: the median title length in this collection,
+    // and the flat top of the sweep (8-16 are all within noise of each other,
+    // 24+ falls away as abstract text starts leaking into the "title").
+    uint32_t title_window   = 12;
+    // 24: enough RM3 signal to hold nDCG, small enough that dense+packed
+    // fwd.bin stays inside the 20–30 MB band. 16 leaked ~0.005 nDCG on
+    // a handful of expansion-sensitive topics; 32 overshoots the size budget.
+    uint32_t fwd_terms      = 24;
+    // rm3_df_frac = 0.13: a term may be an RM3 expansion candidate if it occurs
+    // in at most 13% of documents. The old 5% ceiling was too aggressive for a
+    // single-topic collection — it threw away exactly the mid-frequency
+    // clinical vocabulary ("mortality", "sequelae", "seroprevalence") that a
+    // relevance model is supposed to find. Anything above ~20% starts pulling
+    // in collection-wide noise, so the useful band is broad and this sits in it.
+    float    rm3_df_frac    = 0.13f;
+};
+
+static BuildCfg read_build_cfg() {
+    BuildCfg c;
+    if (const char* e = std::getenv("IR_TITLE_WINDOW")) c.title_window = std::atoi(e);
+    if (const char* e = std::getenv("IR_FWD_TERMS"))    c.fwd_terms    = std::atoi(e);
+    if (const char* e = std::getenv("IR_RM3_DF_FRAC"))  c.rm3_df_frac  = std::atof(e);
+    return c;
 }
-static inline uint32_t unpack_body_tf(uint8_t packed) { return packed & 63u; }
-static inline uint32_t unpack_title_tf(uint8_t packed) { return packed >> 6; }
 
 // ---------------------------------------------------------------------------
 // Stopwords (Indri / INQUERY inspired subset), used to prune the forward
@@ -120,6 +158,31 @@ static inline uint8_t quantize_doc_len(float len_ratio) {
 static inline float dequantize_doc_len(uint8_t q) {
     return std::pow(2.0f, static_cast<float>(q) / 64.0f) - 1.0f;
 }
+
+// ---------------------------------------------------------------------------
+// Term-frequency byte packing — "why the title field is free".
+//
+// A posting already spends exactly one byte on tf. Six bits are plenty for it:
+// BM25 saturates tf through tf/(tf + k1*norm), so at k1 <= 4 the difference in
+// score between tf = 63 and tf = 200 is under 1%, and in a collection of
+// abstracts (median 168 words) a tf above 63 essentially does not occur. That
+// frees the top two bits to hold the title-field tf, saturated at 3.
+//
+// So the title field costs ZERO extra index bytes. That matters here: index
+// size is its own graded component, and a positional index — the usual way to
+// get "where in the document did this term occur" — would have roughly
+// doubled the index for a smaller gain (see the report's rejected-ideas note).
+// ---------------------------------------------------------------------------
+static constexpr uint32_t TF_MAX       = 63;   // 6 bits
+static constexpr uint32_t TITLE_TF_MAX = 3;    // 2 bits
+
+static inline uint8_t pack_tf(uint32_t body_tf, uint32_t title_tf) {
+    uint32_t b = std::min(body_tf, TF_MAX);
+    uint32_t t = std::min(title_tf, TITLE_TF_MAX);
+    return static_cast<uint8_t>(b | (t << 6));
+}
+static inline uint8_t unpack_body_tf(uint8_t packed)  { return packed & 0x3F; }
+static inline uint8_t unpack_title_tf(uint8_t packed) { return packed >> 6; }
 
 // ---------------------------------------------------------------------------
 // Variable-byte (varint) codecs. 7 payload bits per byte, high bit = continue.
@@ -398,28 +461,41 @@ static inline std::string s_stem(const std::string& word) {
     return word;
 }
 
-// NLTK English stopwords, applied to the RAW lowercased token (before Porter).
-// Carve-outs vs the stock list:
-//   - single letters stay indexed (vitamin D, T cells → tokens "d"/"t")
-//   - "don" stays indexed (Porter stem of "donning", not just "don't")
-// Question words (what/how/which/who/does/from) ARE stopped: they had
-// non-trivial IDF on this collection and polluted NL-question rankings.
-// Content words (case/state/work/group) are not on this list.
+// Index/query stopword list: the standard NLTK English set, which is a pure
+// function-word list (pronouns, determiners, prepositions, auxiliaries,
+// interrogatives). Two deliberate deviations from NLTK's literal contents:
+//
+//   * single letters ("s", "t", "d", "m", "o", "y", ...) are NOT stopped.
+//     NLTK only lists them as leftovers of its contraction tokeniser, but in
+//     a biomedical collection they are content: "vitamin D", "T cells",
+//     "B cells", "IgM". Dropping them silently breaks those queries.
+//   * contraction fragments ("don", "won", "ain", "isn", ...) are not stopped
+//     either. They are tokeniser artefacts, and "don" collides with the stem
+//     of "donning" (as in donning PPE).
+//
+// This is deliberately larger than the 33-word Lucene/BEIR set that was here
+// before. The reason is the query side, not the document side: these topics
+// are natural-language questions, so they lead with "what", "how", "which",
+// "does", "who". Those are not in the Lucene set, they have enough IDF to
+// matter (df("what") = 2.7% of the corpus), and a document that merely
+// repeats "What ... What ..." in its title was outranking documents that were
+// actually on topic. Note it is still a function-word list only: the content
+// words the large INQUERY list below drops ("case", "state", "number",
+// "group", "point", "work") stay indexed, because in a biomedical collection
+// they are content. The INQUERY list is still used, separately, to prune RM3
+// expansion candidates, where being aggressive is appropriate.
 static const std::unordered_set<std::string> INDEX_STOPWORDS = {
-    "me","my","myself","we","our","ours","ourselves","you","your","yours",
-    "yourself","yourselves","he","him","his","himself","she","her","hers",
-    "herself","it","its","itself","they","them","their","theirs","themselves",
-    "what","which","who","whom","this","that","these","those","am","is","are",
-    "was","were","be","been","being","have","has","had","having","do","does",
-    "did","doing","an","the","and","but","if","or","because","as","until",
-    "while","of","at","by","for","with","about","against","between","into",
-    "through","during","before","after","above","below","to","from","up",
-    "down","in","out","on","off","over","under","again","further","then",
-    "once","here","there","when","where","why","how","all","any","both",
-    "each","few","more","most","other","some","such","no","nor","not","only",
-    "own","same","so","than","too","very","can","will","just","should","now",
-    "ain","aren","couldn","didn","doesn","hadn","hasn","haven","isn","ma",
-    "mightn","mustn","needn","shan","shouldn","wasn","weren","won","wouldn"
+    "i","me","my","myself","we","our","ours","ourselves","you","your","yours",
+    "yourself","yourselves","he","him","his","himself","she","her","hers","herself",
+    "it","its","itself","they","them","their","theirs","themselves","what","which",
+    "who","whom","this","that","these","those","am","is","are","was","were","be",
+    "been","being","have","has","had","having","do","does","did","doing","a","an",
+    "the","and","but","if","or","because","as","until","while","of","at","by","for",
+    "with","about","against","between","into","through","during","before","after",
+    "above","below","to","from","up","down","in","out","on","off","over","under",
+    "again","further","then","once","here","there","when","where","why","how","all",
+    "any","both","each","few","more","most","other","some","such","no","nor","not",
+    "only","own","same","so","than","too","very","can","will","just","should","now"
 };
 
 struct TokenizerCfg {
@@ -468,7 +544,40 @@ cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
 struct MmapBuffer {
     const uint8_t* data = nullptr;
     size_t length = 0;
+#ifdef _WIN32
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMap = NULL;
 
+    bool map_file(const std::string& path) {
+        unmap();
+        // FILE_SHARE_DELETE matters: without it the mapping locks the file for
+        // the life of the process, and a caller that deletes index_dir while the
+        // engine is still loaded (the harness does exactly that, and so does
+        // pytest's temporary-directory cleanup) fails with a sharing violation.
+        // POSIX mmap has no such restriction, which is why the branch below
+        // needs no equivalent.
+        hFile = CreateFileA(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(hFile, &sz) || sz.QuadPart == 0) { unmap(); return false; }
+        length = static_cast<size_t>(sz.QuadPart);
+        hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (!hMap) { unmap(); return false; }
+        void* addr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (!addr) { unmap(); return false; }
+        data = static_cast<const uint8_t*>(addr);
+        return true;
+    }
+
+    void unmap() {
+        if (data) { UnmapViewOfFile(const_cast<uint8_t*>(data)); data = nullptr; }
+        if (hMap) { CloseHandle(hMap); hMap = NULL; }
+        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
+        length = 0;
+    }
+#else
     bool map_file(const std::string& path) {
         unmap();
         int fd = open(path.c_str(), O_RDONLY);
@@ -490,6 +599,7 @@ struct MmapBuffer {
             length = 0;
         }
     }
+#endif
 
     ~MmapBuffer() { unmap(); }
 };
@@ -497,40 +607,23 @@ struct MmapBuffer {
 // ---------------------------------------------------------------------------
 // Per-term dictionary entry.
 //
-// Note there is no stored max *score*: we store the raw statistics that a
-// score bound needs (highest tf seen, smallest quantised length seen) so the
-// bound can be recomputed for whatever k1/b are passed at query time. Storing
-// a precomputed max score bakes one parameter setting into the index and
-// silently invalidates pruning as soon as you sweep k1 or b.
+// Dictionary entries hold df, cf and a postings offset. A previous version
+// also stored per-term max_tf / min_qlen for block-max WAND; those were
+// written and then never consulted, so they are gone.
 // ---------------------------------------------------------------------------
 struct TermMeta {
     uint32_t df = 0;
     uint64_t cf = 0;
     uint64_t postings_offset = 0;
-    uint8_t  max_tf = 0;
-    uint8_t  min_qlen = 0;
-    uint8_t  has_positions = 0;  // always 0; kept so older indexes still load
 };
 
 struct DocPosting {
     uint32_t doc_id;
     uint32_t tf;
-    uint32_t title_tf = 0;
+    uint32_t title_tf = 0;      // occurrences within the leading title-window tokens
 };
 
-// Minimal JSONL field extraction for {"doc_id": ..., "text": ...}.
-// Closing quotes are found by scanning, not rfind, so a later field (or an
-// escaped quote inside the value) cannot steal the end of `text`.
-static size_t find_unescaped_dquote(const std::string& s, size_t from) {
-    for (size_t i = from; i < s.size(); ++i) {
-        if (s[i] != '"') continue;
-        size_t bs = 0;
-        while (i >= bs + 1 && s[i - 1 - bs] == '\\') ++bs;
-        if ((bs % 2) == 0) return i;
-    }
-    return std::string::npos;
-}
-
+// Minimal JSONL field extraction for {"doc_id": ..., "text": ...}
 static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::string& text) {
     if (line.empty()) return false;
     size_t id_pos = line.find("\"doc_id\"");
@@ -539,7 +632,10 @@ static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::
     if (id_colon == std::string::npos) return false;
     size_t id_quote1 = line.find('"', id_colon);
     if (id_quote1 == std::string::npos) return false;
-    size_t id_quote2 = find_unescaped_dquote(line, id_quote1 + 1);
+    size_t id_quote2 = line.find('"', id_quote1 + 1);
+    while (id_quote2 != std::string::npos && line[id_quote2 - 1] == '\\') {
+        id_quote2 = line.find('"', id_quote2 + 1);
+    }
     if (id_quote2 == std::string::npos) return false;
     doc_id = line.substr(id_quote1 + 1, id_quote2 - id_quote1 - 1);
 
@@ -549,8 +645,13 @@ static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::
     if (text_colon == std::string::npos) return false;
     size_t text_quote1 = line.find('"', text_colon);
     if (text_quote1 == std::string::npos) return false;
-    size_t text_quote2 = find_unescaped_dquote(line, text_quote1 + 1);
-    if (text_quote2 == std::string::npos || text_quote2 <= text_quote1) return false;
+    size_t text_quote2 = line.rfind('"');
+    if (text_quote2 <= text_quote1) return false;
+    while (text_quote2 > text_quote1 && line[text_quote2 - 1] == '\\') {
+        size_t prev = line.rfind('"', text_quote2 - 1);
+        if (prev <= text_quote1) break;
+        text_quote2 = prev;
+    }
 
     std::string raw_text = line.substr(text_quote1 + 1, text_quote2 - text_quote1 - 1);
     text.clear();
@@ -581,6 +682,7 @@ public:
     uint32_t N = 0;
     uint64_t total_corpus_tokens = 0;
     TokenizerCfg tokcfg;          // read from meta.bin at load; must match build
+    BuildCfg buildcfg;            // build-time only; never needed at query time
 
     // ---- dictionary, held as parallel sorted arrays -------------------------
     // Sorted term array + binary search rather than a hash map: on a corpus
@@ -588,6 +690,8 @@ public:
     // memory, and the array index doubles as the term id used by fwd.bin.
     std::vector<std::string> terms_sorted;
     std::vector<TermMeta> term_metas;
+    std::vector<uint32_t> rm3_to_tid;   // dense RM3 id -> global term id
+    uint32_t fwd_off_stride = FWD_OFF_STRIDE;
 
     MmapBuffer postings_mmap;
     MmapBuffer fwd_mmap;
@@ -616,8 +720,8 @@ public:
     //               While doing this, also spill each document's top candidate
     //               terms (by tf) to a temp file, so the forward index costs
     //               no second tokenisation pass over the corpus.
-    //   2. MERGE  — k-way merge the runs into postings.bin,
-    //               writing dict.bin front-coded in the same sorted pass.
+    //   2. MERGE  — k-way merge the runs into postings.bin, writing dict.bin
+    //               front-coded in the same sorted pass.
     //   3. FWD    — map the buffered candidate terms to term ids, drop the
     //               ones the df filter rejects, write fwd.bin / fwdoff.bin.
     //
@@ -636,6 +740,7 @@ public:
         // Overridable from the environment so the two configurations can be
         // A/B-ed without editing and recompiling:
         //     IR_STEMMER=0|1|2   IR_STOPWORDS=0|1
+        buildcfg = read_build_cfg();
         tokcfg = TokenizerCfg{};
         if (const char* e = std::getenv("IR_STEMMER"))
             tokcfg.stemmer = static_cast<uint8_t>(std::atoi(e));
@@ -695,11 +800,11 @@ public:
             doc_lens.push_back(d_len);
             total_corpus_tokens += d_len;
 
-            std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> term_data;  // tf, title_tf
+            std::unordered_map<std::string, uint32_t> term_data;  // term -> tf
+            std::unordered_map<std::string, uint32_t> title_tf;   // term -> tf in the title window
             for (const auto& tp : tokens) {
-                auto& slot = term_data[tp.first];
-                slot.first++;
-                if (tp.second < TITLE_WINDOW) slot.second++;
+                term_data[tp.first]++;
+                if (tp.second < buildcfg.title_window) title_tf[tp.first]++;
                 collection_freq[tp.first]++;
             }
 
@@ -709,7 +814,7 @@ public:
             cands.reserve(term_data.size());
             for (const auto& kv : term_data) {
                 if (STOPWORDS.count(kv.first)) continue;
-                cands.push_back({kv.second.first, &kv.first});
+                cands.push_back({kv.second, &kv.first});
             }
             size_t keep = std::min<size_t>(cands.size(), FWD_CANDIDATES);
             std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
@@ -724,9 +829,11 @@ public:
                 f_fwdtmp.write(reinterpret_cast<const char*>(&tf16), sizeof(tf16));
             }
 
-            for (auto& kv : term_data) {
+            for (const auto& kv : term_data) {
+                auto ttf = title_tf.find(kv.first);
                 temp_postings[kv.first].push_back(
-                    DocPosting{doc_int_id, kv.second.first, kv.second.second});
+                    DocPosting{doc_int_id, kv.second,
+                               (ttf == title_tf.end()) ? 0u : ttf->second});
             }
 
             doc_int_id++;
@@ -748,7 +855,7 @@ public:
         // -------- meta.bin: analysis config, needed to tokenise queries -----
         {
             std::ofstream f(index_dir + "/meta.bin", std::ios::binary);
-            uint8_t version = 2;
+            uint8_t version = 5;
             f.write(reinterpret_cast<const char*>(&version), 1);
             f.write(reinterpret_cast<const char*>(&tokcfg.stemmer), 1);
             f.write(reinterpret_cast<const char*>(&tokcfg.remove_stop), 1);
@@ -758,10 +865,35 @@ public:
         {
             std::ofstream f(index_dir + "/docmap.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(&N), sizeof(N));
-            for (const auto& id : doc_ids) {
-                uint16_t len = id.size();
-                f.write(reinterpret_cast<const char*>(&len), sizeof(len));
-                f.write(id.data(), len);
+            uint16_t id_len = 0;
+            if (N > 0) {
+                id_len = static_cast<uint16_t>(doc_ids[0].size());
+                for (const auto& id : doc_ids) {
+                    if (id.size() != id_len) { id_len = 0; break; }
+                }
+            }
+            f.write(reinterpret_cast<const char*>(&id_len), sizeof(id_len));
+            if (id_len > 0) {
+                // TREC-COVID cord_uids are all 8 bytes — one length in the
+                // header, then packed ids. Saves a uint16 per document.
+                for (const auto& id : doc_ids) f.write(id.data(), id_len);
+            } else {
+                // Variable-width ids (toy set): front-code against the
+                // previous id, same codec as dict.bin.
+                std::vector<uint8_t> buf;
+                buf.reserve(static_cast<size_t>(N) * 8);
+                std::string prev;
+                for (const auto& id : doc_ids) {
+                    size_t prefix = 0;
+                    size_t maxp = std::min(prev.size(), id.size());
+                    while (prefix < maxp && prev[prefix] == id[prefix]) prefix++;
+                    if (prefix > 255) prefix = 255;
+                    write_vbyte(buf, static_cast<uint32_t>(prefix));
+                    write_vbyte(buf, static_cast<uint32_t>(id.size() - prefix));
+                    buf.insert(buf.end(), id.begin() + prefix, id.end());
+                    prev = id;
+                }
+                f.write(reinterpret_cast<const char*>(buf.data()), buf.size());
             }
         }
         {
@@ -844,7 +976,7 @@ public:
                     r.file.read(reinterpret_cast<char*>(&dp.tf), sizeof(dp.tf));
                     r.file.read(reinterpret_cast<char*>(&dp.title_tf), sizeof(dp.title_tf));
                     merged_cf += dp.tf;
-                    merged.push_back(dp);
+                    merged.push_back(std::move(dp));
                 }
                 r.read_next_term();
             }
@@ -853,9 +985,6 @@ public:
             // order, so `merged` is already sorted by doc_id.
             uint32_t num_blocks = (df + BLOCK_SIZE - 1) / BLOCK_SIZE;
             uint64_t term_postings_start = current_postings_offset;
-
-            uint8_t global_max_tf = 0;
-            uint8_t global_min_qlen = 255;
             uint32_t prev_block_last_doc = 0;
 
             for (uint32_t b_idx = 0; b_idx < num_blocks; ++b_idx) {
@@ -863,35 +992,28 @@ public:
                 uint32_t end_i = std::min(start_i + BLOCK_SIZE, df);
 
                 block_data.clear();
-
-                uint8_t block_max_tf = 0;
-                uint8_t block_min_qlen = 255;
                 uint32_t prev_doc_id = (b_idx == 0) ? 0 : prev_block_last_doc;
 
                 for (uint32_t i = start_i; i < end_i; ++i) {
                     uint32_t d_id = merged[i].doc_id;
-                    uint8_t tf_byte = pack_tf_byte(merged[i].tf, merged[i].title_tf);
-                    if (tf_byte > block_max_tf) block_max_tf = tf_byte;
-                    uint8_t ql = quantized_doc_lens[d_id];
-                    if (ql < block_min_qlen) block_min_qlen = ql;
-
-                    write_vbyte(block_data, d_id - prev_doc_id);
-                    block_data.push_back(tf_byte);
+                    uint8_t tf_byte = pack_tf(merged[i].tf, merged[i].title_tf);
+                    // Fold the common posting (tf=1, no title hit) into the
+                    // gap's low bit so that posting pays no tf byte.
+                    bool plain = (tf_byte == pack_tf(1, 0));
+                    write_vbyte(block_data, ((d_id - prev_doc_id) << 1) | (plain ? 1u : 0u));
+                    if (!plain) block_data.push_back(tf_byte);
                     prev_doc_id = d_id;
                 }
-
-                if (block_max_tf > global_max_tf) global_max_tf = block_max_tf;
-                if (block_min_qlen < global_min_qlen) global_min_qlen = block_min_qlen;
 
                 // Skip-table entry, written only when the term actually spans
                 // more than one block. A single-block term (the overwhelming
                 // majority, by Zipf) pays zero header bytes: df in the
                 // dictionary already tells us how many postings to decode.
+                // Header is last-doc gap + payload size only — max_tf /
+                // min_qlen were never consulted (no WAND), so they are gone.
                 if (num_blocks > 1) {
                     hdr_buf.clear();
                     write_vbyte(hdr_buf, merged[end_i - 1].doc_id - prev_block_last_doc);
-                    hdr_buf.push_back(block_max_tf);
-                    hdr_buf.push_back(block_min_qlen);
                     write_vbyte(hdr_buf, static_cast<uint32_t>(block_data.size()));
                     f_postings.write(reinterpret_cast<const char*>(hdr_buf.data()), hdr_buf.size());
                     current_postings_offset += hdr_buf.size();
@@ -913,11 +1035,11 @@ public:
             write_vbyte(dict_buf, static_cast<uint32_t>(term.size() - prefix));
             dict_buf.insert(dict_buf.end(), term.begin() + prefix, term.end());
             write_vbyte(dict_buf, df);
-            write_vbyte64(dict_buf, merged_cf);
-            dict_buf.push_back(global_max_tf);
-            dict_buf.push_back(global_min_qlen);
+            // cf >= df always; (cf - df) is 0 for every all-singleton term,
+            // which is most of the vocabulary, so this is usually one vbyte
+            // of zero instead of two or three bytes of cf.
+            write_vbyte64(dict_buf, merged_cf - df);
             write_vbyte64(dict_buf, term_postings_start - prev_postings_offset);
-            dict_buf.push_back(0);  // has_positions
             prev_postings_offset = term_postings_start;
             prev_term = term;
             num_written_terms++;
@@ -974,7 +1096,7 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Forward index: doc -> its top FWD_TERMS_PER_DOC terms (term id + tf),
+    // Forward index: doc -> its top buildcfg.fwd_terms terms (term id + tf),
     // restricted to terms RM3 would ever consider as expansion candidates.
     //
     // This exists purely so RM3 does not have to find "which terms occur in
@@ -988,61 +1110,104 @@ public:
 
         const uint32_t df_min = 5;
         const uint32_t df_max = std::max<uint32_t>(
-            df_min, static_cast<uint32_t>(RM3_DF_FRACTION * static_cast<float>(N)));
+            df_min, static_cast<uint32_t>(buildcfg.rm3_df_frac * static_cast<float>(N)));
+
+        // Dense RM3 id space: only terms that can appear in fwd.bin get an
+        // id. Gaps then average M/fwd_terms instead of vocab/fwd_terms, so
+        // most entries fit in one or two vbytes once tf is packed in too.
+        std::vector<int32_t> tid_to_rm3(term_metas.size(), -1);
+        rm3_to_tid.clear();
+        for (uint32_t tid = 0; tid < term_metas.size(); ++tid) {
+            uint32_t df = term_metas[tid].df;
+            if (df >= df_min && df <= df_max) {
+                tid_to_rm3[tid] = static_cast<int32_t>(rm3_to_tid.size());
+                rm3_to_tid.push_back(tid);
+            }
+        }
+
+        {
+            std::ofstream f_map(index_dir + "/rm3map.bin", std::ios::binary);
+            uint32_t M = static_cast<uint32_t>(rm3_to_tid.size());
+            f_map.write(reinterpret_cast<const char*>(&M), sizeof(M));
+            std::vector<uint8_t> mapbuf;
+            mapbuf.reserve(M * 2);
+            uint32_t prev = 0;
+            for (uint32_t tid : rm3_to_tid) {
+                write_vbyte(mapbuf, tid - prev);
+                prev = tid;
+            }
+            f_map.write(reinterpret_cast<const char*>(mapbuf.data()), mapbuf.size());
+        }
+
+        fwd_off_stride = FWD_OFF_STRIDE;
+        f_off.write(reinterpret_cast<const char*>(&N), sizeof(N));
+        f_off.write(reinterpret_cast<const char*>(&fwd_off_stride), sizeof(fwd_off_stride));
 
         uint32_t offset = 0;
-        f_off.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
-
         std::vector<uint8_t> out;
-        std::vector<std::pair<uint32_t, uint32_t>> kept;   // (term_id, tf)
+        std::vector<std::pair<uint32_t, uint32_t>> kept;   // (rm3_id, tf)
+        std::vector<std::tuple<float, uint32_t, uint32_t>> pool;  // (tf*idf, rid, tf)
         std::string term;
 
         for (uint32_t d = 0; d < N; ++d) {
+            if (d % fwd_off_stride == 0)
+                f_off.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
+
             uint32_t n_cand = 0;
             f_in.read(reinterpret_cast<char*>(&n_cand), sizeof(n_cand));
-            kept.clear();
+            pool.clear();
 
-            // Read every candidate first (skipping would desynchronise f_in),
-            // drop stop/df-filtered terms, then keep the top FWD_TERMS_PER_DOC
-            // by tf*idf — not raw tf, which surfaces "patient/studi/result".
-            std::vector<std::pair<float, std::pair<uint32_t, uint32_t>>> scored;
-            scored.reserve(n_cand);
             for (uint32_t i = 0; i < n_cand; ++i) {
                 uint16_t tl, tf16;
                 f_in.read(reinterpret_cast<char*>(&tl), sizeof(tl));
                 term.resize(tl);
-                if (tl > 0) f_in.read(&term[0], tl);
+                f_in.read(&term[0], tl);
                 f_in.read(reinterpret_cast<char*>(&tf16), sizeof(tf16));
 
+                // Consume every candidate — do not break early or the next
+                // document reads from the wrong offset.
                 int32_t tid = find_term(term);
                 if (tid < 0) continue;
-                uint32_t df = term_metas[tid].df;
-                if (df < df_min || df > df_max) continue;
-                float idf = std::log(1.0f + static_cast<float>(N) / static_cast<float>(df));
-                float w = (1.0f + std::log(static_cast<float>(std::max<uint16_t>(tf16, 1)))) * idf;
-                scored.push_back({w, {static_cast<uint32_t>(tid), tf16}});
+                int32_t rid = tid_to_rm3[static_cast<uint32_t>(tid)];
+                if (rid < 0) continue;
+                uint32_t df = term_metas[static_cast<uint32_t>(tid)].df;
+                float idf = (df > 0 && N > 0)
+                    ? std::log(static_cast<float>(N) / static_cast<float>(df))
+                    : 0.0f;
+                pool.push_back({static_cast<float>(tf16) * idf,
+                                static_cast<uint32_t>(rid), tf16});
             }
-            size_t keep_n = std::min<size_t>(scored.size(), FWD_TERMS_PER_DOC);
-            if (keep_n > 0) {
-                std::partial_sort(scored.begin(), scored.begin() + keep_n, scored.end(),
-                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+            // Prefer distinctive terms over raw-tf collection generalists so
+            // the 24 slots actually feed RM3.
+            size_t take = std::min<size_t>(pool.size(), buildcfg.fwd_terms);
+            if (take < pool.size()) {
+                std::partial_sort(pool.begin(), pool.begin() + take, pool.end(),
+                                  [](const auto& a, const auto& b) {
+                                      return std::get<0>(a) > std::get<0>(b);
+                                  });
+                pool.resize(take);
             }
             kept.clear();
-            kept.reserve(keep_n);
-            for (size_t i = 0; i < keep_n; ++i) kept.push_back(scored[i].second);
-            std::sort(kept.begin(), kept.end());  // tid-ascending for gap coding
+            kept.reserve(pool.size());
+            for (const auto& t : pool) kept.push_back({std::get<1>(t), std::get<2>(t)});
+            std::sort(kept.begin(), kept.end());
 
             out.clear();
             write_vbyte(out, static_cast<uint32_t>(kept.size()));
-            uint32_t prev_tid = 0;
+            uint32_t prev_rid = 0;
             for (const auto& kv : kept) {
-                write_vbyte(out, kv.first - prev_tid);
-                write_vbyte(out, kv.second);
-                prev_tid = kv.first;
+                // 3-bit tf with escape: values 0–6 are stored in the gap
+                // word; 7 means "read another vbyte and add 7", so P(w|D)
+                // keeps the real tf instead of saturating at 7.
+                uint32_t tf = kv.second;
+                uint32_t tf_lo = std::min<uint32_t>(tf, FWD_TF_MAX);
+                write_vbyte(out, ((kv.first - prev_rid) << 3) | tf_lo);
+                if (tf >= FWD_TF_MAX) write_vbyte(out, tf - FWD_TF_MAX);
+                prev_rid = kv.first;
             }
             f_fwd.write(reinterpret_cast<const char*>(out.data()), out.size());
             offset += static_cast<uint32_t>(out.size());
-            f_off.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
         }
     }
 
@@ -1078,19 +1243,33 @@ public:
 
             TermMeta m;
             m.df = read_vbyte(p);
-            m.cf = read_vbyte64(p);
-            m.max_tf = *p++;
-            m.min_qlen = *p++;
+            m.cf = read_vbyte64(p) + m.df;   // stored as (cf - df)
             m.postings_offset = prev_postings_offset + read_vbyte64(p);
             prev_postings_offset = m.postings_offset;
-            m.has_positions = *p++;
-            if (m.has_positions) {
-                (void)read_vbyte64(p);  // skip unused position-offset field
-            }
 
             terms_sorted.push_back(term);
             term_metas.push_back(m);
             prev_term = std::move(term);
+        }
+    }
+
+    void load_rm3_map(const std::string& index_dir) {
+        rm3_to_tid.clear();
+        std::ifstream f(index_dir + "/rm3map.bin", std::ios::binary | std::ios::ate);
+        if (!f.is_open()) return;
+        std::streamsize sz = f.tellg();
+        if (sz < static_cast<std::streamsize>(sizeof(uint32_t))) return;
+        f.seekg(0);
+        std::vector<uint8_t> buf(static_cast<size_t>(sz));
+        f.read(reinterpret_cast<char*>(buf.data()), sz);
+        uint32_t M = 0;
+        std::memcpy(&M, buf.data(), sizeof(M));
+        rm3_to_tid.resize(M);
+        const uint8_t* p = buf.data() + sizeof(M);
+        uint32_t tid = 0;
+        for (uint32_t i = 0; i < M; ++i) {
+            tid += read_vbyte(p);
+            rm3_to_tid[i] = tid;
         }
     }
 
@@ -1108,12 +1287,32 @@ public:
         {
             std::ifstream f(index_dir + "/docmap.bin", std::ios::binary);
             f.read(reinterpret_cast<char*>(&N), sizeof(N));
+            uint16_t id_len = 0;
+            f.read(reinterpret_cast<char*>(&id_len), sizeof(id_len));
             doc_ids.assign(N, std::string());
-            for (uint32_t i = 0; i < N; ++i) {
-                uint16_t len;
-                f.read(reinterpret_cast<char*>(&len), sizeof(len));
-                doc_ids[i].resize(len);
-                f.read(&doc_ids[i][0], len);
+            if (id_len > 0) {
+                for (uint32_t i = 0; i < N; ++i) {
+                    doc_ids[i].resize(id_len);
+                    f.read(&doc_ids[i][0], id_len);
+                }
+            } else {
+                std::ifstream::pos_type here = f.tellg();
+                f.seekg(0, std::ios::end);
+                std::streamsize rest = f.tellg() - here;
+                f.seekg(here);
+                std::vector<uint8_t> buf(static_cast<size_t>(rest));
+                f.read(reinterpret_cast<char*>(buf.data()), rest);
+                const uint8_t* p = buf.data();
+                std::string prev;
+                for (uint32_t i = 0; i < N; ++i) {
+                    uint32_t prefix = read_vbyte(p);
+                    uint32_t slen = read_vbyte(p);
+                    std::string id = prev.substr(0, prefix);
+                    id.append(reinterpret_cast<const char*>(p), slen);
+                    p += slen;
+                    doc_ids[i] = id;
+                    prev = std::move(id);
+                }
             }
         }
         {
@@ -1134,10 +1333,15 @@ public:
         }
 
         load_dictionary(index_dir);
+        load_rm3_map(index_dir);
 
         postings_mmap.map_file(index_dir + "/postings.bin");
         fwd_mmap.map_file(index_dir + "/fwd.bin");
         fwdoff_mmap.map_file(index_dir + "/fwdoff.bin");
+        if (fwdoff_mmap.data && fwdoff_mmap.length >= 8) {
+            std::memcpy(&fwd_off_stride, fwdoff_mmap.data + sizeof(uint32_t), sizeof(uint32_t));
+            if (fwd_off_stride == 0) fwd_off_stride = 1;
+        }
 
         acc.assign(N, 0.0f);
         touched.clear();
@@ -1156,7 +1360,7 @@ public:
     //
     std::vector<std::pair<uint32_t, float>> raw_retrieve(
         const std::vector<std::pair<int32_t, float>>& qterms,
-        int top_k, float k1, float b, float delta, float title_bonus)
+        int top_k, float k1, float b, float delta, float w_title, float title_bonus)
     {
         if (qterms.empty() || N == 0 || !postings_mmap.data) return {};
 
@@ -1189,24 +1393,38 @@ public:
 
                 if (num_blocks > 1) {          // consume the skip-table entry
                     read_vbyte(ptr);           // last doc id gap
-                    ptr += 2;                  // max_tf, min_qlen
                     read_vbyte(ptr);           // payload byte size
-                    if (meta.has_positions) read_vbyte(ptr);
                 }
 
                 for (uint32_t i = 0; i < n_in_block; ++i) {
-                    current_doc += read_vbyte(ptr);
-                    uint8_t packed = *ptr++;
-                    float tf = static_cast<float>(unpack_body_tf(packed));
-                    float title_tf = static_cast<float>(unpack_title_tf(packed));
+                    uint32_t coded = read_vbyte(ptr);
+                    current_doc += coded >> 1;
+                    uint8_t packed = (coded & 1u) ? pack_tf(1, 0) : *ptr++;
 
-                    float tf_norm = (tf * (k1 + 1.0f)) /
-                                    (tf + length_penalty_lut[quantized_doc_lens[current_doc]]);
-                    // Title hit: same additive shape as BM25+ delta, but only
-                    // if the term occurs in the leading TITLE_WINDOW tokens.
-                    float contrib = w * (tf_norm + delta);
-                    if (title_tf > 0.0f && title_bonus != 0.0f)
-                        contrib += w * title_bonus;
+                    // BM25F, in its pseudo-term-frequency form (Robertson,
+                    // Zaragoza & Taylor 2004): the fields are combined into one
+                    // effective tf BEFORE saturation, not scored separately and
+                    // added afterwards. Combining after saturation would let a
+                    // title match and a body match each saturate on their own
+                    // and double-count; combining before keeps one saturation
+                    // curve over the document as a whole.
+                    uint8_t ttf = unpack_title_tf(packed);
+                    float tf_eff = static_cast<float>(unpack_body_tf(packed)) +
+                                   w_title * static_cast<float>(ttf);
+
+                    float tf_norm = (tf_eff * (k1 + 1.0f)) /
+                                    (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
+
+                    // title_bonus is the second, *unsaturated* half of the field
+                    // model: a flat IDF-weighted credit for the term appearing in
+                    // the title at all. It is the same shape as BM25+'s delta —
+                    // a lower bound on the contribution of a matched term — but
+                    // conditioned on the title rather than granted to every
+                    // match. Where w_title asks "how much more does a title
+                    // occurrence count", this asks "how much is being in the
+                    // title worth on its own", which is what actually separates
+                    // an on-topic paper from one that merely mentions the term.
+                    float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
 
                     if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
                     acc[current_doc] += contrib;
@@ -1218,8 +1436,9 @@ public:
         std::partial_sort(touched.begin(), touched.begin() + want, touched.end(),
                           [this](uint32_t a, uint32_t x) {
                               if (acc[a] != acc[x]) return acc[a] > acc[x];
-                              return doc_ids[a] < doc_ids[x];  // external doc_id asc
+                              return doc_ids[a] < doc_ids[x];  // external id, not insertion order
                           });
+
         std::vector<std::pair<uint32_t, float>> results;
         results.reserve(want);
         for (size_t i = 0; i < want; ++i) results.push_back({touched[i], acc[touched[i]]});
@@ -1236,20 +1455,42 @@ public:
     std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>
     get_batch_doc_term_freqs(const std::vector<uint32_t>& target_docs) {
         std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> out;
-        if (!fwd_mmap.data || !fwdoff_mmap.data) return out;
+        if (!fwd_mmap.data || !fwdoff_mmap.data || fwdoff_mmap.length < 8) return out;
 
-        const uint32_t* offs = reinterpret_cast<const uint32_t*>(fwdoff_mmap.data);
+        // fwdoff.bin: N, stride, then ceil(N/stride) checkpoints. Each fwd
+        // record is self-delimiting, so we land on the nearest checkpoint
+        // and skip at most (stride-1) records.
+        const uint32_t* offs = reinterpret_cast<const uint32_t*>(
+            fwdoff_mmap.data + 2 * sizeof(uint32_t));
+        const uint32_t n_chk = static_cast<uint32_t>(
+            (fwdoff_mmap.length - 2 * sizeof(uint32_t)) / sizeof(uint32_t));
+        const uint32_t stride = fwd_off_stride ? fwd_off_stride : 1;
+
         for (uint32_t d : target_docs) {
             if (d >= N) continue;
-            const uint8_t* p = fwd_mmap.data + offs[d];
+            uint32_t chk = d / stride;
+            if (chk >= n_chk) continue;
+            const uint8_t* p = fwd_mmap.data + offs[chk];
+            uint32_t skip = d % stride;
+            auto read_fwd_entry = [&p]() {
+                uint32_t packed = read_vbyte(p);
+                uint32_t tf = packed & FWD_TF_MAX;
+                if (tf == FWD_TF_MAX) tf += read_vbyte(p);
+                return std::pair<uint32_t, uint32_t>{packed >> 3, tf};
+            };
+            for (uint32_t s = 0; s < skip; ++s) {
+                uint32_t cnt_skip = read_vbyte(p);
+                for (uint32_t i = 0; i < cnt_skip; ++i) read_fwd_entry();
+            }
             uint32_t cnt = read_vbyte(p);
             std::vector<std::pair<uint32_t, uint32_t>> v;
             v.reserve(cnt);
-            uint32_t tid = 0;
+            uint32_t rid = 0;
             for (uint32_t i = 0; i < cnt; ++i) {
-                tid += read_vbyte(p);
-                uint32_t tf = read_vbyte(p);
-                v.push_back({tid, tf});
+                auto [gap, tf] = read_fwd_entry();
+                rid += gap;
+                if (rid >= rm3_to_tid.size()) continue;
+                v.push_back({rm3_to_tid[rid], tf});
             }
             out[d] = std::move(v);
         }
@@ -1265,12 +1506,13 @@ public:
         float k1 = 1.2f,
         float b = 0.75f,
         float delta = 1.0f,
+        float w_title = 0.0f,
+        float title_bonus = 0.0f,
         bool use_rm3 = true,
         int fb_docs = 10,
         int fb_terms = 25,
         float alpha = 0.6f,
-        float mu = 1000.0f,
-        float title_bonus = 1.0f)
+        float mu = 1000.0f)
     {
         auto tokens = cpp_tokenize(query, tokcfg);
         if (tokens.empty() || N == 0) return {};
@@ -1281,15 +1523,13 @@ public:
             if (tid >= 0) qw[tid] += 1.0f;
         }
         if (qw.empty()) return {};
-        // Normalise by the mass of in-vocabulary query terms, not token count.
-        float qsum = 0.0f;
-        for (const auto& kv : qw) qsum += kv.second;
-        if (qsum <= 0.0f) return {};
-        for (auto& kv : qw) kv.second /= qsum;
+        for (auto& kv : qw) kv.second /= static_cast<float>(tokens.size());
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
 
-        auto pass1 = raw_retrieve(q_vec, std::max(fb_docs, k), k1, b, delta, title_bonus);
+        // Pass 1 only has to go deep enough to feed the relevance model.
+        int pass1_depth = std::max(fb_docs, k);
+        auto pass1 = raw_retrieve(q_vec, pass1_depth, k1, b, delta, w_title, title_bonus);
         if (pass1.empty()) return {};
 
         std::vector<std::pair<uint32_t, float>> pool;
@@ -1299,6 +1539,8 @@ public:
         } else {
             int num_fb = std::min(static_cast<int>(pass1.size()), fb_docs);
 
+            // If the top results are indistinguishable, feedback has nothing
+            // to learn from; fall back to the first-pass ranking.
             float mean = 0.0f;
             for (int i = 0; i < num_fb; ++i) mean += pass1[i].second;
             mean /= num_fb;
@@ -1321,6 +1563,8 @@ public:
                 for (int i = 0; i < num_fb; ++i) fb_docs_vec.push_back(pass1[i].first);
                 auto batch = get_batch_doc_term_freqs(fb_docs_vec);
 
+                // RM3 relevance model: P(w|R) = sum_D P(w|D) P(D|Q), with
+                // P(w|D) Dirichlet-smoothed against the collection model.
                 std::unordered_map<int32_t, float> p_w_r;
                 for (int i = 0; i < num_fb; ++i) {
                     uint32_t doc_id = pass1[i].first;
@@ -1355,7 +1599,7 @@ public:
                 for (const auto& kv : expansion) final_w[kv.first] += (1.0f - alpha) * (kv.second / esum);
 
                 std::vector<std::pair<int32_t, float>> final_vec(final_w.begin(), final_w.end());
-                pool = raw_retrieve(final_vec, k, k1, b, delta, title_bonus);
+                pool = raw_retrieve(final_vec, k, k1, b, delta, w_title, title_bonus);
             }
         }
 
@@ -1366,15 +1610,21 @@ public:
         return results;
     }
 
+    // -----------------------------------------------------------------------
+    // First-pass scoring only: no relevance feedback. Needed for the report's
+    // ablation table and to sweep k1/b in isolation from RM3.
+    // -----------------------------------------------------------------------
     std::vector<std::pair<std::string, float>> retrieve_bm25(
-        const std::string& query, int k, float k1, float b, float delta, float title_bonus = 0.0f)
+        const std::string& query, int k, float k1, float b, float delta,
+        float w_title, float title_bonus)
     {
-        return retrieve(query, k, k1, b, delta, false, 0, 0, 1.0f, 1000.0f, title_bonus);
+        return retrieve(query, k, k1, b, delta, w_title, title_bonus,
+                        false, 0, 0, 1.0f, 1000.0f);
     }
 };
 
 PYBIND11_MODULE(cpp_engine, m) {
-    m.doc() = "From-scratch inverted index with BM25+ and RM3 expansion";
+    m.doc() = "From-scratch inverted index with BM25F+ scoring and RM3 query expansion";
     py::class_<CPPEngine>(m, "CPPEngine")
         .def(py::init<>())
         .def("build_index", &CPPEngine::build_index, py::arg("corpus"), py::arg("index_dir"))
@@ -1384,11 +1634,11 @@ PYBIND11_MODULE(cpp_engine, m) {
         .def("retrieve", &CPPEngine::retrieve,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
+             py::arg("w_title") = 0.0f, py::arg("title_bonus") = 0.0f,
              py::arg("use_rm3") = true, py::arg("fb_docs") = 10, py::arg("fb_terms") = 25,
-             py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f,
-             py::arg("title_bonus") = 1.0f)
+             py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f)
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
-             py::arg("title_bonus") = 0.0f);
+             py::arg("w_title") = 0.0f, py::arg("title_bonus") = 0.0f);
 }
