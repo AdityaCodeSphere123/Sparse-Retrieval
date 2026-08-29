@@ -75,3 +75,30 @@ def test_cpp_tie_break_is_external_doc_id_not_insertion_order():
         ids = [doc_id for doc_id, _ in ranking]
         assert ids[:2] == ["docA", "docZ"], ids
         assert ranking[0][1] == pytest.approx(ranking[1][1])
+
+
+def test_ragged_doc_ids_roundtrip_front_coded_docmap():
+    """Held-out collections may mix id widths; id_len==0 must load back."""
+    import struct
+    import pytest
+    from submission import retrieve as r
+
+    if not r.HAS_CPP:
+        pytest.skip("cpp_engine not built")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = os.path.join(tmp, "corpus.jsonl")
+        with open(corpus, "w", encoding="utf-8") as f:
+            f.write('{"doc_id": "short", "text": "alpha beta"}\n')
+            f.write('{"doc_id": "a-much-longer-doc-id", "text": "alpha gamma"}\n')
+            f.write('{"doc_id": "midid", "text": "beta gamma"}\n')
+        index_dir = os.path.join(tmp, "index")
+        r.build_index(corpus, index_dir)
+        docmap = open(os.path.join(index_dir, "docmap.bin"), "rb").read()
+        n, id_len = struct.unpack_from("<IH", docmap, 0)
+        assert n == 3
+        assert id_len == 0, "mixed widths must take the front-coded path"
+        r.load_index(index_dir)
+        ranking = r.retrieve("alpha", k=10)
+        got = {doc_id for doc_id, _ in ranking}
+        assert "short" in got and "a-much-longer-doc-id" in got

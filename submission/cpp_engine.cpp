@@ -1,7 +1,7 @@
 // ===========================================================================
 // cpp_engine.cpp — from-scratch inverted index + BM25F+/RM3 retrieval.
 //
-// On-disk layout (v5). Everything is little-endian, written by build_*() and
+// On-disk layout (v6). Everything is little-endian, written by build_*() and
 // read back by load_index(); nothing survives between the two processes
 // except these files.
 //
@@ -9,17 +9,16 @@
 //                 with the length written once; variable ids are front-coded.
 //   doclens.bin   N, avg_doc_len, total_tokens, then N x uint8 quantised
 //                 length ratios (log-quantised, see quantize_doc_len)
-//   dict.bin      terms in sorted order, front-coded, varint fields.
-//                 Collection frequency is stored as (cf - df).
-//   postings.bin  per term: contiguous gap/varint postings (no skip table).
-//                 The gap's low bit flags the common (tf=1, title_tf=0) case
-//                 so that posting skips the tf byte. Otherwise the tf byte
-//                 packs body tf (low 6 bits) and title tf (high 2 bits).
+//   dict.bin      terms in sorted order, front-coded: prefix, suffix, df,
+//                 delta postings offset. Collection frequency is NOT here.
+//   postings.bin  per term, flags byte: bit0=Elias-Fano (else vbyte),
+//                 bit1=title-tf stream present (EF path only). Short lists
+//                 (df<16) stay vbyte+plain-tf. Longer lists: Simple-9 tfs,
+//                 Simple-9 tfs, optional Simple-9 title tfs, then Elias-Fano
+//                 doc ids (l + interleaved unary/low bits).
 //   fwd.bin       pruned forward index (doc -> top RM3-candidate terms).
-//                 Term ids are a dense 0..M-1 space; each entry is
-//                 ((gap << 3) | min(tf, 7)), plus an extra vbyte when tf >= 7.
-//   fwdoff.bin    N, stride, then ceil(N/stride) x uint32 offsets (stride=1)
-//   rm3map.bin    M, then M varint-gapped global term ids (rm3_id -> tid)
+//   fwdoff.bin    N, stride, then ceil(N/stride) x uint32 offsets (stride=8)
+//   rm3map.bin    M, then M x (tid gap, cf-df) varints — cf only for RM3 terms
 //
 // ===========================================================================
 #include <pybind11/pybind11.h>
@@ -60,9 +59,10 @@ namespace py = pybind11;
 // ---------------------------------------------------------------------------
 static constexpr uint32_t FWD_CANDIDATES   = 64;     // pre-df-filter margin
 static constexpr uint32_t SPIMI_BATCH_DOCS = 50000;  // docs buffered per spill
-static constexpr uint32_t FWD_OFF_STRIDE   = 1;      // one offset per doc (O(1) RM3 lookup)
+static constexpr uint32_t FWD_OFF_STRIDE   = 8;      // checkpoint every 8 docs in fwdoff.bin
 static constexpr uint32_t FWD_TF_MAX       = 7;      // 3 bits, packed into tid gap
 static constexpr int      RM3_POOL         = 250;    // first-pass docs re-scored with RM3
+static constexpr uint8_t  INDEX_VERSION    = 6;
 
 // ---------------------------------------------------------------------------
 // Build-time settings that are swept rather than derived. Each is a plain
@@ -175,11 +175,136 @@ static inline float dequantize_doc_len(uint8_t q) {
 // ---------------------------------------------------------------------------
 static constexpr uint32_t TF_MAX       = 63;   // 6 bits
 static constexpr uint32_t TITLE_TF_MAX = 3;    // 2 bits
+static constexpr uint32_t POST_VBYTE_DF = 16;  // below this, vbyte beats EF overhead
 
 static inline uint8_t pack_tf(uint32_t body_tf, uint32_t title_tf) {
     uint32_t b = std::min(body_tf, TF_MAX);
     uint32_t t = std::min(title_tf, TITLE_TF_MAX);
     return static_cast<uint8_t>(b | (t << 6));
+}
+
+// Simple-9 for tf/title streams: locally adaptive, so one tf=63 does not
+// force 6-bit packing of the whole list.
+static const uint8_t S9_N[9] = {28, 14, 9, 7, 5, 4, 3, 2, 1};
+static const uint8_t S9_B[9] = { 1,  2, 3, 4, 5, 7, 9,14,28};
+
+static void simple9_pack(std::vector<uint8_t>& out, const uint32_t* vals, uint32_t n) {
+    uint32_t i = 0;
+    while (i < n) {
+        int sel = 8;
+        for (int s = 0; s < 9; ++s) {
+            const uint32_t k = S9_N[s];
+            const uint32_t b = S9_B[s];
+            const uint32_t maxv = (b >= 32) ? 0xFFFFFFFFu : ((1u << b) - 1u);
+            const uint32_t take = std::min(k, n - i);
+            bool ok = true;
+            for (uint32_t j = 0; j < take; ++j) {
+                if (vals[i + j] > maxv) { ok = false; break; }
+            }
+            if (ok) { sel = s; break; }
+        }
+        const uint32_t k = S9_N[sel];
+        const uint32_t b = S9_B[sel];
+        const uint32_t mask = (b >= 32) ? 0xFFFFFFFFu : ((1u << b) - 1u);
+        uint32_t word = static_cast<uint32_t>(sel) << 28;
+        const uint32_t take = std::min(k, n - i);
+        for (uint32_t j = 0; j < take; ++j)
+            word |= (vals[i + j] & mask) << (j * b);
+        out.push_back(static_cast<uint8_t>(word));
+        out.push_back(static_cast<uint8_t>(word >> 8));
+        out.push_back(static_cast<uint8_t>(word >> 16));
+        out.push_back(static_cast<uint8_t>(word >> 24));
+        i += take;
+    }
+}
+
+static void simple9_unpack(const uint8_t*& ptr, uint32_t* vals, uint32_t n) {
+    uint32_t i = 0;
+    while (i < n) {
+        uint32_t word = static_cast<uint32_t>(ptr[0])
+                      | (static_cast<uint32_t>(ptr[1]) << 8)
+                      | (static_cast<uint32_t>(ptr[2]) << 16)
+                      | (static_cast<uint32_t>(ptr[3]) << 24);
+        ptr += 4;
+        const uint32_t sel = word >> 28;
+        const uint32_t k = S9_N[sel];
+        const uint32_t b = S9_B[sel];
+        const uint32_t mask = (b >= 32) ? 0xFFFFFFFFu : ((1u << b) - 1u);
+        for (uint32_t j = 0; j < k && i < n; ++j, ++i)
+            vals[i] = (word >> (j * b)) & mask;
+    }
+}
+
+static void bit_put(std::vector<uint8_t>& out, uint64_t& acc, int& filled,
+                    uint64_t val, int bits) {
+    if (bits <= 0) return;
+    acc |= val << filled;
+    filled += bits;
+    while (filled >= 8) {
+        out.push_back(static_cast<uint8_t>(acc));
+        acc >>= 8;
+        filled -= 8;
+    }
+}
+
+static void bit_flush(std::vector<uint8_t>& out, uint64_t& acc, int& filled) {
+    if (filled > 0) {
+        out.push_back(static_cast<uint8_t>(acc));
+        acc = 0;
+        filled = 0;
+    }
+}
+
+static uint32_t bit_get(const uint8_t*& p, uint64_t& acc, int& filled, int bits) {
+    if (bits <= 0) return 0;
+    while (filled < bits) {
+        acc |= static_cast<uint64_t>(*p++) << filled;
+        filled += 8;
+    }
+    const uint32_t mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+    uint32_t v = static_cast<uint32_t>(acc) & mask;
+    acc >>= bits;
+    filled -= bits;
+    return v;
+}
+
+// Elias-Fano over strictly increasing doc ids. Interleaved unary high-deltas
+// and l low bits; sequential decode only (TAAT never needs random access).
+static void ef_pack(std::vector<uint8_t>& out, const uint32_t* docs, uint32_t n) {
+    uint32_t U = docs[n - 1] + 1;
+    uint8_t l = 0;
+    if (U >= n) {
+        uint32_t q = U / n;
+        while (l < 31 && (1u << (l + 1)) <= q) ++l;
+    }
+    out.push_back(l);
+    uint64_t acc = 0;
+    int filled = 0;
+    uint32_t prev_h = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t d = docs[i];
+        uint32_t h = (l == 0) ? d : (d >> l);
+        uint32_t low = (l == 0) ? 0 : (d & ((1u << l) - 1u));
+        uint32_t zeros = h - prev_h;
+        while (zeros > 24) { bit_put(out, acc, filled, 0, 24); zeros -= 24; }
+        if (zeros) bit_put(out, acc, filled, 0, static_cast<int>(zeros));
+        bit_put(out, acc, filled, 1, 1);
+        bit_put(out, acc, filled, low, l);
+        prev_h = h;
+    }
+    bit_flush(out, acc, filled);
+}
+
+static void ef_unpack_docs(const uint8_t*& ptr, uint32_t* docs, uint32_t n) {
+    uint8_t l = *ptr++;
+    uint64_t acc = 0;
+    int filled = 0;
+    uint32_t h = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        while (bit_get(ptr, acc, filled, 1) == 0) ++h;
+        uint32_t low = bit_get(ptr, acc, filled, l);
+        docs[i] = (l == 0) ? h : ((h << l) | low);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +825,9 @@ public:
     // (no hashing) and only the touched entries are reset after each query.
     std::vector<float> acc;
     std::vector<uint32_t> touched;
+    std::vector<uint32_t> scratch_gaps;
+    std::vector<uint32_t> scratch_tfs;
+    std::vector<uint32_t> scratch_titles;
 
     CPPEngine() = default;
 
@@ -853,7 +981,7 @@ public:
         // -------- meta.bin: analysis config, needed to tokenise queries -----
         {
             std::ofstream f(index_dir + "/meta.bin", std::ios::binary);
-            uint8_t version = 5;
+            uint8_t version = INDEX_VERSION;
             f.write(reinterpret_cast<const char*>(&version), 1);
             f.write(reinterpret_cast<const char*>(&tokcfg.stemmer), 1);
             f.write(reinterpret_cast<const char*>(&tokcfg.remove_stop), 1);
@@ -949,6 +1077,7 @@ public:
 
         std::vector<DocPosting> merged;
         std::vector<uint8_t> block_data;
+        std::vector<uint64_t> cfs_in_order;
 
         while (true) {
             const std::string* min_term = nullptr;
@@ -983,21 +1112,36 @@ public:
             // order, so `merged` is already sorted by doc_id.
             uint64_t term_postings_start = current_postings_offset;
             block_data.clear();
-            uint32_t prev_doc_id = 0;
+            scratch_gaps.resize(df);
+            scratch_tfs.resize(df);
+            scratch_titles.resize(df);
+            uint8_t has_title = 0;
             for (uint32_t i = 0; i < df; ++i) {
-                uint32_t d_id = merged[i].doc_id;
-                uint8_t tf_byte = pack_tf(merged[i].tf, merged[i].title_tf);
-                // Fold the common posting (tf=1, no title hit) into the
-                // gap's low bit so that posting pays no tf byte.
-                bool plain = (tf_byte == pack_tf(1, 0));
-                write_vbyte(block_data, ((d_id - prev_doc_id) << 1) | (plain ? 1u : 0u));
-                if (!plain) block_data.push_back(tf_byte);
-                prev_doc_id = d_id;
+                scratch_gaps[i] = merged[i].doc_id;
+                scratch_tfs[i] = std::min(merged[i].tf, TF_MAX);
+                scratch_titles[i] = std::min(merged[i].title_tf, TITLE_TF_MAX);
+                if (scratch_titles[i]) has_title = 1;
             }
-            // No skip table: it was written and then ignored at query time,
-            // so it only cost decode branches on the long lists.
+            if (df < POST_VBYTE_DF) {
+                block_data.push_back(0);
+                uint32_t prev_doc_id = 0;
+                for (uint32_t i = 0; i < df; ++i) {
+                    uint32_t gap = scratch_gaps[i] - prev_doc_id;
+                    uint8_t packed = pack_tf(scratch_tfs[i], scratch_titles[i]);
+                    uint32_t plain = (packed == 1) ? 1u : 0u;
+                    write_vbyte(block_data, (gap << 1) | plain);
+                    if (!plain) block_data.push_back(packed);
+                    prev_doc_id = scratch_gaps[i];
+                }
+            } else {
+                block_data.push_back(static_cast<uint8_t>(1u | (has_title << 1)));
+                simple9_pack(block_data, scratch_tfs.data(), df);
+                if (has_title) simple9_pack(block_data, scratch_titles.data(), df);
+                ef_pack(block_data, scratch_gaps.data(), df);
+            }
             f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
             current_postings_offset += block_data.size();
+            cfs_in_order.push_back(merged_cf);
 
             // -------- dict entry, front-coded against the previous term ----
             size_t prefix = 0;
@@ -1009,10 +1153,6 @@ public:
             write_vbyte(dict_buf, static_cast<uint32_t>(term.size() - prefix));
             dict_buf.insert(dict_buf.end(), term.begin() + prefix, term.end());
             write_vbyte(dict_buf, df);
-            // cf >= df always; (cf - df) is 0 for every all-singleton term,
-            // which is most of the vocabulary, so this is usually one vbyte
-            // of zero instead of two or three bytes of cf.
-            write_vbyte64(dict_buf, merged_cf - df);
             write_vbyte64(dict_buf, term_postings_start - prev_postings_offset);
             prev_postings_offset = term_postings_start;
             prev_term = term;
@@ -1040,6 +1180,8 @@ public:
         // We need the dictionary in memory to resolve term ids and apply the
         // df filter, so load what we just wrote and then stream fwdtmp.bin.
         load_dictionary(index_dir);
+        for (size_t i = 0; i < term_metas.size() && i < cfs_in_order.size(); ++i)
+            term_metas[i].cf = cfs_in_order[i];
         write_forward_index(index_dir, fwdtmp_path);
         std::remove(fwdtmp_path.c_str());
     }
@@ -1108,6 +1250,7 @@ public:
             uint32_t prev = 0;
             for (uint32_t tid : rm3_to_tid) {
                 write_vbyte(mapbuf, tid - prev);
+                write_vbyte64(mapbuf, term_metas[tid].cf - term_metas[tid].df);
                 prev = tid;
             }
             f_map.write(reinterpret_cast<const char*>(mapbuf.data()), mapbuf.size());
@@ -1217,7 +1360,6 @@ public:
 
             TermMeta m;
             m.df = read_vbyte(p);
-            m.cf = read_vbyte64(p) + m.df;   // stored as (cf - df)
             m.postings_offset = prev_postings_offset + read_vbyte64(p);
             prev_postings_offset = m.postings_offset;
 
@@ -1244,6 +1386,9 @@ public:
         for (uint32_t i = 0; i < M; ++i) {
             tid += read_vbyte(p);
             rm3_to_tid[i] = tid;
+            uint64_t cf_extra = read_vbyte64(p);
+            if (tid < term_metas.size())
+                term_metas[tid].cf = cf_extra + term_metas[tid].df;
         }
     }
 
@@ -1254,6 +1399,11 @@ public:
             if (f.is_open()) {
                 uint8_t version = 0;
                 f.read(reinterpret_cast<char*>(&version), 1);
+                if (version != INDEX_VERSION) {
+                    throw std::runtime_error(
+                        "index version mismatch (got " + std::to_string(version) +
+                        ", need " + std::to_string(INDEX_VERSION) + "); rebuild");
+                }
                 f.read(reinterpret_cast<char*>(&tokcfg.stemmer), 1);
                 f.read(reinterpret_cast<char*>(&tokcfg.remove_stop), 1);
             }
@@ -1357,24 +1507,45 @@ public:
             if (w <= 0.0f) continue;
 
             const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
-            uint32_t current_doc = 0;
             const float k1p1 = k1 + 1.0f;
-            const uint32_t npost = meta.df;
-
-            for (uint32_t i = 0; i < npost; ++i) {
-                uint32_t coded = read_vbyte(ptr);
-                current_doc += coded >> 1;
-                uint8_t packed = (coded & 1u) ? static_cast<uint8_t>(1) : *ptr++;
-
-                uint8_t ttf = packed >> 6;
-                float tf_eff = static_cast<float>(packed & 0x3F) +
-                               w_title * static_cast<float>(ttf);
-                float tf_norm = (tf_eff * k1p1) /
-                                (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
-                float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
-
-                if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
-                acc[current_doc] += contrib;
+            const uint32_t df = meta.df;
+            uint8_t flags = *ptr++;
+            if ((flags & 1u) == 0) {
+                uint32_t current_doc = 0;
+                for (uint32_t i = 0; i < df; ++i) {
+                    uint32_t coded = read_vbyte(ptr);
+                    current_doc += coded >> 1;
+                    uint8_t packed = (coded & 1u) ? 1 : *ptr++;
+                    uint8_t ttf = packed >> 6;
+                    float tf_eff = static_cast<float>(packed & 0x3F) +
+                                   w_title * static_cast<float>(ttf);
+                    float tf_norm = (tf_eff * k1p1) /
+                                    (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
+                    float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
+                    if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
+                    acc[current_doc] += contrib;
+                }
+            } else {
+                scratch_tfs.resize(df);
+                simple9_unpack(ptr, scratch_tfs.data(), df);
+                uint8_t has_title = (flags >> 1) & 1u;
+                if (has_title) {
+                    scratch_titles.resize(df);
+                    simple9_unpack(ptr, scratch_titles.data(), df);
+                }
+                scratch_gaps.resize(df);
+                ef_unpack_docs(ptr, scratch_gaps.data(), df);
+                for (uint32_t i = 0; i < df; ++i) {
+                    uint32_t current_doc = scratch_gaps[i];
+                    uint8_t ttf = has_title ? static_cast<uint8_t>(scratch_titles[i]) : 0;
+                    float tf_eff = static_cast<float>(scratch_tfs[i]) +
+                                   w_title * static_cast<float>(ttf);
+                    float tf_norm = (tf_eff * k1p1) /
+                                    (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
+                    float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
+                    if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
+                    acc[current_doc] += contrib;
+                }
             }
         }
 
