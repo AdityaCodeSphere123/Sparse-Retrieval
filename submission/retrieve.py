@@ -66,7 +66,7 @@ except ImportError:
 # are swept with scripts/sweep_build.py.
 # ---------------------------------------------------------------------------
 PARAMS = dict(
-    k1=2.0,
+    k1=2.1,
     b=0.6,
     delta=0.8,
     w_title=0.0,
@@ -74,8 +74,8 @@ PARAMS = dict(
     use_rm3=True,
     fb_docs=30,
     fb_terms=40,
-    alpha=0.65,
-    mu=8000.0,
+    alpha=0.62,
+    mu=9000.0,
     rm3_pool=250,
     fb_temp=20.0,
     use_fusion=False,

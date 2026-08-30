@@ -25,7 +25,13 @@ PYBIND11_MODULE(cpp_engine, m) {
              py::arg("rm3_pool") = RM3_POOL, py::arg("fb_temp") = 20.0f,
              py::arg("fusion_depth") = 100, py::arg("rrf_c") = 60.0f,
              py::arg("rrf_w") = 0.4f, py::arg("use_fusion") = false,
-             py::arg("fusion_kind") = 1)
+             py::arg("fusion_kind") = 1,
+             py::arg("prf2_docs") = 30, py::arg("prf2_terms") = 40,
+             py::arg("prf2_w") = 0.25f, py::arg("prf2_support") = 0.0f,
+             py::arg("prf2_rank_c") = 10.0f,
+             py::arg("rm3_fb_docs") = 50, py::arg("rm3_fb_terms") = 15,
+             py::arg("rm3_lambda") = 0.5f, py::arg("rm3_mu") = 1000.0f,
+             py::arg("rm3_support") = 0.15f, py::arg("rm3_idf_w") = 0.5f)
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
