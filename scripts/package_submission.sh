@@ -16,6 +16,11 @@
 #     runs/
 #     scripts/
 #     submission/
+#       setup.py          (pybind11: sources under submission/cpp/)
+#       retrieve.py
+#       cpp/
+#         ir_config.h engine.h
+#         analysis.{h,cpp} codecs.{h,cpp} corpus_io.{h,cpp} bindings.cpp
 #     tests/
 #
 
@@ -65,12 +70,42 @@ if [ -d "${ROOT_DIR}/runs" ]; then
   done
 fi
 
+# Compiled extension + local junk. The grader rebuilds from setup.py + cpp/.
 find "${BUILD_DIR}" -name "*.so" -delete
 find "${BUILD_DIR}" -name "*.dylib" -delete
+find "${BUILD_DIR}" -name "*.o" -delete
 find "${BUILD_DIR}" -name "*.pyc" -delete
 find "${BUILD_DIR}" -name ".DS_Store" -delete
 find "${BUILD_DIR}" -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-rm -rf "${BUILD_DIR}/build" "${BUILD_DIR}/.pytest_cache" "${BUILD_DIR}/submission/build"
+find "${BUILD_DIR}" -name "_extract_*.txt" -delete
+rm -rf "${BUILD_DIR}/build" "${BUILD_DIR}/.pytest_cache"
+rm -rf "${BUILD_DIR}/submission/build" "${BUILD_DIR}/submission/cpp/build"
+# Legacy single-file engine must not ship; setup.py compiles cpp/*.cpp.
+rm -f "${BUILD_DIR}/submission/cpp_engine.cpp"
+
+CPP_DIR="${BUILD_DIR}/submission/cpp"
+REQUIRED_CPP=(
+  ir_config.h
+  engine.h
+  analysis.h analysis.cpp
+  codecs.h codecs.cpp
+  corpus_io.h corpus_io.cpp
+  bindings.cpp
+)
+missing=0
+for f in "${REQUIRED_CPP[@]}"; do
+  if [ ! -f "${CPP_DIR}/${f}" ]; then
+    echo "Error: missing submission/cpp/${f} (needed by submission/setup.py)"
+    missing=1
+  fi
+done
+if [ ! -f "${BUILD_DIR}/submission/setup.py" ]; then
+  echo "Error: missing submission/setup.py"
+  missing=1
+fi
+if [ "${missing}" -ne 0 ]; then
+  exit 1
+fi
 
 # Guard: never ship the assignment PDF or the full corpus.
 rm -f "${BUILD_DIR}/assignment1.pdf"
