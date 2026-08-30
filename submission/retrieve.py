@@ -16,8 +16,8 @@ Scoring is a two-pass sparse pipeline, all of it inside the C++ extension
   1. BM25F+ over an inverted index. "F" because the leading tokens of a
      document are treated as a title field and scored with their own weight;
      "+" because a matched term gets a lower-bounded contribution (Lv & Zhai).
-  2. RM3 pseudo-relevance feedback: build a relevance model from the top
-     first-pass documents, interpolate it with the original query, re-score.
+  2. RM3 pseudo-relevance feedback: Dirichlet-smoothed relevance model from
+     the top first-pass documents, interpolated with the original query.
 
 The pure-Python path below is a correctness fallback for when the extension
 is not built; it is plain BM25 and scores lower.
@@ -66,18 +66,19 @@ except ImportError:
 # are swept with scripts/sweep_build.py.
 # ---------------------------------------------------------------------------
 PARAMS = dict(
-    k1=2.2,
+    k1=2.0,
     b=0.6,
     delta=0.8,
     w_title=0.0,
-    title_bonus=0.7,
+    title_bonus=0.6,
     use_rm3=True,
     fb_docs=30,
-    fb_terms=30,
+    fb_terms=40,
     alpha=0.65,
-    mu=5000.0,
+    mu=8000.0,
     rm3_pool=250,
     fb_temp=20.0,
+    use_fusion=False,
 )
 
 # The ANALYSIS CHAIN (stemmer + stopwords) is not here because it is not a

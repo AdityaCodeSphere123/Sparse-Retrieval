@@ -769,11 +769,16 @@ struct TokenizerCfg {
 };
 
 static thread_local PorterStemmer g_porter;
+static thread_local std::unordered_map<std::string, std::string> g_stem_cache;
 
 static inline std::string apply_stem(const std::string& w, uint8_t stemmer) {
-    if (stemmer == 2) return g_porter.stem(w);
+    if (stemmer == 0) return w;
     if (stemmer == 1) return s_stem(w);
-    return w;
+    auto it = g_stem_cache.find(w);
+    if (it != g_stem_cache.end()) return it->second;
+    std::string s = g_porter.stem(w);
+    g_stem_cache.emplace(w, s);
+    return s;
 }
 
 // Returns (term, original_token_position) pairs.
@@ -1860,7 +1865,12 @@ public:
         float alpha = 0.6f,
         float mu = 1000.0f,
         int rm3_pool = RM3_POOL,
-        float fb_temp = 20.0f)
+        float fb_temp = 20.0f,
+        int fusion_depth = 100,
+        float rrf_c = 60.0f,
+        float rrf_w = 0.4f,
+        bool use_fusion = false,
+        int fusion_kind = 1)
     {
         auto tokens = cpp_tokenize(query, tokcfg);
         if (tokens.empty() || N == 0) return {};
@@ -1889,8 +1899,6 @@ public:
         } else {
             int num_fb = std::min(static_cast<int>(pass1.size()), fb_docs);
 
-            // If the top results are indistinguishable, feedback has nothing
-            // to learn from; fall back to the first-pass ranking.
             float mean = 0.0f;
             for (int i = 0; i < num_fb; ++i) mean += pass1[i].second;
             mean /= num_fb;
@@ -1907,8 +1915,6 @@ public:
                 float norm = 0.0f;
                 for (int i = 0; i < num_fb; ++i) norm += pass1[i].second;
                 if (norm <= 0.0f) norm = 1.0f;
-                // Optional peaked softmax: fb_temp < 20 interpolates toward
-                // ranking-conditioned P(D|Q). 20+ keeps score/sum (submitted).
                 if (fb_temp < 19.5f) {
                     const float sd = std::sqrt(var);
                     const float tau = std::max(sd * std::max(fb_temp, 0.05f), 1e-6f);
@@ -1932,46 +1938,65 @@ public:
                 BatchFwd batch;
                 get_batch_doc_term_freqs(pool_ids, batch);
 
-                // RM3 relevance model: P(w|R) = sum_D P(w|D) P(D|Q), with
-                // P(w|D) Dirichlet-smoothed against the collection model.
                 std::unordered_map<int32_t, float> p_w_r;
+                std::unordered_map<int32_t, float> prf2_raw;
                 for (int i = 0; i < num_fb; ++i) {
                     uint32_t doc_id = pass1[i].first;
                     float p_d_q = fb_wts[i];
                     float d_len = static_cast<float>(doc_lens[doc_id]);
+                    const float denom = d_len + mu;
 
                     const uint32_t s0 = batch.start[i], sn = batch.len[i];
                     for (uint32_t j = 0; j < sn; ++j) {
                         const auto& tf_kv = batch.arena[s0 + j];
                         int32_t tid = static_cast<int32_t>(tf_kv.first);
                         if (tid < 0 || tid >= static_cast<int32_t>(term_metas.size())) continue;
+                        const float tf = static_cast<float>(tf_kv.second);
                         float p_w_c = (total_corpus_tokens > 0)
                             ? (static_cast<float>(term_metas[tid].cf) / total_corpus_tokens)
                             : 1e-4f;
-                        float p_w_d = (tf_kv.second + mu * p_w_c) / (d_len + mu);
-                        p_w_r[tid] += p_w_d * p_d_q;
+                        // Present-term Dirichlet (standard RM3). The absent-term
+                        // μ P(w|C) mass promotes high-cf noise when we then keep
+                        // only fb_terms; PRF2 fusion is the complementary arm.
+                        p_w_r[tid] += p_d_q * (tf + mu * p_w_c) / denom;
+                        prf2_raw[tid] += std::log(1.0f + (static_cast<float>(N) - term_metas[tid].df + 0.5f)
+                                                  / (term_metas[tid].df + 0.5f));
                     }
                 }
 
-                std::vector<std::pair<int32_t, float>> expansion(p_w_r.begin(), p_w_r.end());
-                size_t keep = std::min(static_cast<size_t>(std::max(fb_terms, 0)), expansion.size());
-                std::partial_sort(expansion.begin(), expansion.begin() + keep, expansion.end(),
-                                  [](const auto& a, const auto& b) { return a.second > b.second; });
-                expansion.resize(keep);
+                auto top_expand = [&](std::unordered_map<int32_t, float>& raw)
+                    -> std::unordered_map<uint32_t, float> {
+                    std::vector<std::pair<int32_t, float>> expansion(raw.begin(), raw.end());
+                    size_t keep = std::min(static_cast<size_t>(std::max(fb_terms, 0)), expansion.size());
+                    if (keep == 0) return {};
+                    std::partial_sort(expansion.begin(), expansion.begin() + keep, expansion.end(),
+                                      [](const auto& a, const auto& b) { return a.second > b.second; });
+                    expansion.resize(keep);
+                    float esum = 0.0f;
+                    for (const auto& e : expansion) esum += e.second;
+                    if (esum <= 0.0f) esum = 1.0f;
+                    std::unordered_map<uint32_t, float> exp_w;
+                    exp_w.reserve(expansion.size() * 2);
+                    for (const auto& e : expansion) {
+                        int32_t tid = e.first;
+                        if (tid < 0 || tid >= static_cast<int32_t>(term_metas.size())) continue;
+                        float idf = std::log(1.0f + (static_cast<float>(N) - term_metas[tid].df + 0.5f)
+                                             / (term_metas[tid].df + 0.5f));
+                        exp_w[static_cast<uint32_t>(tid)] = (1.0f - alpha) * (e.second / esum) * idf;
+                    }
+                    return exp_w;
+                };
 
-                float esum = 0.0f;
-                for (const auto& kv : expansion) esum += kv.second;
-                if (esum <= 0.0f) esum = 1.0f;
+                auto exp_rm3 = top_expand(p_w_r);
+                auto exp_prf2 = use_fusion ? top_expand(prf2_raw) : std::unordered_map<uint32_t, float>{};
 
-                std::unordered_map<uint32_t, float> exp_w;
-                exp_w.reserve(expansion.size() * 2);
-                for (const auto& kv : expansion) {
-                    int32_t tid = kv.first;
-                    if (tid < 0 || tid >= static_cast<int32_t>(term_metas.size())) continue;
-                    float idf = std::log(1.0f + (static_cast<float>(N) - term_metas[tid].df + 0.5f)
-                                                / (term_metas[tid].df + 0.5f));
-                    exp_w[static_cast<uint32_t>(tid)] = (1.0f - alpha) * (kv.second / esum) * idf;
-                }
+                auto merge_exp = [&]() {
+                    auto out = exp_rm3;
+                    for (const auto& kv : exp_prf2) {
+                        out[kv.first] += kv.second;
+                    }
+                    return out;
+                };
 
                 float length_penalty_lut[256];
                 for (int q = 0; q < 256; ++q) {
@@ -1979,32 +2004,121 @@ public:
                     length_penalty_lut[q] = k1 * (1.0f - b + b * ratio);
                 }
                 const float k1p1 = k1 + 1.0f;
+                const size_t n = pass1.size();
 
-                pool.clear();
-                pool.reserve(pass1.size());
-                for (size_t pi = 0; pi < pass1.size(); ++pi) {
-                    uint32_t d = pass1[pi].first;
-                    float s = alpha * pass1[pi].second;
-                    const uint32_t s0 = batch.start[pi], sn = batch.len[pi];
-                    if (sn) {
-                        float lp = length_penalty_lut[quantized_doc_lens[d]];
-                        for (uint32_t j = 0; j < sn; ++j) {
-                            const auto& tf_kv = batch.arena[s0 + j];
-                            auto e = exp_w.find(tf_kv.first);
-                            if (e == exp_w.end()) continue;
-                            float tf_eff = static_cast<float>(tf_kv.second);
-                            float tf_norm = (tf_eff * k1p1) / (tf_eff + lp);
-                            s += e->second * (tf_norm + delta);
+                auto score_arm = [&](const std::unordered_map<uint32_t, float>& exp_w,
+                                     std::vector<float>& out) {
+                    out.assign(n, 0.0f);
+                    for (size_t pi = 0; pi < n; ++pi) {
+                        uint32_t d = pass1[pi].first;
+                        float s = alpha * pass1[pi].second;
+                        const uint32_t s0 = batch.start[pi], sn = batch.len[pi];
+                        if (sn && !exp_w.empty()) {
+                            float lp = length_penalty_lut[quantized_doc_lens[d]];
+                            for (uint32_t j = 0; j < sn; ++j) {
+                                const auto& tf_kv = batch.arena[s0 + j];
+                                auto e = exp_w.find(tf_kv.first);
+                                if (e == exp_w.end()) continue;
+                                float tf_eff = static_cast<float>(tf_kv.second);
+                                float tf_norm = (tf_eff * k1p1) / (tf_eff + lp);
+                                s += e->second * (tf_norm + delta);
+                            }
                         }
+                        out[pi] = s;
                     }
-                    pool.push_back({d, s});
+                };
+
+                std::vector<float> s_rm3, s_prf2;
+                score_arm(exp_rm3, s_rm3);
+
+                auto better = [&](size_t a, size_t b, const std::vector<float>& sc) {
+                    if (sc[a] != sc[b]) return sc[a] > sc[b];
+                    return doc_ids[pass1[a].first] < doc_ids[pass1[b].first];
+                };
+
+                auto fill_rank = [&](const std::vector<float>& sc, int depth,
+                                     std::vector<int>& rank) {
+                    std::vector<size_t> ord(n);
+                    for (size_t i = 0; i < n; ++i) ord[i] = i;
+                    std::sort(ord.begin(), ord.end(),
+                              [&](size_t a, size_t b) { return better(a, b, sc); });
+                    rank.assign(n, depth + 1);
+                    const int lim = std::min(depth, static_cast<int>(n));
+                    for (int r = 0; r < lim; ++r)
+                        rank[ord[static_cast<size_t>(r)]] = r + 1;
+                };
+
+                if (!use_fusion || fusion_kind == 0) {
+                    std::vector<size_t> ord(n);
+                    for (size_t i = 0; i < n; ++i) ord[i] = i;
+                    std::sort(ord.begin(), ord.end(),
+                              [&](size_t a, size_t b) { return better(a, b, s_rm3); });
+                    pool.clear();
+                    const size_t want_n = std::min(n, static_cast<size_t>(std::max(k, 0)));
+                    pool.reserve(want_n);
+                    for (size_t i = 0; i < want_n; ++i)
+                        pool.push_back({pass1[ord[i]].first, s_rm3[ord[i]]});
+                } else if (fusion_kind == 2) {
+                    std::vector<float> s_union;
+                    score_arm(merge_exp(), s_union);
+                    std::vector<size_t> ord(n);
+                    for (size_t i = 0; i < n; ++i) ord[i] = i;
+                    std::sort(ord.begin(), ord.end(),
+                              [&](size_t a, size_t b) { return better(a, b, s_union); });
+                    pool.clear();
+                    const size_t want_n = std::min(n, static_cast<size_t>(std::max(k, 0)));
+                    pool.reserve(want_n);
+                    for (size_t i = 0; i < want_n; ++i)
+                        pool.push_back({pass1[ord[i]].first, s_union[ord[i]]});
+                } else if (fusion_kind == 3) {
+                    score_arm(exp_prf2, s_prf2);
+                    float mn1 = s_rm3[0], mx1 = s_rm3[0], mn2 = s_prf2[0], mx2 = s_prf2[0];
+                    for (size_t i = 1; i < n; ++i) {
+                        mn1 = std::min(mn1, s_rm3[i]); mx1 = std::max(mx1, s_rm3[i]);
+                        mn2 = std::min(mn2, s_prf2[i]); mx2 = std::max(mx2, s_prf2[i]);
+                    }
+                    const float r1 = std::max(mx1 - mn1, 1e-6f);
+                    const float r2 = std::max(mx2 - mn2, 1e-6f);
+                    pool.clear();
+                    pool.reserve(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        float a = (s_rm3[i] - mn1) / r1;
+                        float b = (s_prf2[i] - mn2) / r2;
+                        pool.push_back({pass1[i].first, rrf_w * a + (1.0f - rrf_w) * b});
+                    }
+                    std::sort(pool.begin(), pool.end(),
+                              [this](const auto& a, const auto& b) {
+                                  if (a.second != b.second) return a.second > b.second;
+                                  return doc_ids[a.first] < doc_ids[b.first];
+                              });
+                    if (static_cast<int>(pool.size()) > k)
+                        pool.resize(static_cast<size_t>(std::max(k, 0)));
+                } else {
+                    score_arm(exp_prf2, s_prf2);
+                    const int depth = std::max(fusion_depth, k);
+                    std::vector<int> rank_rm3, rank_prf2;
+                    fill_rank(s_rm3, depth, rank_rm3);
+                    fill_rank(s_prf2, depth, rank_prf2);
+                    pool.clear();
+                    pool.reserve(n);
+                    const float w2 = 1.0f - rrf_w;
+                    const float c = std::max(rrf_c, 1.0f);
+                    for (size_t i = 0; i < n; ++i) {
+                        float s = 0.0f;
+                        if (rank_rm3[i] <= depth)
+                            s += rrf_w / (c + static_cast<float>(rank_rm3[i]));
+                        if (rank_prf2[i] <= depth)
+                            s += w2 / (c + static_cast<float>(rank_prf2[i]));
+                        if (s > 0.0f) pool.push_back({pass1[i].first, s});
+                    }
+                    std::sort(pool.begin(), pool.end(),
+                              [this](const auto& a, const auto& b) {
+                                  if (a.second != b.second) return a.second > b.second;
+                                  return doc_ids[a.first] < doc_ids[b.first];
+                              });
+                    if (static_cast<int>(pool.size()) > k)
+                        pool.resize(static_cast<size_t>(std::max(k, 0)));
                 }
-                std::sort(pool.begin(), pool.end(),
-                          [this](const auto& a, const auto& b) {
-                              if (a.second != b.second) return a.second > b.second;
-                              return doc_ids[a.first] < doc_ids[b.first];
-                          });
-                if (static_cast<int>(pool.size()) > k) pool.resize(static_cast<size_t>(std::max(k, 0)));
             }
         }
 
@@ -2044,7 +2158,10 @@ PYBIND11_MODULE(cpp_engine, m) {
              py::arg("w_title") = 0.0f, py::arg("title_bonus") = 0.0f,
              py::arg("use_rm3") = true, py::arg("fb_docs") = 10, py::arg("fb_terms") = 25,
              py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f,
-             py::arg("rm3_pool") = RM3_POOL, py::arg("fb_temp") = 20.0f)
+             py::arg("rm3_pool") = RM3_POOL, py::arg("fb_temp") = 20.0f,
+             py::arg("fusion_depth") = 100, py::arg("rrf_c") = 60.0f,
+             py::arg("rrf_w") = 0.4f, py::arg("use_fusion") = false,
+             py::arg("fusion_kind") = 1)
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
