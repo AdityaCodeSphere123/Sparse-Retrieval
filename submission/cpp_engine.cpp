@@ -1,7 +1,7 @@
 // ===========================================================================
 // cpp_engine.cpp — from-scratch inverted index + BM25F+/RM3 retrieval.
 //
-// On-disk layout (v7). Everything is little-endian, written by build_*() and
+// On-disk layout (v8). Everything is little-endian, written by build_*() and
 // read back by load_index(); nothing survives between the two processes
 // except these files.
 //
@@ -17,7 +17,8 @@
 //                 vbyte gaps with 2-bit title_tf), then Elias-Fano doc ids.
 //                 Eight zero bytes are appended after the last list so
 //                 bit_get cannot read past the mmap on the final EF decode.
-//   fwd.bin       pruned forward index (doc -> top RM3-candidate terms).
+//   fwd.bin       per doc: count | ef_len | Simple-9 tfs | Elias-Fano rids.
+//                 Same 8-byte trailing pad as postings.bin.
 //   fwdoff.bin    N, stride, then ceil(N/stride) x uint32 offsets (stride=8)
 //   rm3map.bin    M, then M x (tid gap, cf-df) varints — cf only for RM3 terms
 //
@@ -40,6 +41,8 @@
 #include <cstdlib>
 #include <sstream>
 #include <cctype>
+#include <random>
+#include <stdexcept>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -61,9 +64,8 @@ namespace py = pybind11;
 static constexpr uint32_t FWD_CANDIDATES   = 64;     // pre-df-filter margin
 static constexpr uint32_t SPIMI_BATCH_DOCS = 50000;  // docs buffered per spill
 static constexpr uint32_t FWD_OFF_STRIDE   = 8;      // checkpoint every 8 docs in fwdoff.bin
-static constexpr uint32_t FWD_TF_MAX       = 7;      // 3 bits, packed into tid gap
 static constexpr int      RM3_POOL         = 250;    // first-pass docs re-scored with RM3
-static constexpr uint8_t  INDEX_VERSION    = 7;
+static constexpr uint8_t  INDEX_VERSION    = 8;
 
 // ---------------------------------------------------------------------------
 // Build-time settings that are swept rather than derived. Each is a plain
@@ -74,6 +76,7 @@ static constexpr uint8_t  INDEX_VERSION    = 7;
 //   IR_TITLE_WINDOW  leading raw tokens treated as the title field
 //   IR_FWD_TERMS     forward-index width (terms/doc) available to RM3
 //   IR_RM3_DF_FRAC   df ceiling, as a fraction of N, for RM3 candidate terms
+//   IR_MIN_DF        terms rarer than this are dropped from dict+postings
 // ---------------------------------------------------------------------------
 struct BuildCfg {
     // title_window = 12 raw tokens: the median title length in this collection,
@@ -91,6 +94,9 @@ struct BuildCfg {
     // relevance model is supposed to find. Anything above ~20% starts pulling
     // in collection-wide noise, so the useful band is broad and this sits in it.
     float    rm3_df_frac    = 0.13f;
+    // Default 1: keep hapaxes. Sweep 2–4 on dev; they shrink dict+postings
+    // but any topic that uses a df=1 stem will lose a first-pass term.
+    uint32_t min_df         = 1;
 };
 
 static BuildCfg read_build_cfg() {
@@ -98,6 +104,7 @@ static BuildCfg read_build_cfg() {
     if (const char* e = std::getenv("IR_TITLE_WINDOW")) c.title_window = std::atoi(e);
     if (const char* e = std::getenv("IR_FWD_TERMS"))    c.fwd_terms    = std::atoi(e);
     if (const char* e = std::getenv("IR_RM3_DF_FRAC"))  c.rm3_df_frac  = std::atof(e);
+    if (const char* e = std::getenv("IR_MIN_DF"))       c.min_df       = std::atoi(e);
     return c;
 }
 
@@ -308,6 +315,137 @@ static void ef_unpack_docs(const uint8_t*& ptr, uint32_t* docs, uint32_t n) {
         while (bit_get(ptr, acc, filled, 1) == 0) ++h;
         uint32_t low = bit_get(ptr, acc, filled, l);
         docs[i] = (l == 0) ? h : ((h << l) | low);
+    }
+}
+
+// Streaming decoders for the scoring loop. Cross a unary zero-run with
+// ctz instead of a branch per bit; hand back one value at a time so the
+// loop never materialises scratch_gaps / scratch_tfs. simple9_unpack is
+// the reference S9Reader / s9_skip are checked against (check_codecs).
+// ef_unpack_docs is that reference for EFReader and also how RM3 reads
+// the forward-index rid stream.
+struct EFReader {
+    const uint8_t* p = nullptr;
+    uint64_t buf = 0;
+    int      nbits = 0;
+    uint32_t h = 0;
+    uint8_t  l = 0;
+
+    inline void init(const uint8_t* q) { p = q; l = *p++; buf = 0; nbits = 0; h = 0; }
+    inline void fill() { while (nbits <= 56) { buf |= static_cast<uint64_t>(*p++) << nbits; nbits += 8; } }
+
+    inline uint32_t next() {
+        for (;;) {
+            if (nbits < 8) fill();
+            // Only bits [0, nbits) are valid. ctzll on the raw buf can see a
+            // stale 1 above nbits and skip a unary zero-run (wrong doc ids).
+            const uint64_t live = (nbits >= 64) ? buf
+                                 : (buf & ((nbits > 0) ? ((1ull << nbits) - 1ull) : 0ull));
+            if (live == 0) {
+                h += static_cast<uint32_t>(nbits);
+                buf = 0;
+                nbits = 0;
+                fill();
+                continue;
+            }
+            const int t = __builtin_ctzll(live);
+            h += static_cast<uint32_t>(t);
+            buf >>= (t + 1);
+            nbits -= (t + 1);
+            if (nbits > 0 && nbits < 64) buf &= (1ull << nbits) - 1ull;
+            else if (nbits <= 0) { buf = 0; nbits = 0; }
+            break;
+        }
+        if (l == 0) return h;
+        if (nbits < l) fill();
+        const uint32_t low = static_cast<uint32_t>(buf & ((1ull << l) - 1ull));
+        buf >>= l;
+        nbits -= l;
+        if (nbits > 0 && nbits < 64) buf &= (1ull << nbits) - 1ull;
+        else if (nbits <= 0) { buf = 0; nbits = 0; }
+        return (h << l) | low;
+    }
+};
+
+struct S9Reader {
+    const uint8_t* p = nullptr;
+    uint32_t word = 0, mask = 0, b = 0, shift = 0, left = 0;
+    inline void init(const uint8_t* q) { p = q; left = 0; }
+    inline uint32_t next() {
+        if (!left) {
+            word = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                 | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+            p += 4;
+            const uint32_t sel = word >> 28;
+            left = S9_N[sel]; b = S9_B[sel];
+            mask = (b >= 32) ? 0xFFFFFFFFu : ((1u << b) - 1u);
+            shift = 0;
+        }
+        const uint32_t v = (word >> shift) & mask;
+        shift += b; --left;
+        return v;
+    }
+};
+
+static inline const uint8_t* s9_skip(const uint8_t* p, uint32_t n) {
+    uint32_t i = 0;
+    while (i < n) { i += S9_N[static_cast<uint32_t>(p[3]) >> 4]; p += 4; }
+    return p;
+}
+
+static void check_one_list(const uint32_t* tfs, const uint32_t* docs, uint32_t n, int trial) {
+    std::vector<uint8_t> s9, ef;
+    simple9_pack(s9, tfs, n);
+    ef_pack(ef, docs, n);
+    s9.insert(s9.end(), 8, 0);
+    ef.insert(ef.end(), 8, 0);
+
+    std::vector<uint32_t> ref_tf(n), ref_doc(n);
+    const uint8_t* p = s9.data();
+    simple9_unpack(p, ref_tf.data(), n);
+    const uint8_t* q = ef.data();
+    ef_unpack_docs(q, ref_doc.data(), n);
+
+    S9Reader sr; sr.init(s9.data());
+    EFReader er; er.init(ef.data());
+    for (uint32_t i = 0; i < n; ++i) {
+        if (sr.next() != ref_tf[i] || ref_tf[i] != tfs[i] ||
+            er.next() != ref_doc[i] || ref_doc[i] != docs[i]) {
+            throw std::runtime_error("codec mismatch trial=" + std::to_string(trial) +
+                                    " i=" + std::to_string(i));
+        }
+    }
+    if (s9_skip(s9.data(), n) != p) {
+        throw std::runtime_error("s9_skip cursor drift trial=" + std::to_string(trial));
+    }
+}
+
+static void check_codecs() {
+    std::mt19937 rng(1);
+    auto run = [&](const std::vector<uint32_t>& tfs,
+                   const std::vector<uint32_t>& docs, int trial) {
+        check_one_list(tfs.data(), docs.data(), static_cast<uint32_t>(tfs.size()), trial);
+    };
+    for (uint32_t n : {1u, 2u, 7u, 8u, 28u, 29u, 64u, 1000u, 4096u}) {
+        std::vector<uint32_t> tfs(n), docs(n);
+        for (uint32_t i = 0; i < n; ++i) { tfs[i] = rng() % 64; docs[i] = i; }
+        run(tfs, docs, -static_cast<int>(n));
+    }
+    const uint32_t sel_hi[9] = {1, 3, 7, 15, 31, 127, 511, 16383, (1u << 28) - 1u};
+    for (int s = 0; s < 9; ++s) {
+        uint32_t n = S9_N[s] + (s & 1u);
+        std::vector<uint32_t> tfs(n, sel_hi[s]), docs(n);
+        for (uint32_t i = 0; i < n; ++i) docs[i] = i * 3u + 1u;
+        run(tfs, docs, -100 - s);
+    }
+    { std::vector<uint32_t> tfs{0, 0}, docs{0u, 1u << 20}; run(tfs, docs, -200); }
+    for (int trial = 0; trial < 2000; ++trial) {
+        uint32_t n = 1 + rng() % 5000;
+        std::vector<uint32_t> tfs(n), docs(n);
+        for (auto& t : tfs) t = rng() % 64;
+        uint32_t d = 0;
+        for (auto& x : docs) { d += 1 + rng() % 200; x = d; }
+        run(tfs, docs, trial);
     }
 }
 
@@ -833,6 +971,15 @@ public:
     std::vector<uint32_t> scratch_gaps;
     std::vector<uint32_t> scratch_tfs;
     std::vector<uint32_t> scratch_titles;
+    std::vector<uint32_t> fwd_order;
+    std::vector<float> fb_wts;
+    std::vector<uint32_t> rid_scratch;
+
+    struct BatchFwd {
+        std::vector<std::pair<uint32_t, uint32_t>> arena;
+        std::vector<uint32_t> start;
+        std::vector<uint32_t> len;
+    };
 
     CPPEngine() = default;
 
@@ -1115,6 +1262,8 @@ public:
 
             // Runs are produced in increasing doc_id order and merged in run
             // order, so `merged` is already sorted by doc_id.
+            if (df < buildcfg.min_df) continue;
+
             uint64_t term_postings_start = current_postings_offset;
             block_data.clear();
             scratch_gaps.resize(df);
@@ -1246,8 +1395,10 @@ public:
             df_min, static_cast<uint32_t>(buildcfg.rm3_df_frac * static_cast<float>(N)));
 
         // Dense RM3 id space: only terms that can appear in fwd.bin get an
-        // id. Gaps then average M/fwd_terms instead of vocab/fwd_terms, so
-        // most entries fit in one or two vbytes once tf is packed in too.
+        // id. Assigned in dictionary (tid) order so rm3map.bin can delta-code
+        // tids with an unsigned gap. Ascending-df order compresses Elias-Fano
+        // rids slightly more but needs a zigzag map; unsigned deltas are the
+        // format the rest of the engine already uses.
         std::vector<int32_t> tid_to_rm3(term_metas.size(), -1);
         rm3_to_tid.clear();
         for (uint32_t tid = 0; tid < term_metas.size(); ++tid) {
@@ -1281,6 +1432,8 @@ public:
         std::vector<uint8_t> out;
         std::vector<std::pair<uint32_t, uint32_t>> kept;   // (rm3_id, tf)
         std::vector<std::tuple<float, uint32_t, uint32_t>> pool;  // (tf*idf, rid, tf)
+        std::vector<uint32_t> ef_scratch;
+        std::vector<uint8_t> ef_block;
         std::string term;
 
         for (uint32_t d = 0; d < N; ++d) {
@@ -1327,22 +1480,33 @@ public:
             for (const auto& t : pool) kept.push_back({std::get<1>(t), std::get<2>(t)});
             std::sort(kept.begin(), kept.end());
 
+            // count | ef_len | Simple-9 tfs | Elias-Fano rids.
+            // Splitting streams avoids stuffing 3 tf bits into a ~16K mean
+            // rid gap (which pushed almost every varint over a byte boundary).
+            // Simple-9 keeps the real tf for P(w|D); nibbles capped at 15
+            // cost ~0.03 nDCG on this collection.
             out.clear();
-            write_vbyte(out, static_cast<uint32_t>(kept.size()));
-            uint32_t prev_rid = 0;
-            for (const auto& kv : kept) {
-                // 3-bit tf with escape: values 0–6 are stored in the gap
-                // word; 7 means "read another vbyte and add 7", so P(w|D)
-                // keeps the real tf instead of saturating at 7.
-                uint32_t tf = kv.second;
-                uint32_t tf_lo = std::min<uint32_t>(tf, FWD_TF_MAX);
-                write_vbyte(out, ((kv.first - prev_rid) << 3) | tf_lo);
-                if (tf >= FWD_TF_MAX) write_vbyte(out, tf - FWD_TF_MAX);
-                prev_rid = kv.first;
+            const uint32_t nk = static_cast<uint32_t>(kept.size());
+            write_vbyte(out, nk);
+            ef_scratch.clear();
+            std::vector<uint32_t> tfs_u32;
+            tfs_u32.reserve(nk);
+            for (uint32_t i = 0; i < nk; ++i) {
+                ef_scratch.push_back(kept[i].first);
+                tfs_u32.push_back(kept[i].second);
             }
+            std::vector<uint8_t> tf_block;
+            if (nk) simple9_pack(tf_block, tfs_u32.data(), nk);
+            ef_block.clear();
+            if (nk) ef_pack(ef_block, ef_scratch.data(), nk);
+            write_vbyte(out, static_cast<uint32_t>(ef_block.size()));
+            out.insert(out.end(), tf_block.begin(), tf_block.end());
+            out.insert(out.end(), ef_block.begin(), ef_block.end());
             f_fwd.write(reinterpret_cast<const char*>(out.data()), out.size());
             offset += static_cast<uint32_t>(out.size());
         }
+        const uint8_t fwd_pad[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        f_fwd.write(reinterpret_cast<const char*>(fwd_pad), 8);
     }
 
     // =======================================================================
@@ -1544,30 +1708,31 @@ public:
                     acc[current_doc] += contrib;
                 }
             } else {
-                scratch_tfs.resize(df);
-                simple9_unpack(ptr, scratch_tfs.data(), df);
+                const uint8_t* p_ef = s9_skip(ptr, df);
                 uint32_t n_title_hits = 0;
                 if (meta.has_title) {
-                    n_title_hits = read_vbyte(ptr);
+                    n_title_hits = read_vbyte(p_ef);
                     scratch_titles.resize(n_title_hits);
                     uint32_t prev = 0;
                     for (uint32_t h = 0; h < n_title_hits; ++h) {
-                        uint32_t coded = read_vbyte(ptr);
+                        uint32_t coded = read_vbyte(p_ef);
                         prev += coded >> 2;
                         scratch_titles[h] = (prev << 2) | (coded & 3u);
                     }
                 }
-                scratch_gaps.resize(df);
-                ef_unpack_docs(ptr, scratch_gaps.data(), df);
+
+                S9Reader s9; s9.init(ptr);
+                EFReader ef; ef.init(p_ef);
                 uint32_t hi = 0;
                 for (uint32_t i = 0; i < df; ++i) {
-                    uint32_t current_doc = scratch_gaps[i];
+                    const uint32_t tf_raw      = s9.next();
+                    const uint32_t current_doc = ef.next();
                     uint8_t ttf = 0;
                     if (hi < n_title_hits && (scratch_titles[hi] >> 2) == i) {
                         ttf = static_cast<uint8_t>(scratch_titles[hi] & 3u);
                         ++hi;
                     }
-                    float tf_eff = static_cast<float>(scratch_tfs[i] + 1u) +
+                    float tf_eff = static_cast<float>(tf_raw + 1u) +
                                    w_title * static_cast<float>(ttf);
                     float tf_norm = (tf_eff * k1p1) /
                                     (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
@@ -1579,13 +1744,15 @@ public:
         }
 
         size_t want = std::min(static_cast<size_t>(std::max(top_k, 0)), touched.size());
-        // Integer compare only — string doc_id ties are resolved on the
-        // tiny top-k, not on every comparison against the full candidate pool.
-        std::partial_sort(touched.begin(), touched.begin() + want, touched.end(),
-                          [this](uint32_t a, uint32_t x) {
-                              if (acc[a] != acc[x]) return acc[a] > acc[x];
-                              return a < x;
-                          });
+        // nth_element rather than partial_sort: we only need the top `want`
+        // as a set (exact order is imposed by the std::sort below).
+        if (want < touched.size()) {
+            std::nth_element(touched.begin(), touched.begin() + want, touched.end(),
+                             [this](uint32_t a, uint32_t x) {
+                                 if (acc[a] != acc[x]) return acc[a] > acc[x];
+                                 return a < x;
+                             });
+        }
         std::sort(touched.begin(), touched.begin() + want,
                   [this](uint32_t a, uint32_t x) {
                       if (acc[a] != acc[x]) return acc[a] > acc[x];
@@ -1605,10 +1772,13 @@ public:
     // Term frequencies for the RM3 feedback documents, straight out of the
     // forward index. O(feedback docs) instead of O(vocabulary).
     // -----------------------------------------------------------------------
-    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>
-    get_batch_doc_term_freqs(const std::vector<uint32_t>& target_docs) {
-        std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> out;
-        if (!fwd_mmap.data || !fwdoff_mmap.data || fwdoff_mmap.length < 8) return out;
+    void get_batch_doc_term_freqs(const std::vector<uint32_t>& target_docs, BatchFwd& out) {
+        const size_t n = target_docs.size();
+        out.start.assign(n, 0);
+        out.len.assign(n, 0);
+        out.arena.clear();
+        if (!fwd_mmap.data || !fwdoff_mmap.data || fwdoff_mmap.length < 8) return;
+        out.arena.reserve(n * 24);
 
         const uint32_t* offs = reinterpret_cast<const uint32_t*>(
             fwdoff_mmap.data + 2 * sizeof(uint32_t));
@@ -1616,38 +1786,61 @@ public:
             (fwdoff_mmap.length - 2 * sizeof(uint32_t)) / sizeof(uint32_t));
         const uint32_t stride = fwd_off_stride ? fwd_off_stride : 1;
 
-        auto read_fwd_entry = [](const uint8_t*& p) {
-            uint32_t packed = read_vbyte(p);
-            uint32_t tf = packed & FWD_TF_MAX;
-            if (tf == FWD_TF_MAX) tf += read_vbyte(p);
-            return std::pair<uint32_t, uint32_t>{packed >> 3, tf};
+        auto skip_record = [](const uint8_t*& p) {
+            uint32_t cnt    = read_vbyte(p);
+            uint32_t ef_len = read_vbyte(p);
+            if (cnt) p = s9_skip(p, cnt);
+            p += ef_len;
         };
 
-        for (uint32_t d : target_docs) {
+        fwd_order.resize(n);
+        for (size_t i = 0; i < n; ++i) fwd_order[i] = static_cast<uint32_t>(i);
+        std::sort(fwd_order.begin(), fwd_order.end(),
+                  [&target_docs](uint32_t a, uint32_t b) {
+                      return target_docs[a] < target_docs[b];
+                  });
+
+        uint32_t cur_chk = UINT32_MAX;
+        uint32_t cur_sub = 0;
+        const uint8_t* p = nullptr;
+
+        for (uint32_t pos : fwd_order) {
+            const uint32_t d = target_docs[pos];
             if (d >= N) continue;
-            uint32_t chk = d / stride;
+            const uint32_t chk = d / stride, sub = d % stride;
             if (chk >= n_chk) continue;
-            const uint8_t* p = fwd_mmap.data + offs[chk];
-            if (stride > 1) {
-                uint32_t skip = d % stride;
-                for (uint32_t s = 0; s < skip; ++s) {
-                    uint32_t cnt_skip = read_vbyte(p);
-                    for (uint32_t i = 0; i < cnt_skip; ++i) read_fwd_entry(p);
-                }
+            if (chk != cur_chk || sub < cur_sub) {
+                p = fwd_mmap.data + offs[chk];
+                cur_chk = chk;
+                cur_sub = 0;
             }
-            uint32_t cnt = read_vbyte(p);
-            std::vector<std::pair<uint32_t, uint32_t>> v;
-            v.reserve(cnt);
-            uint32_t rid = 0;
+            while (cur_sub < sub) { skip_record(p); ++cur_sub; }
+
+            const uint32_t cnt    = read_vbyte(p);
+            const uint32_t ef_len = read_vbyte(p);
+            const uint8_t* tfp    = p;
+            if (cnt) p = s9_skip(p, cnt);
+            const uint8_t* efp    = p;
+            p += ef_len;
+            ++cur_sub;
+
+            if (!cnt) continue;
+            rid_scratch.resize(cnt);
+            const uint8_t* efc = efp;
+            ef_unpack_docs(efc, rid_scratch.data(), cnt);
+            S9Reader s9; s9.init(tfp);
+
+            out.start[pos] = static_cast<uint32_t>(out.arena.size());
+            uint32_t kept = 0;
             for (uint32_t i = 0; i < cnt; ++i) {
-                auto [gap, tf] = read_fwd_entry(p);
-                rid += gap;
+                const uint32_t rid = rid_scratch[i];
+                const uint32_t tf  = s9.next();
                 if (rid >= rm3_to_tid.size()) continue;
-                v.push_back({rm3_to_tid[rid], tf});
+                out.arena.push_back({rm3_to_tid[rid], tf});
+                ++kept;
             }
-            out[d] = std::move(v);
+            out.len[pos] = kept;
         }
-        return out;
     }
 
     // =======================================================================
@@ -1665,7 +1858,9 @@ public:
         int fb_docs = 10,
         int fb_terms = 25,
         float alpha = 0.6f,
-        float mu = 1000.0f)
+        float mu = 1000.0f,
+        int rm3_pool = RM3_POOL,
+        float fb_temp = 20.0f)
     {
         auto tokens = cpp_tokenize(query, tokcfg);
         if (tokens.empty() || N == 0) return {};
@@ -1683,7 +1878,7 @@ public:
         // Deep enough for the RM3 re-rank pool. The second pass used to
         // re-scan every expansion-term postings list (~4 ms); we now
         // re-score only these first-pass documents from the forward index.
-        int pass1_depth = std::max(std::max(fb_docs, k), use_rm3 ? RM3_POOL : k);
+        int pass1_depth = std::max(std::max(fb_docs, k), use_rm3 ? std::max(rm3_pool, k) : k);
         auto pass1 = raw_retrieve(q_vec, pass1_depth, k1, b, delta, w_title, title_bonus);
         if (pass1.empty()) return {};
 
@@ -1712,23 +1907,42 @@ public:
                 float norm = 0.0f;
                 for (int i = 0; i < num_fb; ++i) norm += pass1[i].second;
                 if (norm <= 0.0f) norm = 1.0f;
+                // Optional peaked softmax: fb_temp < 20 interpolates toward
+                // ranking-conditioned P(D|Q). 20+ keeps score/sum (submitted).
+                if (fb_temp < 19.5f) {
+                    const float sd = std::sqrt(var);
+                    const float tau = std::max(sd * std::max(fb_temp, 0.05f), 1e-6f);
+                    const float smax = pass1[0].second;
+                    fb_wts.resize(num_fb);
+                    norm = 0.0f;
+                    for (int i = 0; i < num_fb; ++i) {
+                        fb_wts[i] = std::exp((pass1[i].second - smax) / tau);
+                        norm += fb_wts[i];
+                    }
+                    if (norm <= 0.0f) norm = 1.0f;
+                    for (int i = 0; i < num_fb; ++i) fb_wts[i] /= norm;
+                } else {
+                    fb_wts.resize(num_fb);
+                    for (int i = 0; i < num_fb; ++i) fb_wts[i] = pass1[i].second / norm;
+                }
 
                 std::vector<uint32_t> pool_ids;
                 pool_ids.reserve(pass1.size());
                 for (const auto& p : pass1) pool_ids.push_back(p.first);
-                auto batch = get_batch_doc_term_freqs(pool_ids);
+                BatchFwd batch;
+                get_batch_doc_term_freqs(pool_ids, batch);
 
                 // RM3 relevance model: P(w|R) = sum_D P(w|D) P(D|Q), with
                 // P(w|D) Dirichlet-smoothed against the collection model.
                 std::unordered_map<int32_t, float> p_w_r;
                 for (int i = 0; i < num_fb; ++i) {
                     uint32_t doc_id = pass1[i].first;
-                    float p_d_q = pass1[i].second / norm;
+                    float p_d_q = fb_wts[i];
                     float d_len = static_cast<float>(doc_lens[doc_id]);
 
-                    auto it = batch.find(doc_id);
-                    if (it == batch.end()) continue;
-                    for (const auto& tf_kv : it->second) {
+                    const uint32_t s0 = batch.start[i], sn = batch.len[i];
+                    for (uint32_t j = 0; j < sn; ++j) {
+                        const auto& tf_kv = batch.arena[s0 + j];
                         int32_t tid = static_cast<int32_t>(tf_kv.first);
                         if (tid < 0 || tid >= static_cast<int32_t>(term_metas.size())) continue;
                         float p_w_c = (total_corpus_tokens > 0)
@@ -1771,13 +1985,14 @@ public:
 
                 pool.clear();
                 pool.reserve(pass1.size());
-                for (const auto& p1 : pass1) {
-                    uint32_t d = p1.first;
-                    float s = alpha * p1.second;
-                    auto it = batch.find(d);
-                    if (it != batch.end()) {
+                for (size_t pi = 0; pi < pass1.size(); ++pi) {
+                    uint32_t d = pass1[pi].first;
+                    float s = alpha * pass1[pi].second;
+                    const uint32_t s0 = batch.start[pi], sn = batch.len[pi];
+                    if (sn) {
                         float lp = length_penalty_lut[quantized_doc_lens[d]];
-                        for (const auto& tf_kv : it->second) {
+                        for (uint32_t j = 0; j < sn; ++j) {
+                            const auto& tf_kv = batch.arena[s0 + j];
                             auto e = exp_w.find(tf_kv.first);
                             if (e == exp_w.end()) continue;
                             float tf_eff = static_cast<float>(tf_kv.second);
@@ -1812,12 +2027,14 @@ public:
         float w_title, float title_bonus)
     {
         return retrieve(query, k, k1, b, delta, w_title, title_bonus,
-                        false, 0, 0, 1.0f, 1000.0f);
+                        false, 0, 0, 1.0f, 1000.0f, RM3_POOL, 20.0f);
     }
 };
 
 PYBIND11_MODULE(cpp_engine, m) {
     m.doc() = "From-scratch inverted index with BM25F+ scoring and RM3 query expansion";
+    m.def("check_codecs", &check_codecs,
+          "S9Reader/EFReader/s9_skip must match simple9_unpack/ef_unpack_docs");
     py::class_<CPPEngine>(m, "CPPEngine")
         .def(py::init<>())
         .def("build_index", &CPPEngine::build_index, py::arg("corpus"), py::arg("index_dir"))
@@ -1829,7 +2046,8 @@ PYBIND11_MODULE(cpp_engine, m) {
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
              py::arg("w_title") = 0.0f, py::arg("title_bonus") = 0.0f,
              py::arg("use_rm3") = true, py::arg("fb_docs") = 10, py::arg("fb_terms") = 25,
-             py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f)
+             py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f,
+             py::arg("rm3_pool") = RM3_POOL, py::arg("fb_temp") = 20.0f)
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,

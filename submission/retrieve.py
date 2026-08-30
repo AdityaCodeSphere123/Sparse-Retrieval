@@ -73,6 +73,10 @@ PARAMS = dict(
     fb_terms=30,
     alpha=0.65,
     mu=5000.0,
+    rm3_pool=250,
+    # >= 19.5 keeps P(D|Q) = score/sum(scores). Smaller values peak the
+    # softmax on the first-pass ranking (sweep 0.5, 1, 2, 5 on dev).
+    fb_temp=20.0,
 )
 
 # The ANALYSIS CHAIN (stemmer + stopwords) is not here because it is not a
