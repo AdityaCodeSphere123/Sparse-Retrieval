@@ -77,6 +77,22 @@ def test_cpp_tie_break_is_external_doc_id_not_insertion_order():
         assert ranking[0][1] == pytest.approx(ranking[1][1])
 
 
+def test_parallel_build_matches_serial(monkeypatch):
+    """Contiguous doc-id shards must be byte-identical to a 1-worker build."""
+    import pytest
+    from submission import retrieve as r
+
+    if not r.HAS_CPP:
+        pytest.skip("cpp_engine not built")
+
+    with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+        monkeypatch.setenv("IR_BUILD_WORKERS", "1")
+        r.build_index(CORPUS_PATH, d1)
+        monkeypatch.setenv("IR_BUILD_WORKERS", "4")
+        r.build_index(CORPUS_PATH, d2)
+        assert _file_hashes(d1) == _file_hashes(d2)
+
+
 def test_ragged_doc_ids_roundtrip_front_coded_docmap():
     """Held-out collections may mix id widths; id_len==0 must load back."""
     import struct

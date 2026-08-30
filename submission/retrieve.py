@@ -105,19 +105,29 @@ _LOAD_TMP: Optional[tempfile.TemporaryDirectory] = None
 _GZIP_NAMES = frozenset({"postings.bin", "fwd.bin", "dict.bin", "rm3map.bin"})
 
 
+def _gzip_one(index_dir: str, name: str) -> None:
+    path = os.path.join(index_dir, name)
+    if not os.path.isfile(path):
+        return
+    gz_path = path + ".gz"
+    with open(path, "rb") as src, open(gz_path, "wb") as dst:
+        with gzip.GzipFile(
+            filename="", fileobj=dst, mode="wb", mtime=0, compresslevel=1
+        ) as gz:
+            shutil.copyfileobj(src, gz)
+    os.remove(path)
+
+
 def _gzip_index_dir(index_dir: str) -> None:
     """Replace bulky index files with deterministic .gz siblings."""
-    for name in _GZIP_NAMES:
-        path = os.path.join(index_dir, name)
-        if not os.path.isfile(path):
-            continue
-        gz_path = path + ".gz"
-        with open(path, "rb") as src, open(gz_path, "wb") as dst:
-            with gzip.GzipFile(
-                filename="", fileobj=dst, mode="wb", mtime=0, compresslevel=9
-            ) as gz:
-                shutil.copyfileobj(src, gz)
-        os.remove(path)
+    from concurrent.futures import ThreadPoolExecutor
+
+    names = [n for n in _GZIP_NAMES if os.path.isfile(os.path.join(index_dir, n))]
+    if not names:
+        return
+    workers = min(4, len(names))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda n: _gzip_one(index_dir, n), names))
 
 
 def _prepare_cpp_load_dir(index_dir: str) -> str:

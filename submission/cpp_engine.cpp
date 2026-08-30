@@ -43,6 +43,10 @@
 #include <cctype>
 #include <random>
 #include <stdexcept>
+#include <thread>
+#include <exception>
+#include <string_view>
+#include <chrono>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -62,7 +66,6 @@ namespace py = pybind11;
 // they trade memory against I/O during the build, not ranking quality.
 // ---------------------------------------------------------------------------
 static constexpr uint32_t FWD_CANDIDATES   = 64;     // pre-df-filter margin
-static constexpr uint32_t SPIMI_BATCH_DOCS = 50000;  // docs buffered per spill
 static constexpr uint32_t FWD_OFF_STRIDE   = 8;      // checkpoint every 8 docs in fwdoff.bin
 static constexpr int      RM3_POOL         = 250;    // first-pass docs re-scored with RM3
 static constexpr uint8_t  INDEX_VERSION    = 8;
@@ -77,6 +80,7 @@ static constexpr uint8_t  INDEX_VERSION    = 8;
 //   IR_FWD_TERMS     forward-index width (terms/doc) available to RM3
 //   IR_RM3_DF_FRAC   df ceiling, as a fraction of N, for RM3 candidate terms
 //   IR_MIN_DF        terms rarer than this are dropped from dict+postings
+//   IR_BUILD_WORKERS tokenize threads (default min(4, hardware_concurrency))
 // ---------------------------------------------------------------------------
 struct BuildCfg {
     // title_window = 12 raw tokens: the median title length in this collection,
@@ -106,6 +110,17 @@ static BuildCfg read_build_cfg() {
     if (const char* e = std::getenv("IR_RM3_DF_FRAC"))  c.rm3_df_frac  = std::atof(e);
     if (const char* e = std::getenv("IR_MIN_DF"))       c.min_df       = std::atoi(e);
     return c;
+}
+
+// Cap at 4: the grading image is a 4-core box. IR_BUILD_WORKERS overrides
+// (used to prove 1- vs N-worker indexes are byte-identical).
+static int build_workers() {
+    int hw = static_cast<int>(std::thread::hardware_concurrency());
+    int n = (hw > 0) ? std::min(hw, 4) : 4;
+    if (const char* e = std::getenv("IR_BUILD_WORKERS")) n = std::atoi(e);
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,14 +786,27 @@ struct TokenizerCfg {
 static thread_local PorterStemmer g_porter;
 static thread_local std::unordered_map<std::string, std::string> g_stem_cache;
 
-static inline std::string apply_stem(const std::string& w, uint8_t stemmer) {
-    if (stemmer == 0) return w;
-    if (stemmer == 1) return s_stem(w);
+static uint8_t g_tok_alnum[256];
+static uint8_t g_tok_lower[256];
+static const bool g_tok_inited = []() {
+    for (int i = 0; i < 256; ++i) {
+        unsigned char c = static_cast<unsigned char>(i);
+        if (std::isalnum(c)) {
+            g_tok_alnum[i] = 1;
+            g_tok_lower[i] = static_cast<uint8_t>(std::tolower(c));
+        }
+    }
+    return true;
+}();
+
+static inline const std::string& apply_stem(const std::string& w, uint8_t stemmer) {
     auto it = g_stem_cache.find(w);
     if (it != g_stem_cache.end()) return it->second;
-    std::string s = g_porter.stem(w);
-    g_stem_cache.emplace(w, s);
-    return s;
+    std::string s;
+    if (stemmer <= 0) s = w;
+    else if (stemmer == 1) s = s_stem(w);
+    else s = g_porter.stem(w);
+    return g_stem_cache.emplace(w, std::move(s)).first->second;
 }
 
 // Returns (term, original_token_position) pairs.
@@ -791,20 +819,52 @@ cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
 
     auto emit = [&]() {
         if (current.empty()) return;
-        uint32_t this_pos = pos++;                       // position counted first
+        uint32_t this_pos = pos++;
         if (!(cfg.remove_stop && INDEX_STOPWORDS.count(current)))
             tokens.push_back({apply_stem(current, cfg.stemmer), this_pos});
         current.clear();
     };
 
-    for (char c : text) {
-        if (std::isalnum(static_cast<unsigned char>(c)))
-            current += std::tolower(static_cast<unsigned char>(c));
+    for (unsigned char uc : text) {
+        if (g_tok_alnum[uc])
+            current += static_cast<char>(g_tok_lower[uc]);
         else
             emit();
     }
     emit();
     return tokens;
+}
+
+// Build-path tokenisation: one pass into tf maps, no per-token std::string vector.
+static void accumulate_tf(
+    std::string_view text, const TokenizerCfg& cfg, uint32_t title_window,
+    std::unordered_map<std::string, uint32_t>& term_data,
+    std::unordered_map<std::string, uint32_t>& title_tf,
+    uint32_t& d_len)
+{
+    (void)g_tok_inited;
+    char buf[96];
+    int n = 0;
+    uint32_t pos = 0;
+    auto emit = [&]() {
+        if (n <= 0) { n = 0; return; }
+        std::string surface(buf, static_cast<size_t>(n));
+        n = 0;
+        uint32_t this_pos = pos++;
+        if (cfg.remove_stop && INDEX_STOPWORDS.count(surface)) return;
+        const std::string& stem = apply_stem(surface, cfg.stemmer);
+        term_data[stem]++;
+        if (this_pos < title_window) title_tf[stem]++;
+        ++d_len;
+    };
+    for (unsigned char uc : text) {
+        if (g_tok_alnum[uc]) {
+            if (n < 95) buf[n++] = static_cast<char>(g_tok_lower[uc]);
+        } else {
+            emit();
+        }
+    }
+    emit();
 }
 
 // ---------------------------------------------------------------------------
@@ -895,27 +955,27 @@ struct DocPosting {
 };
 
 // Minimal JSONL field extraction for {"doc_id": ..., "text": ...}
-static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::string& text) {
+static bool parse_jsonl_sv(std::string_view line, std::string& doc_id, std::string& text) {
     if (line.empty()) return false;
     size_t id_pos = line.find("\"doc_id\"");
-    if (id_pos == std::string::npos) return false;
+    if (id_pos == std::string_view::npos) return false;
     size_t id_colon = line.find(':', id_pos);
-    if (id_colon == std::string::npos) return false;
+    if (id_colon == std::string_view::npos) return false;
     size_t id_quote1 = line.find('"', id_colon);
-    if (id_quote1 == std::string::npos) return false;
+    if (id_quote1 == std::string_view::npos) return false;
     size_t id_quote2 = line.find('"', id_quote1 + 1);
-    while (id_quote2 != std::string::npos && line[id_quote2 - 1] == '\\') {
+    while (id_quote2 != std::string_view::npos && id_quote2 > 0 && line[id_quote2 - 1] == '\\') {
         id_quote2 = line.find('"', id_quote2 + 1);
     }
-    if (id_quote2 == std::string::npos) return false;
-    doc_id = line.substr(id_quote1 + 1, id_quote2 - id_quote1 - 1);
+    if (id_quote2 == std::string_view::npos) return false;
+    doc_id.assign(line.data() + id_quote1 + 1, id_quote2 - id_quote1 - 1);
 
     size_t text_pos = line.find("\"text\"");
-    if (text_pos == std::string::npos) return false;
+    if (text_pos == std::string_view::npos) return false;
     size_t text_colon = line.find(':', text_pos);
-    if (text_colon == std::string::npos) return false;
+    if (text_colon == std::string_view::npos) return false;
     size_t text_quote1 = line.find('"', text_colon);
-    if (text_quote1 == std::string::npos) return false;
+    if (text_quote1 == std::string_view::npos) return false;
     size_t text_quote2 = line.rfind('"');
     if (text_quote2 <= text_quote1) return false;
     while (text_quote2 > text_quote1 && line[text_quote2 - 1] == '\\') {
@@ -924,7 +984,11 @@ static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::
         text_quote2 = prev;
     }
 
-    std::string raw_text = line.substr(text_quote1 + 1, text_quote2 - text_quote1 - 1);
+    std::string_view raw_text(line.data() + text_quote1 + 1, text_quote2 - text_quote1 - 1);
+    if (raw_text.find('\\') == std::string_view::npos) {
+        text.assign(raw_text.data(), raw_text.size());
+        return true;
+    }
     text.clear();
     text.reserve(raw_text.size());
     for (size_t i = 0; i < raw_text.size(); ++i) {
@@ -941,6 +1005,29 @@ static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::
         }
     }
     return true;
+}
+
+static bool parse_jsonl_line(const std::string& line, std::string& doc_id, std::string& text) {
+    return parse_jsonl_sv(line, doc_id, text);
+}
+
+static void collect_jsonl_spans(const char* p, size_t n,
+                                std::vector<std::pair<const char*, size_t>>& spans) {
+    size_t i = 0;
+    while (i < n) {
+        size_t j = i;
+        while (j < n && p[j] != '\n') ++j;
+        size_t len = j - i;
+        if (len > 0 && p[i + len - 1] == '\r') --len;
+        if (len > 0) spans.emplace_back(p + i, len);
+        if (j >= n) break;
+        i = j + 1;
+    }
+}
+
+static bool build_timing_enabled() {
+    const char* e = std::getenv("IR_BUILD_TIMING");
+    return e && e[0] == '1';
 }
 
 class CPPEngine {
@@ -1009,7 +1096,9 @@ public:
     //               ones the df filter rejects, write fwd.bin / fwdoff.bin.
     //
     template <typename Supplier>
-    void build_common(Supplier&& next_doc, const std::string& index_dir) {
+    void build_common(Supplier&& next_doc, const std::string& index_dir,
+                      const std::vector<std::pair<const char*, size_t>>* line_spans = nullptr,
+                      MmapBuffer* release_corpus = nullptr) {
         postings_mmap.unmap();
         fwd_mmap.unmap();
         fwdoff_mmap.unmap();
@@ -1030,103 +1119,177 @@ public:
         if (const char* e = std::getenv("IR_STOPWORDS"))
             tokcfg.remove_stop = static_cast<uint8_t>(std::atoi(e));
 
-        std::vector<std::string> run_files;
-        uint32_t run_count = 0;
-
-        std::unordered_map<std::string, std::vector<DocPosting>> temp_postings;
-        std::unordered_map<std::string, uint64_t> collection_freq;
-
-        const std::string fwdtmp_path = index_dir + "/fwdtmp.bin";
-        std::ofstream f_fwdtmp(fwdtmp_path, std::ios::binary);
-
-        auto flush_spimi_run = [&](uint32_t run_idx) {
-            std::string run_path = index_dir + "/spimi_run_" + std::to_string(run_idx) + ".bin";
-            std::ofstream f(run_path, std::ios::binary);
-
-            std::vector<std::string> terms;
-            terms.reserve(temp_postings.size());
-            for (const auto& kv : temp_postings) terms.push_back(kv.first);
-            std::sort(terms.begin(), terms.end());
-
-            uint32_t num_terms = terms.size();
-            f.write(reinterpret_cast<const char*>(&num_terms), sizeof(num_terms));
-
-            for (const auto& term : terms) {
-                const auto& plist = temp_postings[term];
-                uint16_t t_len = term.size();
-                f.write(reinterpret_cast<const char*>(&t_len), sizeof(t_len));
-                f.write(term.data(), t_len);
-
-                uint32_t df = plist.size();
-                f.write(reinterpret_cast<const char*>(&df), sizeof(df));
-
-                for (const auto& p : plist) {
-                    f.write(reinterpret_cast<const char*>(&p.doc_id), sizeof(p.doc_id));
-                    f.write(reinterpret_cast<const char*>(&p.tf), sizeof(p.tf));
-                    f.write(reinterpret_cast<const char*>(&p.title_tf), sizeof(p.title_tf));
-                }
-            }
-            temp_postings.clear();
-            run_files.push_back(run_path);
+        const bool time_build = build_timing_enabled();
+        auto t0 = std::chrono::steady_clock::now();
+        auto stamp = [&](const char* label, std::chrono::steady_clock::time_point& mark) {
+            if (!time_build) return;
+            auto now = std::chrono::steady_clock::now();
+            double s = std::chrono::duration<double>(now - mark).count();
+            std::cerr << "[build] " << label << ": " << s << "s\n";
+            mark = now;
         };
 
-        std::string ext_id, text;
-        uint32_t doc_int_id = 0;
-
-        while (next_doc(ext_id, text)) {
-            doc_ids.push_back(ext_id);
-
-            auto tokens = cpp_tokenize(text, tokcfg);
-            // Document length is the number of INDEXED tokens, so BM25's
-            // length normalisation is consistent with what is actually scored.
-            uint32_t d_len = static_cast<uint32_t>(tokens.size());
-            doc_lens.push_back(d_len);
-            total_corpus_tokens += d_len;
-
-            std::unordered_map<std::string, uint32_t> term_data;  // term -> tf
-            std::unordered_map<std::string, uint32_t> title_tf;   // term -> tf in the title window
-            for (const auto& tp : tokens) {
-                term_data[tp.first]++;
-                if (tp.second < buildcfg.title_window) title_tf[tp.first]++;
-                collection_freq[tp.first]++;
+        std::vector<std::string> all_ids;
+        std::vector<std::string> all_texts;
+        if (!line_spans) {
+            std::string ext_id, text;
+            while (next_doc(ext_id, text)) {
+                all_ids.push_back(std::move(ext_id));
+                all_texts.push_back(std::move(text));
             }
+        }
+        stamp("load_docs", t0);
+        const uint32_t Ndocs = line_spans
+            ? static_cast<uint32_t>(line_spans->size())
+            : static_cast<uint32_t>(all_ids.size());
+        int W = build_workers();
+        if (Ndocs == 0) W = 1;
+        else if (static_cast<uint32_t>(W) > Ndocs) W = static_cast<int>(Ndocs);
 
-            // Forward-index candidates: the highest-tf non-stopword terms in
-            // this document. Written now, resolved to term ids after merge.
-            std::vector<std::pair<uint32_t, const std::string*>> cands;
-            cands.reserve(term_data.size());
-            for (const auto& kv : term_data) {
-                if (STOPWORDS.count(kv.first)) continue;
-                cands.push_back({kv.second, &kv.first});
-            }
-            size_t keep = std::min<size_t>(cands.size(), FWD_CANDIDATES);
-            std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
-                              [](const auto& a, const auto& b) { return a.first > b.first; });
-            uint32_t n_cand = static_cast<uint32_t>(keep);
-            f_fwdtmp.write(reinterpret_cast<const char*>(&n_cand), sizeof(n_cand));
-            for (size_t i = 0; i < keep; ++i) {
-                uint16_t tl = static_cast<uint16_t>(cands[i].second->size());
-                uint16_t tf16 = static_cast<uint16_t>(std::min<uint32_t>(cands[i].first, 65535u));
-                f_fwdtmp.write(reinterpret_cast<const char*>(&tl), sizeof(tl));
-                f_fwdtmp.write(cands[i].second->data(), tl);
-                f_fwdtmp.write(reinterpret_cast<const char*>(&tf16), sizeof(tf16));
-            }
+        struct Shard {
+            std::unordered_map<std::string, std::vector<DocPosting>> postings;
+            std::vector<std::string> ids;
+            std::string fwdtmp_path;
+            uint64_t tokens = 0;
+            std::vector<uint32_t> doc_lens;
+            std::exception_ptr err;
+        };
+        std::vector<Shard> shards(static_cast<size_t>(W));
 
-            for (const auto& kv : term_data) {
-                auto ttf = title_tf.find(kv.first);
-                temp_postings[kv.first].push_back(
-                    DocPosting{doc_int_id, kv.second,
-                               (ttf == title_tf.end()) ? 0u : ttf->second});
-            }
+        auto ingest_range = [&](int w) {
+            try {
+                const uint32_t lo = static_cast<uint32_t>((static_cast<uint64_t>(w) * Ndocs) / static_cast<uint32_t>(W));
+                const uint32_t hi = static_cast<uint32_t>((static_cast<uint64_t>(w + 1) * Ndocs) / static_cast<uint32_t>(W));
+                Shard& sh = shards[static_cast<size_t>(w)];
+                sh.doc_lens.reserve(hi - lo);
+                if (line_spans) sh.ids.reserve(hi - lo);
+                sh.fwdtmp_path = index_dir + "/fwdtmp_" + std::to_string(w) + ".bin";
+                std::ofstream f_fwdtmp(sh.fwdtmp_path, std::ios::binary);
 
-            doc_int_id++;
-            if (doc_int_id % SPIMI_BATCH_DOCS == 0) flush_spimi_run(run_count++);
+                thread_local std::string tls_id, tls_text;
+                for (uint32_t doc_int_id = lo; doc_int_id < hi; ++doc_int_id) {
+                    std::string_view text_sv;
+                    if (line_spans) {
+                        const auto& sp = (*line_spans)[doc_int_id];
+                        if (!parse_jsonl_sv(std::string_view(sp.first, sp.second), tls_id, tls_text)) {
+                            tls_id.clear();
+                            tls_text.clear();
+                        }
+                        sh.ids.push_back(tls_id);
+                        text_sv = tls_text;
+                    } else {
+                        text_sv = all_texts[doc_int_id];
+                    }
+                    std::unordered_map<std::string, uint32_t> term_data;
+                    std::unordered_map<std::string, uint32_t> title_tf;
+                    uint32_t d_len = 0;
+                    accumulate_tf(text_sv, tokcfg, buildcfg.title_window,
+                                  term_data, title_tf, d_len);
+                    sh.doc_lens.push_back(d_len);
+                    sh.tokens += d_len;
+
+                    std::vector<std::pair<uint32_t, const std::string*>> cands;
+                    cands.reserve(term_data.size());
+                    for (const auto& kv : term_data) {
+                        if (STOPWORDS.count(kv.first)) continue;
+                        cands.push_back({kv.second, &kv.first});
+                    }
+                    size_t keep = std::min<size_t>(cands.size(), FWD_CANDIDATES);
+                    std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
+                                      [](const auto& a, const auto& b) { return a.first > b.first; });
+                    uint32_t n_cand = static_cast<uint32_t>(keep);
+                    f_fwdtmp.write(reinterpret_cast<const char*>(&n_cand), sizeof(n_cand));
+                    for (size_t i = 0; i < keep; ++i) {
+                        uint16_t tl = static_cast<uint16_t>(cands[i].second->size());
+                        uint16_t tf16 = static_cast<uint16_t>(std::min<uint32_t>(cands[i].first, 65535u));
+                        f_fwdtmp.write(reinterpret_cast<const char*>(&tl), sizeof(tl));
+                        f_fwdtmp.write(cands[i].second->data(), tl);
+                        f_fwdtmp.write(reinterpret_cast<const char*>(&tf16), sizeof(tf16));
+                    }
+
+                    for (const auto& kv : term_data) {
+                        auto ttf = title_tf.find(kv.first);
+                        sh.postings[kv.first].push_back(
+                            DocPosting{doc_int_id, kv.second,
+                                       (ttf == title_tf.end()) ? 0u : ttf->second});
+                    }
+                }
+                f_fwdtmp.close();
+            } catch (...) {
+                shards[static_cast<size_t>(w)].err = std::current_exception();
+            }
+        };
+
+        if (W <= 1) {
+            ingest_range(0);
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(static_cast<size_t>(W));
+            for (int w = 0; w < W; ++w) pool.emplace_back(ingest_range, w);
+            for (auto& t : pool) t.join();
+        }
+        for (auto& sh : shards) {
+            if (sh.err) std::rethrow_exception(sh.err);
         }
 
-        if (!temp_postings.empty()) flush_spimi_run(run_count++);
-        f_fwdtmp.close();
+        stamp("ingest", t0);
+        if (release_corpus) release_corpus->unmap();
 
-        N = doc_int_id;
+        if (line_spans) {
+            doc_ids.clear();
+            doc_ids.reserve(Ndocs);
+            for (int w = 0; w < W; ++w)
+                for (auto& id : shards[static_cast<size_t>(w)].ids)
+                    doc_ids.push_back(std::move(id));
+        } else {
+            doc_ids = std::move(all_ids);
+        }
+        all_texts.clear();
+        all_texts.shrink_to_fit();
+
+        doc_lens.resize(Ndocs);
+        total_corpus_tokens = 0;
+        for (int w = 0; w < W; ++w) {
+            const uint32_t lo = static_cast<uint32_t>((static_cast<uint64_t>(w) * Ndocs) / static_cast<uint32_t>(W));
+            std::copy(shards[static_cast<size_t>(w)].doc_lens.begin(),
+                      shards[static_cast<size_t>(w)].doc_lens.end(),
+                      doc_lens.begin() + lo);
+            total_corpus_tokens += shards[static_cast<size_t>(w)].tokens;
+        }
+
+        const std::string fwdtmp_path = index_dir + "/fwdtmp.bin";
+        {
+            std::ofstream f_fwdtmp(fwdtmp_path, std::ios::binary);
+            for (int w = 0; w < W; ++w) {
+                const std::string& p = shards[static_cast<size_t>(w)].fwdtmp_path;
+                std::ifstream in(p, std::ios::binary);
+                if (in) f_fwdtmp << in.rdbuf();
+                in.close();
+                std::remove(p.c_str());
+            }
+        }
+
+        using TermRun = std::vector<std::pair<std::string, std::vector<DocPosting>>>;
+        std::vector<TermRun> mem_runs(static_cast<size_t>(W));
+        auto sort_shard = [&](int w) {
+            auto& src = shards[static_cast<size_t>(w)].postings;
+            auto& dst = mem_runs[static_cast<size_t>(w)];
+            dst.reserve(src.size());
+            for (auto& kv : src) dst.emplace_back(std::move(kv.first), std::move(kv.second));
+            src.clear();
+            std::sort(dst.begin(), dst.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+        };
+        if (W <= 1) {
+            sort_shard(0);
+        } else {
+            std::vector<std::thread> pool;
+            for (int w = 0; w < W; ++w) pool.emplace_back(sort_shard, w);
+            for (auto& t : pool) t.join();
+        }
+        stamp("sort_runs", t0);
+
+        N = Ndocs;
         avg_doc_len = (N > 0) ? static_cast<float>(static_cast<double>(total_corpus_tokens) / N) : 0.0f;
 
         quantized_doc_lens.resize(N);
@@ -1187,38 +1350,26 @@ public:
             f.write(reinterpret_cast<const char*>(quantized_doc_lens.data()), N * sizeof(uint8_t));
         }
 
-        // -------- stage 2: k-way merge -------------------------------------
-        struct RunReader {
-            std::ifstream file;
-            uint32_t num_terms = 0;
-            uint32_t terms_read = 0;
-            std::string curr_term;
-            uint32_t curr_df = 0;
-            bool active = false;
-
-            bool read_next_term() {
-                if (terms_read >= num_terms) { active = false; curr_term.clear(); return false; }
-                uint16_t t_len;
-                if (!file.read(reinterpret_cast<char*>(&t_len), sizeof(t_len))) {
-                    active = false; curr_term.clear(); return false;
-                }
-                curr_term.resize(t_len);
-                file.read(&curr_term[0], t_len);
-                file.read(reinterpret_cast<char*>(&curr_df), sizeof(curr_df));
-                terms_read++;
-                active = true;
-                return true;
-            }
+        // -------- stage 2: k-way merge of in-memory shard runs -------------
+        struct MemCursor {
+            TermRun* lists = nullptr;
+            size_t i = 0;
+            bool active() const { return lists && i < lists->size(); }
+            const std::string& term() const { return (*lists)[i].first; }
+            std::vector<DocPosting>& posts() { return (*lists)[i].second; }
+            uint32_t df() const { return static_cast<uint32_t>((*lists)[i].second.size()); }
+            void next() { ++i; }
         };
 
-        std::vector<RunReader> readers(run_files.size());
-        for (size_t i = 0; i < run_files.size(); ++i) {
-            readers[i].file.open(run_files[i], std::ios::binary);
-            readers[i].file.read(reinterpret_cast<char*>(&readers[i].num_terms), sizeof(readers[i].num_terms));
-            readers[i].read_next_term();
+        std::vector<MemCursor> readers(static_cast<size_t>(W));
+        for (int w = 0; w < W; ++w) {
+            readers[static_cast<size_t>(w)].lists = &mem_runs[static_cast<size_t>(w)];
+            readers[static_cast<size_t>(w)].i = 0;
         }
 
         std::ofstream f_postings(index_dir + "/postings.bin", std::ios::binary);
+        std::vector<char> post_buf(1 << 20);
+        f_postings.rdbuf()->pubsetbuf(post_buf.data(), static_cast<std::streamsize>(post_buf.size()));
         std::ofstream f_dict(index_dir + "/dict.bin", std::ios::binary | std::ios::out);
 
         uint32_t placeholder = 0;
@@ -1239,30 +1390,26 @@ public:
         while (true) {
             const std::string* min_term = nullptr;
             for (auto& r : readers) {
-                if (!r.active) continue;
-                if (!min_term || r.curr_term < *min_term) min_term = &r.curr_term;
+                if (!r.active()) continue;
+                if (!min_term || r.term() < *min_term) min_term = &r.term();
             }
             if (!min_term) break;
             std::string term = *min_term;
 
             uint32_t df = 0;
-            for (auto& r : readers) if (r.active && r.curr_term == term) df += r.curr_df;
+            for (auto& r : readers) if (r.active() && r.term() == term) df += r.df();
 
             merged.clear();
             merged.reserve(df);
             uint64_t merged_cf = 0;
 
             for (auto& r : readers) {
-                if (!r.active || r.curr_term != term) continue;
-                for (uint32_t p_idx = 0; p_idx < r.curr_df; ++p_idx) {
-                    DocPosting dp;
-                    r.file.read(reinterpret_cast<char*>(&dp.doc_id), sizeof(dp.doc_id));
-                    r.file.read(reinterpret_cast<char*>(&dp.tf), sizeof(dp.tf));
-                    r.file.read(reinterpret_cast<char*>(&dp.title_tf), sizeof(dp.title_tf));
+                if (!r.active() || r.term() != term) continue;
+                for (const auto& dp : r.posts()) {
                     merged_cf += dp.tf;
-                    merged.push_back(std::move(dp));
+                    merged.push_back(dp);
                 }
-                r.read_next_term();
+                r.next();
             }
 
             // Runs are produced in increasing doc_id order and merged in run
@@ -1343,9 +1490,8 @@ public:
         const uint8_t pad[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         f_postings.write(reinterpret_cast<const char*>(pad), 8);
         f_postings.close();
-
-        for (auto& r : readers) r.file.close();
-        for (const auto& rfile : run_files) std::remove(rfile.c_str());
+        mem_runs.clear();
+        stamp("merge", t0);
 
         // -------- stage 3: forward index -----------------------------------
         // We need the dictionary in memory to resolve term ids and apply the
@@ -1355,6 +1501,7 @@ public:
             term_metas[i].cf = cfs_in_order[i];
         write_forward_index(index_dir, fwdtmp_path);
         std::remove(fwdtmp_path.c_str());
+        stamp("forward", t0);
     }
 
     void build_index(const std::vector<std::pair<std::string, std::string>>& corpus,
@@ -1370,6 +1517,15 @@ public:
     }
 
     void build_index_from_file(const std::string& corpus_path, const std::string& index_dir) {
+        MmapBuffer corpus_map;
+        if (corpus_map.map_file(corpus_path) && corpus_map.data) {
+            std::vector<std::pair<const char*, size_t>> spans;
+            collect_jsonl_spans(reinterpret_cast<const char*>(corpus_map.data),
+                                corpus_map.length, spans);
+            build_common([&](std::string&, std::string&) { return false; },
+                         index_dir, &spans, &corpus_map);
+            return;
+        }
         std::ifstream file(corpus_path);
         if (!file.is_open()) throw std::runtime_error("Cannot open corpus file: " + corpus_path);
         std::string line;
@@ -1441,6 +1597,11 @@ public:
         std::vector<uint8_t> ef_block;
         std::string term;
 
+        std::unordered_map<std::string, uint32_t> term_to_tid;
+        term_to_tid.reserve(terms_sorted.size() * 2 + 1);
+        for (uint32_t i = 0; i < terms_sorted.size(); ++i)
+            term_to_tid.emplace(terms_sorted[i], i);
+
         for (uint32_t d = 0; d < N; ++d) {
             if (d % fwd_off_stride == 0)
                 f_off.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
@@ -1458,8 +1619,9 @@ public:
 
                 // Consume every candidate — do not break early or the next
                 // document reads from the wrong offset.
-                int32_t tid = find_term(term);
-                if (tid < 0) continue;
+                auto it = term_to_tid.find(term);
+                if (it == term_to_tid.end()) continue;
+                int32_t tid = static_cast<int32_t>(it->second);
                 int32_t rid = tid_to_rm3[static_cast<uint32_t>(tid)];
                 if (rid < 0) continue;
                 uint32_t df = term_metas[static_cast<uint32_t>(tid)].df;
