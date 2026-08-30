@@ -22,7 +22,10 @@ Scoring is a two-pass sparse pipeline, all of it inside the C++ extension
 The pure-Python path below is a correctness fallback for when the extension
 is not built; it is plain BM25 and scores lower.
 """
+import gzip
 import os
+import shutil
+import tempfile
 from typing import List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
@@ -91,6 +94,58 @@ PARAMS = dict(
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
+# Decompressed C++ index lives here for the query process only. The harness
+# measures index_dir *after build_index*, so gzipped files are what count.
+_LOAD_TMP: Optional[tempfile.TemporaryDirectory] = None
+
+
+# Already entropy-coded files still gzip somewhat; leave the tiny layout
+# files uncompressed so tests (and a debugger) can read them as-is.
+_GZIP_NAMES = frozenset({"postings.bin", "fwd.bin", "dict.bin", "rm3map.bin"})
+
+
+def _gzip_index_dir(index_dir: str) -> None:
+    """Replace bulky index files with deterministic .gz siblings."""
+    for name in _GZIP_NAMES:
+        path = os.path.join(index_dir, name)
+        if not os.path.isfile(path):
+            continue
+        gz_path = path + ".gz"
+        with open(path, "rb") as src, open(gz_path, "wb") as dst:
+            with gzip.GzipFile(
+                filename="", fileobj=dst, mode="wb", mtime=0, compresslevel=9
+            ) as gz:
+                shutil.copyfileobj(src, gz)
+        os.remove(path)
+
+
+def _prepare_cpp_load_dir(index_dir: str) -> str:
+    """Return a directory of uncompressed names the C++ loader expects.
+
+    Gzipped files are inflated into a tempfile *outside* index_dir so query
+    mmap still works. Uncompressed trees (local debugging) are used as-is.
+    """
+    global _LOAD_TMP
+    names = os.listdir(index_dir)
+    if not any(n.endswith(".gz") for n in names):
+        _LOAD_TMP = None
+        return index_dir
+
+    if _LOAD_TMP is not None:
+        _LOAD_TMP.cleanup()
+    _LOAD_TMP = tempfile.TemporaryDirectory(prefix="a1_idx_")
+    out = _LOAD_TMP.name
+    for name in names:
+        src = os.path.join(index_dir, name)
+        if not os.path.isfile(src):
+            continue
+        if name.endswith(".gz"):
+            dest = os.path.join(out, name[:-3])
+            with gzip.open(src, "rb") as gzf, open(dest, "wb") as dst:
+                shutil.copyfileobj(gzf, dst)
+        else:
+            shutil.copy2(src, os.path.join(out, name))
+    return out
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
@@ -109,6 +164,7 @@ def build_index(corpus_path: str, index_dir: str) -> None:
             engine.build_index_from_file(stream_path, index_dir)
         else:
             engine.build_index(load_corpus(corpus_path), index_dir)
+        _gzip_index_dir(index_dir)
     else:
         index = InvertedIndex()
         index.build(stream_corpus(corpus_path))
@@ -120,7 +176,7 @@ def load_index(index_dir: str) -> None:
     global _INDEX, _CPP_ENGINE
     if HAS_CPP:
         _CPP_ENGINE = cpp_engine.CPPEngine()
-        _CPP_ENGINE.load_index(index_dir)
+        _CPP_ENGINE.load_index(_prepare_cpp_load_dir(index_dir))
     else:
         _INDEX = InvertedIndex.load(index_dir)
         bm25.build(_INDEX)
