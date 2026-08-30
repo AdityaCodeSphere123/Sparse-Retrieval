@@ -11,7 +11,13 @@ if sys.platform != "win32":
 ext_modules = [
     Pybind11Extension(
         "cpp_engine",
-        ["cpp_engine.cpp"],
+        [
+            "cpp/codecs.cpp",
+            "cpp/analysis.cpp",
+            "cpp/corpus_io.cpp",
+            "cpp/bindings.cpp",
+        ],
+        include_dirs=["cpp"],
         cxx_std=17,
         extra_compile_args=extra_compile,
         extra_link_args=extra_link,

@@ -11,7 +11,7 @@ rename them, change their signatures, or move them out of this file.
     retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]
 
 Scoring is a two-pass sparse pipeline, all of it inside the C++ extension
-(cpp_engine.cpp):
+(`submission/cpp/`, compiled as `cpp_engine`):
 
   1. BM25F+ over an inverted index. "F" because the leading tokens of a
      document are treated as a title field and scored with their own weight;
@@ -62,7 +62,7 @@ except ImportError:
 #
 # These were chosen with scripts/tune_cv.py (greedy coordinate ascent under
 # 5-fold cross-validation, taking plateau centres rather than the argmax) —
-# see the report. Build-time settings live in cpp_engine.cpp's BuildCfg and
+# see the report. Build-time settings live in cpp/ir_config.h (BuildCfg) and
 # are swept with scripts/sweep_build.py.
 # ---------------------------------------------------------------------------
 PARAMS = dict(
