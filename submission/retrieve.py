@@ -74,8 +74,6 @@ PARAMS = dict(
     alpha=0.65,
     mu=5000.0,
     rm3_pool=250,
-    # >= 19.5 keeps P(D|Q) = score/sum(scores). Smaller values peak the
-    # softmax on the first-pass ranking (sweep 0.5, 1, 2, 5 on dev).
     fb_temp=20.0,
 )
 
@@ -99,18 +97,18 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     """Build the index and persist everything retrieve() needs into index_dir."""
     os.makedirs(index_dir, exist_ok=True)
 
+    stream_path = corpus_path
+    if os.path.isdir(corpus_path):
+        candidate = os.path.join(corpus_path, "corpus.jsonl")
+        if os.path.isfile(candidate):
+            stream_path = candidate
+
     if HAS_CPP:
         engine = cpp_engine.CPPEngine()
-        # Streaming straight off the file avoids materialising the whole corpus
-        # in Python memory; fall back to the list form for ir_datasets specifiers.
-        if os.path.isfile(corpus_path):
-            engine.build_index_from_file(corpus_path, index_dir)
+        if os.path.isfile(stream_path):
+            engine.build_index_from_file(stream_path, index_dir)
         else:
-            candidate = os.path.join(corpus_path, "corpus.jsonl") if os.path.isdir(corpus_path) else ""
-            if candidate and os.path.isfile(candidate):
-                engine.build_index_from_file(candidate, index_dir)
-            else:
-                engine.build_index(load_corpus(corpus_path), index_dir)
+            engine.build_index(load_corpus(corpus_path), index_dir)
     else:
         index = InvertedIndex()
         index.build(stream_corpus(corpus_path))

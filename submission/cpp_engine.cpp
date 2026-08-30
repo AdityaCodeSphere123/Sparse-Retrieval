@@ -1871,13 +1871,13 @@ public:
             if (tid >= 0) qw[tid] += 1.0f;
         }
         if (qw.empty()) return {};
-        for (auto& kv : qw) kv.second /= static_cast<float>(tokens.size());
+        float qsum = 0.0f;
+        for (const auto& kv : qw) qsum += kv.second;
+        if (qsum <= 0.0f) return {};
+        for (auto& kv : qw) kv.second /= qsum;
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
 
-        // Deep enough for the RM3 re-rank pool. The second pass used to
-        // re-scan every expansion-term postings list (~4 ms); we now
-        // re-score only these first-pass documents from the forward index.
         int pass1_depth = std::max(std::max(fb_docs, k), use_rm3 ? std::max(rm3_pool, k) : k);
         auto pass1 = raw_retrieve(q_vec, pass1_depth, k1, b, delta, w_title, title_bonus);
         if (pass1.empty()) return {};
@@ -1963,9 +1963,6 @@ public:
                 for (const auto& kv : expansion) esum += kv.second;
                 if (esum <= 0.0f) esum = 1.0f;
 
-                // Expansion-only BM25 weights. Query-term contribution is
-                // recovered as alpha * first-pass score (BM25 is linear in
-                // the query weight), so we never re-scan those postings.
                 std::unordered_map<uint32_t, float> exp_w;
                 exp_w.reserve(expansion.size() * 2);
                 for (const auto& kv : expansion) {
