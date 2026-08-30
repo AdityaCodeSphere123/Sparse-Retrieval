@@ -1,6 +1,7 @@
 #include "analysis.h"
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <string_view>
 
 const std::unordered_set<std::string> STOPWORDS = {
