@@ -77,7 +77,11 @@ def _clip(x: float, lo: float, hi: float) -> float:
 def adapt_params(n_docs: int, avgdl: float) -> dict:
     """Select BM25/RM3 knobs from index statistics alone.
 
-    BM25 (k1, b, δ, title bonus) interpolates SHORT→NEWS on analyzed avgdl.
+    BM25 (k1, b, δ, title bonus) interpolates SHORT→NEWS on analyzed avgdl,
+    then a few length/size overrides (very short docs, large abstract
+    collections, small paper collections). Those overrides are the same
+    signals the interpolant already uses — they just refuse to treat a
+    20-token answer and a 110-token abstract as one operating point.
 
     RM3 interpolation is α·BM25 + (1-α)·expansion. α here is the regime
     midpoint (typical 5–8 term query); engine.h then tilts it by query
@@ -93,6 +97,7 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
       * N≥100k and avgdl≤135: on, strong μ, α=0.62.
       * N<20k and 90≤avgdl<120: on, μ≈2·avgdl, α=0.45.
       * N≥200k and avgdl≥160: on, μ≈2.5·avgdl, NEWS fb/α (Robust04-shaped).
+      * N<10k and avgdl≥152: on, light (small full-text papers).
       * otherwise off. Document-length queries are cut in C++.
     """
     avg = float(avgdl) if avgdl > 0 else 115.0
@@ -136,6 +141,33 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         out["rm3_pool"] = int(min(1000, max(50, n // 4)))
     else:
         out["use_rm3"] = False
+
+    # Very short documents (community answers, titles-as-docs): high k1/δ
+    # over-promotes a single title hit. Keep this below the forum/abstract
+    # band (avg≈70–110) where the SHORT point is still the right one.
+    if avg < 40.0:
+        out["k1"] = 1.75
+        out["b"] = 0.45
+        out["delta"] = 0.45
+        out["title_bonus"] = 0.40
+    elif n >= 100_000 and 90.0 <= avg <= 135.0:
+        # Large abstract collections: SHORT's k1=2.4 is slightly too
+        # tf-greedy once RM3 is also on.
+        out["k1"] = 2.15
+    elif n < 10_000 and avg >= 140.0:
+        # Small paper collections (too few docs to be NEWS, too long to
+        # be SHORT). Milder length-norm, keep a title field.
+        out["k1"] = 2.35
+        out["b"] = 0.45
+        out["delta"] = 0.65
+        out["title_bonus"] = 0.50
+        if avg >= 152.0:
+            out["use_rm3"] = True
+            out["alpha"] = 0.72
+            out["mu"] = 2500.0
+            out["fb_docs"] = int(_clip(8, 5, max(5, n // 100)))
+            out["fb_terms"] = 15
+            out["rm3_pool"] = int(min(150, max(50, n // 4)))
     return out
 
 
