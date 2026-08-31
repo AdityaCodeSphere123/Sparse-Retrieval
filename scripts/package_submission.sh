@@ -16,9 +16,9 @@
 #     runs/
 #     scripts/
 #     submission/
-#       setup.py          (pybind11: sources under submission/cpp/)
+#       setup.py          (pybind11: sources under submission/code/)
 #       retrieve.py
-#       cpp/
+#       code/
 #         ir_config.h engine.h
 #         analysis.{h,cpp} codecs.{h,cpp} corpus_io.{h,cpp} bindings.cpp
 #     tests/
@@ -70,7 +70,7 @@ if [ -d "${ROOT_DIR}/runs" ]; then
   done
 fi
 
-# Compiled extension + local junk. The grader rebuilds from setup.py + cpp/.
+# Compiled extension + local junk. The grader rebuilds from setup.py + code/.
 find "${BUILD_DIR}" -name "*.so" -delete
 find "${BUILD_DIR}" -name "*.dylib" -delete
 find "${BUILD_DIR}" -name "*.o" -delete
@@ -79,12 +79,14 @@ find "${BUILD_DIR}" -name ".DS_Store" -delete
 find "${BUILD_DIR}" -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find "${BUILD_DIR}" -name "_extract_*.txt" -delete
 rm -rf "${BUILD_DIR}/build" "${BUILD_DIR}/.pytest_cache"
-rm -rf "${BUILD_DIR}/submission/build" "${BUILD_DIR}/submission/cpp/build"
-# Legacy single-file engine must not ship; setup.py compiles cpp/*.cpp.
+rm -rf "${BUILD_DIR}/submission/build" "${BUILD_DIR}/submission/code/build"
+# Old layout name; do not ship a second copy of the sources.
+rm -rf "${BUILD_DIR}/submission/cpp"
+# Legacy single-file engine must not ship; setup.py compiles code/*.cpp.
 rm -f "${BUILD_DIR}/submission/cpp_engine.cpp"
 
-CPP_DIR="${BUILD_DIR}/submission/cpp"
-REQUIRED_CPP=(
+CODE_DIR="${BUILD_DIR}/submission/code"
+REQUIRED_SRC=(
   ir_config.h
   engine.h
   analysis.h analysis.cpp
@@ -93,9 +95,9 @@ REQUIRED_CPP=(
   bindings.cpp
 )
 missing=0
-for f in "${REQUIRED_CPP[@]}"; do
-  if [ ! -f "${CPP_DIR}/${f}" ]; then
-    echo "Error: missing submission/cpp/${f} (needed by submission/setup.py)"
+for f in "${REQUIRED_SRC[@]}"; do
+  if [ ! -f "${CODE_DIR}/${f}" ]; then
+    echo "Error: missing submission/code/${f} (needed by submission/setup.py)"
     missing=1
   fi
 done

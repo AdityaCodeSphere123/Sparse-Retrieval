@@ -11,7 +11,7 @@ rename them, change their signatures, or move them out of this file.
     retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]
 
 Scoring is a two-pass sparse pipeline, all of it inside the C++ extension
-(`submission/cpp/`, compiled as `cpp_engine`):
+(`submission/code/`, compiled as `cpp_engine`):
 
   1. BM25F+ over an inverted index. "F" because the leading tokens of a
      document are treated as a title field and scored with their own weight;
