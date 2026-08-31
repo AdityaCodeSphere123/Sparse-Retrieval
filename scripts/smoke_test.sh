@@ -21,4 +21,32 @@ python -m harness.run_harness \
   --report-out runs/dev_report.json
 
 echo
+echo "== Full harness run on the full set =="
+python -m harness.run_harness \
+  --corpus data/full/corpus.jsonl \
+  --queries data/full/queries_dev.tsv \
+  --qrels data/full/qrels_dev.txt \
+  --baseline-run data/full/reference_bm25_run_dev.trec \
+  --run-out runs/full_run.trec \
+  --report-out runs/full_report.json
+
+echo
+echo "== Full harness run on cranfield =="
+python -m harness.run_harness \
+  --corpus data/cranfield/corpus.jsonl \
+  --queries data/cranfield/queries_dev.tsv \
+  --qrels data/cranfield/qrels_dev.txt \
+  --run-out runs/cranfield_run.trec \
+  --report-out runs/cranfield_report.json
+
+echo
+echo "== Full harness run on cacm =="
+python -m harness.run_harness \
+  --corpus data/cacm/corpus.jsonl \
+  --queries data/cacm/queries_dev.tsv \
+  --qrels data/cacm/qrels_dev.txt \
+  --run-out runs/cacm_run.trec \
+  --report-out runs/cacm_report.json
+
+echo
 echo "All smoke checks passed."
