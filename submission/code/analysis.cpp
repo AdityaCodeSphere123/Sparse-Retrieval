@@ -211,21 +211,45 @@ class PorterStemmer {
     void step4() {
         if (k == 0) return;
         switch (b[k - 1]) {
-            case 'a': if (ends("al")) break; return;
-            case 'c': if (ends("ance")) break; if (ends("ence")) break; return;
-            case 'e': if (ends("er")) break; return;
-            case 'i': if (ends("ic")) break; return;
-            case 'l': if (ends("able")) break; if (ends("ible")) break; return;
-            case 'n': if (ends("ant")) break; if (ends("ement")) break;
-                      if (ends("ment")) break; if (ends("ent")) break; return;
-            case 'o': if (ends("ion") && j >= 0 && (b[j] == 's' || b[j] == 't')) break;
-                      if (ends("ou")) break; return;
-            case 's': if (ends("ism")) break; return;
-            case 't': if (ends("ate")) break; if (ends("iti")) break; return;
-            case 'u': if (ends("ous")) break; return;
-            case 'v': if (ends("ive")) break; return;
-            case 'z': if (ends("ize")) break; return;
-            default: return;
+            case 'a':
+                if (ends("al")) break;
+                return;
+            case 'c':
+                if (ends("ance") || ends("ence")) break;
+                return;
+            case 'e':
+                if (ends("er")) break;
+                return;
+            case 'i':
+                if (ends("ic")) break;
+                return;
+            case 'l':
+                if (ends("able") || ends("ible")) break;
+                return;
+            case 'n':
+                if (ends("ant") || ends("ement") || ends("ment") || ends("ent")) break;
+                return;
+            case 'o':
+                if (ends("ion") && j >= 0 && (b[j] == 's' || b[j] == 't')) break;
+                if (ends("ou")) break;
+                return;
+            case 's':
+                if (ends("ism")) break;
+                return;
+            case 't':
+                if (ends("ate") || ends("iti")) break;
+                return;
+            case 'u':
+                if (ends("ous")) break;
+                return;
+            case 'v':
+                if (ends("ive")) break;
+                return;
+            case 'z':
+                if (ends("ize")) break;
+                return;
+            default:
+                return;
         }
         if (m() > 1) k = j;
     }
