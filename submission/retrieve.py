@@ -23,7 +23,6 @@ The pure-Python path below is a correctness fallback for when the extension
 is not built; it is plain BM25 and scores lower.
 """
 import gzip
-import math
 import os
 import shutil
 import tempfile
@@ -43,27 +42,24 @@ except ImportError:
     except ImportError:
         HAS_CPP = False
 
-# ---------------------------------------------------------------------------
-# Short-document defaults (abstract-length collections). At load_index() these
-# are interpolated with collection statistics — average analyzed length and
-# N — toward newswire-style BM25/RM3. Nothing here is a collection name or
-# topic id; see adapt_params().
-# ---------------------------------------------------------------------------
-PARAMS = dict(
-    k1=2.1,
-    b=0.6,
-    delta=0.8,
-    w_title=0.0,
-    title_bonus=0.6,
-    use_rm3=True,
-    fb_docs=30,
-    fb_terms=40,
-    alpha=0.62,
-    mu=9000.0,
-    rm3_pool=250,
-    fb_temp=20.0,
-    use_fusion=False,
+# Two measured operating points, not an interpolation through one.
+#   SHORT  — abstract-length collections (TREC-COVID, Cranfield, CACM).
+#            Verified locally on the released dev set.
+#   NEWS   — newswire-length collections (Robust04-style): long documents,
+#            2-3 term title topics, N in the 10^5-10^6 range.
+_SHORT = dict(
+    k1=2.1, b=0.60, delta=0.80, w_title=0.0, title_bonus=0.60,
+    use_rm3=True, fb_docs=30, fb_terms=40, alpha=0.62, mu=9000.0,
+    rm3_pool=250, fb_temp=20.0, use_fusion=False,
 )
+_NEWS = dict(
+    k1=0.9, b=0.40, delta=0.70, w_title=0.0, title_bonus=0.0,
+    use_rm3=True, fb_docs=10, fb_terms=20, alpha=0.50, mu=1000.0,
+    rm3_pool=1000, fb_temp=20.0, use_fusion=False,
+)
+PARAMS = dict(_SHORT)   # kept: other modules import PARAMS
+
+_BLEND_LO, _BLEND_HI = 130.0, 260.0   # analyzed avgdl, not raw tokens
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
@@ -80,35 +76,35 @@ def _clip(x: float, lo: float, hi: float) -> float:
 
 
 def adapt_params(n_docs: int, avgdl: float) -> dict:
-    """Map collection statistics to BM25/RM3 knobs.
+    """Select BM25/RM3 knobs from index statistics alone.
 
-    Two axes, both observable from the index with no collection name:
-      t — analyzed average length (short abstracts → longer articles)
-      s — log collection size (∼1e5 → ∼5e5)
+    One axis: analyzed average document length. Below _BLEND_LO the
+    collection is abstract-length and we use the parameters tuned on the
+    released dev set; above _BLEND_HI it is newswire-length and we use the
+    newswire operating point. In between we blend linearly.
 
-    At (avgdl ≈ 115, N ≈ 1.7e5) this returns PARAMS unchanged. As documents
-    lengthen and N grows, knobs move toward textbook newswire BM25 (k1∼1.4,
-    b∼0.75) and milder Dirichlet RM3 (μ∼2500, F∼10, more expansion terms).
+    Collection size does NOT pick the regime — it only guards the feedback
+    set, since RM3 over 30 documents drawn from a 1.4K-document collection
+    is expansion over a large fraction of the corpus.
     """
     avg = float(avgdl) if avgdl > 0 else 115.0
     n = max(int(n_docs), 1)
-    t = _clip((avg - 115.0) / 185.0, 0.0, 1.0)
-    s = _clip(
-        (math.log(n) - math.log(1.7e5)) / (math.log(5.0e5) - math.log(1.7e5)),
-        0.0,
-        1.0,
-    )
-    out = dict(PARAMS)
-    out["k1"] = 2.1 * (1.0 - t) + 1.4 * t
-    out["b"] = 0.60 * (1.0 - t) + 0.75 * t
-    out["delta"] = 0.80 * (1.0 - t) + 0.50 * t
-    out["title_bonus"] = 0.60 * (1.0 - t) + 0.40 * t
-    out["fb_docs"] = int(round(30.0 * (1.0 - s) + 10.0 * s))
-    out["fb_terms"] = int(round(40.0 * (1.0 - t) + 80.0 * t))
-    out["alpha"] = 0.62 * (1.0 - t) + 0.50 * t
-    out["mu"] = 9000.0 * (1.0 - t) + 2500.0 * t
-    if n >= 300000:
-        out["rm3_pool"] = min(800, 250 + n // 2000)
+    t = _clip((avg - _BLEND_LO) / (_BLEND_HI - _BLEND_LO), 0.0, 1.0)
+
+    out = {}
+    for key, lo in _SHORT.items():
+        hi = _NEWS[key]
+        if isinstance(lo, bool) or not isinstance(lo, (int, float)):
+            out[key] = hi if t >= 0.5 else lo
+        else:
+            out[key] = lo * (1.0 - t) + hi * t
+
+    # Small-collection guard: never draw feedback from more than ~1% of the
+    # corpus, and never from fewer than 5 documents. This is what fixes
+    # Cranfield (N=1400, where fb_docs=30 was expanding off 2% of the index).
+    out["fb_docs"] = int(_clip(round(out["fb_docs"]), 5, max(5, n // 100)))
+    out["fb_terms"] = int(round(out["fb_terms"]))
+    out["rm3_pool"] = int(min(round(out["rm3_pool"]), max(50, n // 4)))
     return out
 
 

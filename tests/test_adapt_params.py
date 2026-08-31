@@ -1,5 +1,5 @@
-"""Collection-adaptive knobs: short/small collections keep PARAMS."""
-from submission.retrieve import PARAMS, adapt_params
+"""Collection-adaptive knobs: short collections keep PARAMS; news uses _NEWS."""
+from submission.retrieve import PARAMS, _NEWS, adapt_params
 
 
 def test_short_small_collection_matches_shipped_params():
@@ -15,11 +15,20 @@ def test_short_small_collection_matches_shipped_params():
     assert p["rm3_pool"] == PARAMS["rm3_pool"]
 
 
-def test_long_large_collection_moves_toward_newswire_defaults():
+def test_long_large_collection_uses_newswire_operating_point():
     p = adapt_params(528155, 280.0)
-    assert p["k1"] < PARAMS["k1"]
-    assert p["b"] > PARAMS["b"]
-    assert p["mu"] < PARAMS["mu"]
-    assert p["fb_docs"] < PARAMS["fb_docs"]
-    assert p["fb_terms"] > PARAMS["fb_terms"]
-    assert p["rm3_pool"] > PARAMS["rm3_pool"]
+    assert p["k1"] == _NEWS["k1"]
+    assert p["b"] == _NEWS["b"]
+    assert p["b"] < PARAMS["b"]
+    assert p["mu"] == _NEWS["mu"]
+    assert p["fb_docs"] == _NEWS["fb_docs"]
+    assert p["fb_terms"] == _NEWS["fb_terms"]
+    assert p["rm3_pool"] == _NEWS["rm3_pool"]
+    assert p["title_bonus"] == 0.0
+
+
+def test_small_collection_caps_feedback_at_one_percent():
+    p = adapt_params(1400, 80.0)
+    assert p["fb_docs"] == 14
+    assert p["fb_docs"] <= 1400 // 100
+    assert p["rm3_pool"] <= max(50, 1400 // 4)

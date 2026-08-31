@@ -1039,20 +1039,17 @@ public:
         if (qsum <= 0.0f) return {};
         for (auto& kv : qw) kv.second /= qsum;
 
-        // On longer / larger collections, short keyword queries need more
-        // expansion; verbose queries already name the concepts. Short-document
-        // collections keep the caller’s knobs unchanged.
+        // Short keyword queries name fewer concepts than verbose ones, so
+        // lean slightly harder on feedback — but do not override the
+        // regime's term budget, which is tuned per collection shape.
         if (use_rm3 && (avg_doc_len > 160.0f || N >= 250000u)) {
             const int qn = static_cast<int>(qw.size());
             if (qn <= 4) {
-                alpha = std::min(alpha, 0.52f);
-                fb_terms = std::max(fb_terms, 60);
-                fb_docs = std::max(10, std::min(fb_docs, 15));
-                if (mu > 3000.0f) mu = 2500.0f;
-                rm3_pool = std::max(rm3_pool, 400);
+                alpha = std::min(alpha, 0.55f);
+                rm3_pool = std::max(rm3_pool, 600);
             } else if (qn >= 10) {
                 alpha = std::max(alpha, 0.65f);
-                fb_terms = std::min(fb_terms, 40);
+                fb_terms = std::min(fb_terms, 30);
             }
         }
 
