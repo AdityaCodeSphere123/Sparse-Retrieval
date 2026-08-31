@@ -118,8 +118,10 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     elif n < 20_000 and 90.0 <= avg < 120.0:
         out["use_rm3"] = True
         out["mu"] = _clip(2.0 * avg, 200.0, 800.0)
-        out["alpha"] = 0.62
-        out["fb_terms"] = 40
+        out["alpha"] = 0.55
+        out["fb_docs"] = int(_clip(5, 5, max(5, n // 100)))
+        out["fb_terms"] = 50
+        out["rm3_pool"] = int(min(200, max(50, n // 4)))
     elif n >= 200_000 and avg >= 160.0:
         out["use_rm3"] = True
         out["mu"] = _clip(2.5 * avg, 400.0, 2000.0)

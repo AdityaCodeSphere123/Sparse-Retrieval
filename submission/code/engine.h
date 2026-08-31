@@ -615,8 +615,11 @@ public:
         if (N == 0 || term_metas.empty()) return;
         // Mid-df filter first, then tf×idf. Cutting by raw tf before the
         // df band emptied RM3 rows on long documents. Cap is length-scaled.
-        const uint32_t df_band_min = 5;
-        const uint32_t df_max = std::max<uint32_t>(
+        // Small collections: keep rare terms. df_min=5 dropped the
+        // technical vocabulary RM3 needs when N is a few thousand.
+        const bool small_col = (N < 20000u);
+        const uint32_t df_band_min = small_col ? 1u : 5u;
+        const uint32_t df_max = small_col ? N : std::max<uint32_t>(
             df_band_min, static_cast<uint32_t>(buildcfg.rm3_df_frac * static_cast<float>(N)));
         std::vector<uint32_t> cnt(N, 0);
         for (uint32_t tid = 0; tid < term_metas.size(); ++tid) {
@@ -651,7 +654,9 @@ public:
             cand.reserve(b - a);
             for (uint32_t i = a; i < b; ++i) {
                 uint32_t tid = csr_tid[i];
-                if (tid >= terms_sorted.size() || STOPWORDS.count(terms_sorted[tid]))
+                if (tid >= terms_sorted.size()) continue;
+                if (small_col ? INDEX_STOPWORDS.count(terms_sorted[tid])
+                              : STOPWORDS.count(terms_sorted[tid]))
                     continue;
                 uint32_t df = term_metas[tid].df;
                 if (df < df_band_min || df > df_max) continue;
@@ -664,22 +669,23 @@ public:
             // Rank the candidate cut by tf*idf, not raw tf. On long documents
             // raw tf selects the most common words, which the df band then
             // discards -- leaving RM3 with near-empty feedback rows.
-            if (cand.size() > FWD_CANDIDATES) {
+            const uint32_t cand_cap = small_col ? 256u : FWD_CANDIDATES;
+            if (cand.size() > cand_cap) {
                 std::partial_sort(cand.begin(),
-                                  cand.begin() + static_cast<std::ptrdiff_t>(FWD_CANDIDATES),
+                                  cand.begin() + static_cast<std::ptrdiff_t>(cand_cap),
                                   cand.end(),
                                   [](const auto& x, const auto& y) {
                                       return std::get<1>(x) > std::get<1>(y);
                                   });
-                cand.resize(FWD_CANDIDATES);
+                cand.resize(cand_cap);
             }
-            // Comment at the top of this function promises length scaling;
-            // this is it. Long documents carry more usable feedback terms.
             const float lr = (d < quantized_doc_lens.size())
                 ? dequantize_doc_len(quantized_doc_lens[d]) : 1.0f;
-            const uint32_t keep_d = std::min<uint32_t>(
-                FWD_CANDIDATES,
-                static_cast<uint32_t>(fwd_keep * std::min(1.0f + lr, 3.0f) * 0.5f + 0.5f));
+            const uint32_t keep_d = small_col
+                ? 128u
+                : std::min<uint32_t>(
+                    FWD_CANDIDATES,
+                    static_cast<uint32_t>(fwd_keep * std::min(1.0f + lr, 3.0f) * 0.5f + 0.5f));
             size_t take = std::min(cand.size(), static_cast<size_t>(std::max(keep_d, 8u)));
             if (take < cand.size()) {
                 std::partial_sort(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(take),
