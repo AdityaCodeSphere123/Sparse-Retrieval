@@ -70,6 +70,9 @@ run_proxy scifact data/proxy_scifact
 run_proxy nfcorpus data/proxy_nfcorpus
 run_proxy arguana data/proxy_arguana
 run_proxy antique data/proxy_antique
+run_proxy quora data/proxy_quora
+run_proxy scidocs data/proxy_scidocs
+run_proxy vaswani data/vaswani
 
 echo
 echo "All smoke checks passed."

@@ -53,3 +53,17 @@ def test_small_fulltext_collection_enables_light_rm3():
     p = adapt_params(3600, 156.0)
     assert p["use_rm3"] is True
     assert abs(p["alpha"] - 0.72) < 1e-9
+
+
+def test_small_short_docs_enable_light_rm3():
+    p = adapt_params(3204, 33.63)
+    assert p["use_rm3"] is True
+    assert abs(p["alpha"] - 0.55) < 1e-9
+    p = adapt_params(11429, 24.84)
+    assert p["use_rm3"] is True
+    assert abs(p["alpha"] - 0.65) < 1e-9
+
+
+def test_toy_sized_collection_does_not_force_rm3():
+    p = adapt_params(20, 15.0)
+    assert p["use_rm3"] is False

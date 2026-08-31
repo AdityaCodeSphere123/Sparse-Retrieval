@@ -98,6 +98,8 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
       * N<20k and 90≤avgdl<120: on, μ≈2·avgdl, α=0.45.
       * N≥200k and avgdl≥160: on, μ≈2.5·avgdl, NEWS fb/α (Robust04-shaped).
       * N<10k and avgdl≥152: on, light (small full-text papers).
+      * 500≤N<20k and avgdl<50: on, light (classic short-doc IR).
+        avgdl<28 uses a tighter feedback set than 28–50.
       * otherwise off. Document-length queries are cut in C++.
     """
     avg = float(avgdl) if avgdl > 0 else 115.0
@@ -167,6 +169,22 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
             out["mu"] = 2500.0
             out["fb_docs"] = int(_clip(8, 5, max(5, n // 100)))
             out["fb_terms"] = 15
+            out["rm3_pool"] = int(min(150, max(50, n // 4)))
+    # Tiny classic collections (CACM, Vaswani): first-pass MICRO BM25 is
+    # already mild; a small RM3 mix still helps. Skip toy-sized N.
+    if 500 <= n < 20_000 and avg < 50.0:
+        out["use_rm3"] = True
+        if avg < 28.0:
+            out["alpha"] = 0.65
+            out["mu"] = 400.0
+            out["fb_docs"] = int(_clip(5, 5, max(5, n // 100)))
+            out["fb_terms"] = 20
+            out["rm3_pool"] = int(min(100, max(50, n // 4)))
+        else:
+            out["alpha"] = 0.55
+            out["mu"] = _clip(2.0 * avg, 150.0, 400.0)
+            out["fb_docs"] = int(_clip(8, 5, max(5, n // 100)))
+            out["fb_terms"] = 30
             out["rm3_pool"] = int(min(150, max(50, n // 4)))
     return out
 
