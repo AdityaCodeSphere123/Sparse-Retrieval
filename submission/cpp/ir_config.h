@@ -42,6 +42,14 @@ inline int build_workers() {
     return n;
 }
 
+// Cap threads on large collections so mmap + per-worker maps stay under 8 GB.
+inline int build_workers_for_docs(uint32_t n_docs) {
+    int n = build_workers();
+    if (n_docs >= 800000u) n = 1;
+    else if (n_docs >= 400000u) n = std::min(n, 2);
+    return n;
+}
+
 inline uint8_t quantize_doc_len(float len_ratio) {
     if (len_ratio <= 0.0f) return 0;
     float val = 64.0f * std::log2(1.0f + len_ratio);

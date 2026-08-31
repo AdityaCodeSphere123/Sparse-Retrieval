@@ -137,7 +137,7 @@ public:
         const uint32_t Ndocs = line_spans
             ? static_cast<uint32_t>(line_spans->size())
             : static_cast<uint32_t>(all_ids.size());
-        int W = build_workers();
+        int W = build_workers_for_docs(Ndocs);
         if (Ndocs == 0) W = 1;
         else if (static_cast<uint32_t>(W) > Ndocs) W = static_cast<int>(Ndocs);
 
@@ -630,6 +630,14 @@ public:
             // Prefer distinctive terms over raw-tf collection generalists so
             // the 24 slots actually feed RM3.
             size_t take = std::min<size_t>(pool.size(), buildcfg.fwd_terms);
+            // Longer documents have more distinct terms; keep a length-scaled
+            // slice so feedback still sees mid-idf content (capped by the
+            // candidate buffer written at ingest).
+            if (d < doc_lens.size() && doc_lens[d] > 160u) {
+                size_t extra = static_cast<size_t>(doc_lens[d] / 8u);
+                take = std::min(pool.size(), std::max(take, extra));
+                take = std::min(take, static_cast<size_t>(FWD_CANDIDATES));
+            }
             if (take < pool.size()) {
                 std::partial_sort(pool.begin(), pool.begin() + take, pool.end(),
                                   [](const auto& a, const auto& b) {
@@ -1053,6 +1061,23 @@ public:
         for (const auto& kv : qw) qsum += kv.second;
         if (qsum <= 0.0f) return {};
         for (auto& kv : qw) kv.second /= qsum;
+
+        // On longer / larger collections, short keyword queries need more
+        // expansion; verbose queries already name the concepts. Short-document
+        // collections keep the caller’s knobs unchanged.
+        if (use_rm3 && (avg_doc_len > 160.0f || N >= 250000u)) {
+            const int qn = static_cast<int>(qw.size());
+            if (qn <= 4) {
+                alpha = std::min(alpha, 0.52f);
+                fb_terms = std::max(fb_terms, 60);
+                fb_docs = std::max(10, std::min(fb_docs, 15));
+                if (mu > 3000.0f) mu = 2500.0f;
+                rm3_pool = std::max(rm3_pool, 400);
+            } else if (qn >= 10) {
+                alpha = std::max(alpha, 0.65f);
+                fb_terms = std::min(fb_terms, 40);
+            }
+        }
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
 

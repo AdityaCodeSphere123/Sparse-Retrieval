@@ -35,5 +35,8 @@ PYBIND11_MODULE(cpp_engine, m) {
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,
-             py::arg("w_title") = 0.0f, py::arg("title_bonus") = 0.0f);
+             py::arg("w_title") = 0.0f, py::arg("title_bonus") = 0.0f)
+        .def_readonly("N", &CPPEngine::N)
+        .def_readonly("avg_doc_len", &CPPEngine::avg_doc_len)
+        .def_readonly("total_corpus_tokens", &CPPEngine::total_corpus_tokens);
 }
