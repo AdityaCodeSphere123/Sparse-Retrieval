@@ -52,9 +52,14 @@ cp "${ROOT_DIR}/requirements.txt" "${BUILD_DIR}/"
 
 cp -r "${ROOT_DIR}/docs" "${BUILD_DIR}/"
 cp -r "${ROOT_DIR}/harness" "${BUILD_DIR}/"
-cp -r "${ROOT_DIR}/scripts" "${BUILD_DIR}/"
 cp -r "${ROOT_DIR}/submission" "${BUILD_DIR}/"
 cp -r "${ROOT_DIR}/tests" "${BUILD_DIR}/"
+
+# Starter scripts only (no local sweeps / proxy builders).
+mkdir -p "${BUILD_DIR}/scripts"
+for f in package_submission.sh smoke_test.sh download_full_corpus.py error_analysis.py; do
+  cp "${ROOT_DIR}/scripts/${f}" "${BUILD_DIR}/scripts/"
+done
 
 mkdir -p "${BUILD_DIR}/data"
 cp "${ROOT_DIR}/data/README.md" "${BUILD_DIR}/data/"
