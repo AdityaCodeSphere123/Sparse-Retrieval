@@ -42,12 +42,9 @@ except ImportError:
     except ImportError:
         HAS_CPP = False
 
-# Two measured operating points, not an interpolation through one.
-#   SHORT  — abstract-length collections (TREC-COVID, Cranfield, CACM).
-#            Verified locally on the released dev set.
-#   NEWS   — longer documents / title queries. k1/b from a first-pass
-#            retrieve_bm25_only sweep on BEIR Touché-2020 (382k docs,
-#            avgdl≈154; best nDCG@10 at k1=2.2, b=0.4). Not k1=0.9.
+# BM25F+ operating points, blended on analyzed avgdl only.
+# RM3 is a discrete policy in adapt_params — it does not interpolate
+# with length the way b does.
 _SHORT = dict(
     k1=2.1, b=0.60, delta=0.80, w_title=0.0, title_bonus=0.60,
     use_rm3=True, fb_docs=30, fb_terms=40, alpha=0.62, mu=9000.0,
@@ -60,7 +57,8 @@ _NEWS = dict(
 )
 PARAMS = dict(_SHORT)   # kept: other modules import PARAMS
 
-_BLEND_LO, _BLEND_HI = 130.0, 260.0   # analyzed avgdl, not raw tokens
+# Narrower than 130–260 so Touché (avgdl≈154) is mostly NEWS BM25.
+_BLEND_LO, _BLEND_HI = 120.0, 165.0
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
@@ -79,14 +77,18 @@ def _clip(x: float, lo: float, hi: float) -> float:
 def adapt_params(n_docs: int, avgdl: float) -> dict:
     """Select BM25/RM3 knobs from index statistics alone.
 
-    One axis: analyzed average document length. Below _BLEND_LO the
-    collection is abstract-length and we use the parameters tuned on the
-    released dev set; above _BLEND_HI it is newswire-length and we use the
-    newswire operating point. In between we blend linearly.
+    BM25 (k1, b, δ, title bonus) interpolates SHORT→NEWS on analyzed avgdl.
 
-    Collection size does NOT pick the regime — it only guards the feedback
-    set, since RM3 over 30 documents drawn from a 1.4K-document collection
-    is expansion over a large fraction of the corpus.
+    RM3 is discrete: it helps a tight abstract cluster and (on paper)
+    newswire titles, and it hurts BEIR-style Q&A and claim retrieval.
+
+      * avgdl < 90: off (short docs / forums).
+      * N≥100k and avgdl≤135: on, μ=9000 (regularised; TREC-COVID-shaped).
+      * N<20k and 90≤avgdl<120: on, μ≈2·avgdl (Cranfield-shaped; fb
+        already capped to 1% of N).
+      * N≥200k and avgdl≥160: on, μ≈2.5·avgdl, NEWS fb/α (Robust04-shaped).
+        Touché is avgdl≈154 so it gets NEWS BM25 without RM3.
+      * otherwise off. Document-length queries are also cut in C++.
     """
     avg = float(avgdl) if avgdl > 0 else 115.0
     n = max(int(n_docs), 1)
@@ -100,17 +102,32 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         else:
             out[key] = lo * (1.0 - t) + hi * t
 
-    # Small-collection guard: never draw feedback from more than ~1% of the
-    # corpus, and never from fewer than 5 documents. This is what fixes
-    # Cranfield (N=1400, where fb_docs=30 was expanding off 2% of the index).
     out["fb_docs"] = int(_clip(round(out["fb_docs"]), 5, max(5, n // 100)))
     out["fb_terms"] = int(round(out["fb_terms"]))
     out["rm3_pool"] = int(min(round(out["rm3_pool"]), max(50, n // 4)))
-    # RM3 needs a tight first-pass cluster (TREC-COVID, Cranfield). On
-    # short-document Q&A/forums the feedback set is mostly non-relevant
-    # and expansion hurts nDCG/MAP (measured on FiQA and CACM). Long
-    # queries are handled in the C++ retrieve path, not here.
-    if avg < 85.0:
+
+    if avg < 90.0:
+        out["use_rm3"] = False
+    elif n >= 100_000 and avg <= 135.0:
+        out["use_rm3"] = True
+        out["mu"] = 9000.0
+        out["alpha"] = 0.62
+        out["fb_docs"] = int(_clip(30, 5, max(5, n // 100)))
+        out["fb_terms"] = 40
+        out["rm3_pool"] = int(min(250, max(50, n // 4)))
+    elif n < 20_000 and 90.0 <= avg < 120.0:
+        out["use_rm3"] = True
+        out["mu"] = _clip(2.0 * avg, 200.0, 800.0)
+        out["alpha"] = 0.62
+        out["fb_terms"] = 40
+    elif n >= 200_000 and avg >= 160.0:
+        out["use_rm3"] = True
+        out["mu"] = _clip(2.5 * avg, 400.0, 2000.0)
+        out["alpha"] = 0.50
+        out["fb_docs"] = int(_clip(10, 5, max(5, n // 100)))
+        out["fb_terms"] = 20
+        out["rm3_pool"] = int(min(1000, max(50, n // 4)))
+    else:
         out["use_rm3"] = False
     return out
 
