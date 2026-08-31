@@ -114,7 +114,7 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
 
 # Already entropy-coded files still gzip somewhat; leave the tiny layout
 # files uncompressed so tests (and a debugger) can read them as-is.
-_GZIP_NAMES = frozenset({"postings.bin", "fwd.bin", "dict.bin", "rm3map.bin"})
+_GZIP_NAMES = frozenset({"postings.bin", "dict.bin"})
 
 
 def _gzip_one(index_dir: str, name: str) -> None:

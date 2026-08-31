@@ -12,7 +12,7 @@
 constexpr uint32_t FWD_CANDIDATES   = 64;
 constexpr uint32_t FWD_OFF_STRIDE   = 8;
 constexpr int      RM3_POOL         = 250;
-constexpr uint8_t  INDEX_VERSION    = 8;
+constexpr uint8_t  INDEX_VERSION    = 9;
 constexpr uint32_t TF_MAX           = 63;
 constexpr uint32_t TITLE_TF_MAX     = 3;
 constexpr uint32_t POST_VBYTE_DF    = 8;

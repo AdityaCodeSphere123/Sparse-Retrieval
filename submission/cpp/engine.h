@@ -23,7 +23,7 @@
 #include <thread>
 #include <exception>
 #include <string_view>
-#include <chrono>
+#include <cstddef>
 
 class CPPEngine {
 public:
@@ -40,15 +40,17 @@ public:
     // ---- dictionary, held as parallel sorted arrays -------------------------
     // Sorted term array + binary search rather than a hash map: on a corpus
     // with millions of distinct terms this loads faster and uses far less
-    // memory, and the array index doubles as the term id used by fwd.bin.
+    // memory, and the array index is the term id used when rebuilding RM3 rows.
     std::vector<std::string> terms_sorted;
     std::vector<TermMeta> term_metas;
-    std::vector<uint32_t> rm3_to_tid;   // dense RM3 id -> global term id
-    uint32_t fwd_off_stride = FWD_OFF_STRIDE;
 
     MmapBuffer postings_mmap;
-    MmapBuffer fwd_mmap;
-    MmapBuffer fwdoff_mmap;
+
+    // RM3 forward index, rebuilt at load from postings (not persisted).
+    std::vector<uint32_t> csr_off;   // N+1
+    std::vector<uint32_t> csr_tid;
+    std::vector<uint32_t> csr_tf;
+    uint32_t fwd_keep = 20;
 
     // ---- query-time scratch -------------------------------------------------
     // A dense accumulator plus a dirty list. Scoring touches acc[doc] directly
@@ -58,9 +60,7 @@ public:
     std::vector<uint32_t> scratch_gaps;
     std::vector<uint32_t> scratch_tfs;
     std::vector<uint32_t> scratch_titles;
-    std::vector<uint32_t> fwd_order;
     std::vector<float> fb_wts;
-    std::vector<uint32_t> rid_scratch;
 
     struct BatchFwd {
         std::vector<std::pair<uint32_t, uint32_t>> arena;
@@ -82,21 +82,19 @@ public:
     //
     // Three stages:
     //   1. SPIMI  — tokenise, buffer postings in memory, spill sorted runs.
-    //               While doing this, also spill each document's top candidate
-    //               terms (by tf) to a temp file, so the forward index costs
-    //               no second tokenisation pass over the corpus.
     //   2. MERGE  — k-way merge the runs into postings.bin, writing dict.bin
     //               front-coded in the same sorted pass.
-    //   3. FWD    — map the buffered candidate terms to term ids, drop the
-    //               ones the df filter rejects, write fwd.bin / fwdoff.bin.
+    //   3. RM3 rows — rebuild a truncated per-document term CSR from postings
+    //               (not written to disk; query load does the same walk).
     //
     template <typename Supplier>
     void build_common(Supplier&& next_doc, const std::string& index_dir,
                       const std::vector<std::pair<const char*, size_t>>* line_spans = nullptr,
                       MmapBuffer* release_corpus = nullptr) {
         postings_mmap.unmap();
-        fwd_mmap.unmap();
-        fwdoff_mmap.unmap();
+        csr_off.clear();
+        csr_tid.clear();
+        csr_tf.clear();
 
         doc_ids.clear();
         doc_lens.clear();
@@ -144,7 +142,6 @@ public:
         struct Shard {
             std::unordered_map<std::string, std::vector<DocPosting>> postings;
             std::vector<std::string> ids;
-            std::string fwdtmp_path;
             uint64_t tokens = 0;
             std::vector<uint32_t> doc_lens;
             std::exception_ptr err;
@@ -158,8 +155,6 @@ public:
                 Shard& sh = shards[static_cast<size_t>(w)];
                 sh.doc_lens.reserve(hi - lo);
                 if (line_spans) sh.ids.reserve(hi - lo);
-                sh.fwdtmp_path = index_dir + "/fwdtmp_" + std::to_string(w) + ".bin";
-                std::ofstream f_fwdtmp(sh.fwdtmp_path, std::ios::binary);
 
                 thread_local std::string tls_id, tls_text;
                 for (uint32_t doc_int_id = lo; doc_int_id < hi; ++doc_int_id) {
@@ -183,25 +178,6 @@ public:
                     sh.doc_lens.push_back(d_len);
                     sh.tokens += d_len;
 
-                    std::vector<std::pair<uint32_t, const std::string*>> cands;
-                    cands.reserve(term_data.size());
-                    for (const auto& kv : term_data) {
-                        if (STOPWORDS.count(kv.first)) continue;
-                        cands.push_back({kv.second, &kv.first});
-                    }
-                    size_t keep = std::min<size_t>(cands.size(), FWD_CANDIDATES);
-                    std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
-                                      [](const auto& a, const auto& b) { return a.first > b.first; });
-                    uint32_t n_cand = static_cast<uint32_t>(keep);
-                    f_fwdtmp.write(reinterpret_cast<const char*>(&n_cand), sizeof(n_cand));
-                    for (size_t i = 0; i < keep; ++i) {
-                        uint16_t tl = static_cast<uint16_t>(cands[i].second->size());
-                        uint16_t tf16 = static_cast<uint16_t>(std::min<uint32_t>(cands[i].first, 65535u));
-                        f_fwdtmp.write(reinterpret_cast<const char*>(&tl), sizeof(tl));
-                        f_fwdtmp.write(cands[i].second->data(), tl);
-                        f_fwdtmp.write(reinterpret_cast<const char*>(&tf16), sizeof(tf16));
-                    }
-
                     for (const auto& kv : term_data) {
                         auto ttf = title_tf.find(kv.first);
                         sh.postings[kv.first].push_back(
@@ -209,7 +185,6 @@ public:
                                        (ttf == title_tf.end()) ? 0u : ttf->second});
                     }
                 }
-                f_fwdtmp.close();
             } catch (...) {
                 shards[static_cast<size_t>(w)].err = std::current_exception();
             }
@@ -252,18 +227,6 @@ public:
             total_corpus_tokens += shards[static_cast<size_t>(w)].tokens;
         }
 
-        const std::string fwdtmp_path = index_dir + "/fwdtmp.bin";
-        {
-            std::ofstream f_fwdtmp(fwdtmp_path, std::ios::binary);
-            for (int w = 0; w < W; ++w) {
-                const std::string& p = shards[static_cast<size_t>(w)].fwdtmp_path;
-                std::ifstream in(p, std::ios::binary);
-                if (in) f_fwdtmp << in.rdbuf();
-                in.close();
-                std::remove(p.c_str());
-            }
-        }
-
         using TermRun = std::vector<std::pair<std::string, std::vector<DocPosting>>>;
         std::vector<TermRun> mem_runs(static_cast<size_t>(W));
         auto sort_shard = [&](int w) {
@@ -300,6 +263,9 @@ public:
             f.write(reinterpret_cast<const char*>(&version), 1);
             f.write(reinterpret_cast<const char*>(&tokcfg.stemmer), 1);
             f.write(reinterpret_cast<const char*>(&tokcfg.remove_stop), 1);
+            uint32_t fk = buildcfg.fwd_terms;
+            f.write(reinterpret_cast<const char*>(&fk), sizeof(fk));
+            f.write(reinterpret_cast<const char*>(&buildcfg.rm3_df_frac), sizeof(float));
         }
 
         // -------- docmap.bin / doclens.bin ---------------------------------
@@ -313,28 +279,98 @@ public:
                     if (id.size() != id_len) { id_len = 0; break; }
                 }
             }
-            f.write(reinterpret_cast<const char*>(&id_len), sizeof(id_len));
-            if (id_len > 0) {
-                // TREC-COVID cord_uids are all 8 bytes — one length in the
-                // header, then packed ids. Saves a uint16 per document.
-                for (const auto& id : doc_ids) f.write(id.data(), id_len);
-            } else {
-                // Variable-width ids (toy set): front-code against the
-                // previous id, same codec as dict.bin.
-                std::vector<uint8_t> buf;
-                buf.reserve(static_cast<size_t>(N) * 8);
-                std::string prev;
-                for (const auto& id : doc_ids) {
-                    size_t prefix = 0;
-                    size_t maxp = std::min(prev.size(), id.size());
-                    while (prefix < maxp && prev[prefix] == id[prefix]) prefix++;
-                    if (prefix > 255) prefix = 255;
-                    write_vbyte(buf, static_cast<uint32_t>(prefix));
-                    write_vbyte(buf, static_cast<uint32_t>(id.size() - prefix));
-                    buf.insert(buf.end(), id.begin() + prefix, id.end());
-                    prev = id;
+
+            bool packed = false;
+            std::string alphabet;
+            int bits = 0;
+            if (id_len > 0 && id_len <= 12) {
+                bool seen[256] = {};
+                for (const auto& id : doc_ids)
+                    for (unsigned char c : id) seen[c] = true;
+                for (int c = 0; c < 256; ++c)
+                    if (seen[c]) alphabet.push_back(static_cast<char>(c));
+                const uint64_t A = alphabet.size();
+                if (A >= 2 && A <= 64) {
+                    uint64_t span = 1;
+                    bool overflow = false;
+                    for (uint16_t i = 0; i < id_len; ++i) {
+                        if (span > (~0ull) / A) { overflow = true; break; }
+                        span *= A;
+                    }
+                    if (!overflow && span > 0) {
+                        uint64_t maxc = span - 1;
+                        bits = 0;
+                        for (uint64_t m = maxc; m; m >>= 1) ++bits;
+                        const size_t packed_bytes = alphabet.size() + 2 +
+                            (static_cast<size_t>(bits) * N + 7) / 8;
+                        const size_t raw_bytes = static_cast<size_t>(id_len) * N;
+                        if (bits > 0 && bits <= 64 && packed_bytes < raw_bytes)
+                            packed = true;
+                    }
                 }
-                f.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+            }
+
+            if (packed) {
+                uint16_t flag = static_cast<uint16_t>(id_len) | 0x8000u;
+                f.write(reinterpret_cast<const char*>(&flag), sizeof(flag));
+                uint8_t asz = static_cast<uint8_t>(alphabet.size());
+                uint8_t bw = static_cast<uint8_t>(bits);
+                f.write(reinterpret_cast<const char*>(&asz), 1);
+                f.write(alphabet.data(), asz);
+                f.write(reinterpret_cast<const char*>(&bw), 1);
+                int rank[256];
+                for (int c = 0; c < 256; ++c) rank[c] = -1;
+                for (size_t i = 0; i < alphabet.size(); ++i)
+                    rank[static_cast<unsigned char>(alphabet[i])] = static_cast<int>(i);
+                const uint64_t A = alphabet.size();
+                std::vector<uint8_t> body;
+                body.reserve((static_cast<size_t>(bits) * N + 7) / 8 + 8);
+                uint64_t buf = 0;
+                int nbuf = 0;
+                auto emit = [&](uint64_t v, int w) {
+                    while (w > 0) {
+                        int take = std::min(w, 64 - nbuf);
+                        uint64_t mask = (take == 64) ? ~0ull : ((1ull << take) - 1ull);
+                        buf |= (v & mask) << nbuf;
+                        nbuf += take;
+                        v >>= take;
+                        w -= take;
+                        while (nbuf >= 8) {
+                            body.push_back(static_cast<uint8_t>(buf));
+                            buf >>= 8;
+                            nbuf -= 8;
+                        }
+                    }
+                };
+                for (const auto& id : doc_ids) {
+                    uint64_t code = 0;
+                    for (unsigned char c : id)
+                        code = code * A + static_cast<uint64_t>(rank[c]);
+                    emit(code, bits);
+                }
+                if (nbuf) body.push_back(static_cast<uint8_t>(buf));
+                f.write(reinterpret_cast<const char*>(body.data()),
+                        static_cast<std::streamsize>(body.size()));
+            } else {
+                f.write(reinterpret_cast<const char*>(&id_len), sizeof(id_len));
+                if (id_len > 0) {
+                    for (const auto& id : doc_ids) f.write(id.data(), id_len);
+                } else {
+                    std::vector<uint8_t> buf;
+                    buf.reserve(static_cast<size_t>(N) * 8);
+                    std::string prev;
+                    for (const auto& id : doc_ids) {
+                        size_t prefix = 0;
+                        size_t maxp = std::min(prev.size(), id.size());
+                        while (prefix < maxp && prev[prefix] == id[prefix]) prefix++;
+                        if (prefix > 255) prefix = 255;
+                        write_vbyte(buf, static_cast<uint32_t>(prefix));
+                        write_vbyte(buf, static_cast<uint32_t>(id.size() - prefix));
+                        buf.insert(buf.end(), id.begin() + prefix, id.end());
+                        prev = id;
+                    }
+                    f.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+                }
             }
         }
         {
@@ -488,14 +524,13 @@ public:
         mem_runs.clear();
         stamp("merge", t0);
 
-        // -------- stage 3: forward index -----------------------------------
-        // We need the dictionary in memory to resolve term ids and apply the
-        // df filter, so load what we just wrote and then stream fwdtmp.bin.
+        // -------- stage 3: RM3 CSR from postings (not persisted) -----------
         load_dictionary(index_dir);
         for (size_t i = 0; i < term_metas.size() && i < cfs_in_order.size(); ++i)
             term_metas[i].cf = cfs_in_order[i];
-        write_forward_index(index_dir, fwdtmp_path);
-        std::remove(fwdtmp_path.c_str());
+        postings_mmap.map_file(index_dir + "/postings.bin");
+        fwd_keep = buildcfg.fwd_terms;
+        rebuild_forward();
         stamp("forward", t0);
     }
 
@@ -534,149 +569,132 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Forward index: doc -> its top buildcfg.fwd_terms terms (term id + tf),
-    // restricted to terms RM3 would ever consider as expansion candidates.
-    //
-    // This exists purely so RM3 does not have to find "which terms occur in
-    // these 10 feedback documents" by scanning the entire dictionary and
-    // decoding every postings list, which is O(vocabulary) per query.
+    // RM3 forward rows: rebuilt from postings at load (nothing extra on disk).
+    // Keep the mid-df terms in each document, ranked by tf*idf, capped at
+    // fwd_keep (length-scaled for long docs).
     // -----------------------------------------------------------------------
-    void write_forward_index(const std::string& index_dir, const std::string& fwdtmp_path) {
-        std::ifstream f_in(fwdtmp_path, std::ios::binary);
-        std::ofstream f_fwd(index_dir + "/fwd.bin", std::ios::binary);
-        std::ofstream f_off(index_dir + "/fwdoff.bin", std::ios::binary);
+    template <typename Fn>
+    void visit_postings(uint32_t tid, Fn&& fn) {
+        if (tid >= term_metas.size() || !postings_mmap.data) return;
+        const TermMeta& meta = term_metas[tid];
+        if (meta.df == 0) return;
+        const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
+        const uint32_t df = meta.df;
+        if (df < POST_VBYTE_DF) {
+            uint32_t current_doc = 0;
+            for (uint32_t i = 0; i < df; ++i) {
+                uint32_t coded = read_vbyte(ptr);
+                current_doc += coded >> 1;
+                uint8_t packed = (coded & 1u) ? 1 : *ptr++;
+                uint32_t tf = packed & 0x3F;
+                fn(current_doc, tf);
+            }
+        } else {
+            const uint8_t* p_ef = s9_skip(ptr, df);
+            if (meta.has_title) {
+                uint32_t n_title_hits = read_vbyte(p_ef);
+                for (uint32_t h = 0; h < n_title_hits; ++h) (void)read_vbyte(p_ef);
+            }
+            S9Reader s9; s9.init(ptr);
+            EFReader ef; ef.init(p_ef);
+            for (uint32_t i = 0; i < df; ++i) {
+                const uint32_t tf_raw = s9.next();
+                const uint32_t current_doc = ef.next();
+                fn(current_doc, tf_raw + 1u);
+            }
+        }
+    }
 
-        const uint32_t df_min = 5;
+    void rebuild_forward() {
+        csr_off.clear();
+        csr_tid.clear();
+        csr_tf.clear();
+        if (N == 0 || term_metas.empty()) return;
+        // Ingest used to keep each doc's top-64 tfs (any df), then the RM3
+        // df band, then tf×idf. Rebuild the same cuts from postings.
+        const uint32_t df_band_min = 5;
         const uint32_t df_max = std::max<uint32_t>(
-            df_min, static_cast<uint32_t>(buildcfg.rm3_df_frac * static_cast<float>(N)));
-
-        // Dense RM3 id space: only terms that can appear in fwd.bin get an
-        // id. Assigned in dictionary (tid) order so rm3map.bin can delta-code
-        // tids with an unsigned gap. Ascending-df order compresses Elias-Fano
-        // rids slightly more but needs a zigzag map; unsigned deltas are the
-        // format the rest of the engine already uses.
-        std::vector<int32_t> tid_to_rm3(term_metas.size(), -1);
-        rm3_to_tid.clear();
+            df_band_min, static_cast<uint32_t>(buildcfg.rm3_df_frac * static_cast<float>(N)));
+        std::vector<uint32_t> cnt(N, 0);
         for (uint32_t tid = 0; tid < term_metas.size(); ++tid) {
-            uint32_t df = term_metas[tid].df;
-            if (df >= df_min && df <= df_max) {
-                tid_to_rm3[tid] = static_cast<int32_t>(rm3_to_tid.size());
-                rm3_to_tid.push_back(tid);
-            }
+            uint64_t cf = 0;
+            visit_postings(tid, [&](uint32_t d, uint32_t tf) {
+                if (d < N) ++cnt[d];
+                cf += tf;
+            });
+            term_metas[tid].cf = cf;
         }
-
-        {
-            std::ofstream f_map(index_dir + "/rm3map.bin", std::ios::binary);
-            uint32_t M = static_cast<uint32_t>(rm3_to_tid.size());
-            f_map.write(reinterpret_cast<const char*>(&M), sizeof(M));
-            std::vector<uint8_t> mapbuf;
-            mapbuf.reserve(M * 2);
-            uint32_t prev = 0;
-            for (uint32_t tid : rm3_to_tid) {
-                write_vbyte(mapbuf, tid - prev);
-                write_vbyte64(mapbuf, term_metas[tid].cf - term_metas[tid].df);
-                prev = tid;
-            }
-            f_map.write(reinterpret_cast<const char*>(mapbuf.data()), mapbuf.size());
+        csr_off.assign(static_cast<size_t>(N) + 1, 0);
+        for (uint32_t d = 0; d < N; ++d) csr_off[d + 1] = csr_off[d] + cnt[d];
+        csr_tid.assign(csr_off[N], 0);
+        csr_tf.assign(csr_off[N], 0);
+        std::vector<uint32_t> cursor(csr_off.begin(), csr_off.end() - 1);
+        for (uint32_t tid = 0; tid < term_metas.size(); ++tid) {
+            visit_postings(tid, [&](uint32_t d, uint32_t tf) {
+                if (d >= N) return;
+                uint32_t at = cursor[d]++;
+                csr_tid[at] = tid;
+                csr_tf[at] = tf;
+            });
         }
-
-        fwd_off_stride = FWD_OFF_STRIDE;
-        f_off.write(reinterpret_cast<const char*>(&N), sizeof(N));
-        f_off.write(reinterpret_cast<const char*>(&fwd_off_stride), sizeof(fwd_off_stride));
-
-        uint32_t offset = 0;
-        std::vector<uint8_t> out;
-        std::vector<std::pair<uint32_t, uint32_t>> kept;   // (rm3_id, tf)
-        std::vector<std::tuple<float, uint32_t, uint32_t>> pool;  // (tf*idf, rid, tf)
-        std::vector<uint32_t> ef_scratch;
-        std::vector<uint8_t> ef_block;
-        std::string term;
-
-        std::unordered_map<std::string, uint32_t> term_to_tid;
-        term_to_tid.reserve(terms_sorted.size() * 2 + 1);
-        for (uint32_t i = 0; i < terms_sorted.size(); ++i)
-            term_to_tid.emplace(terms_sorted[i], i);
-
+        std::vector<uint32_t> new_off(static_cast<size_t>(N) + 1, 0);
+        std::vector<uint32_t> new_tid, new_tf;
+        new_tid.reserve(static_cast<size_t>(N) * std::min<uint32_t>(fwd_keep, 32));
+        new_tf.reserve(new_tid.capacity());
+        std::vector<std::tuple<uint32_t, float, uint32_t>> cand;  // tf, tf*idf, tid
         for (uint32_t d = 0; d < N; ++d) {
-            if (d % fwd_off_stride == 0)
-                f_off.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
-
-            uint32_t n_cand = 0;
-            f_in.read(reinterpret_cast<char*>(&n_cand), sizeof(n_cand));
-            pool.clear();
-
-            for (uint32_t i = 0; i < n_cand; ++i) {
-                uint16_t tl, tf16;
-                f_in.read(reinterpret_cast<char*>(&tl), sizeof(tl));
-                term.resize(tl);
-                f_in.read(&term[0], tl);
-                f_in.read(reinterpret_cast<char*>(&tf16), sizeof(tf16));
-
-                // Consume every candidate — do not break early or the next
-                // document reads from the wrong offset.
-                auto it = term_to_tid.find(term);
-                if (it == term_to_tid.end()) continue;
-                int32_t tid = static_cast<int32_t>(it->second);
-                int32_t rid = tid_to_rm3[static_cast<uint32_t>(tid)];
-                if (rid < 0) continue;
-                uint32_t df = term_metas[static_cast<uint32_t>(tid)].df;
+            uint32_t a = csr_off[d], b = csr_off[d + 1];
+            cand.clear();
+            cand.reserve(b - a);
+            for (uint32_t i = a; i < b; ++i) {
+                uint32_t tid = csr_tid[i];
+                if (tid >= terms_sorted.size() || STOPWORDS.count(terms_sorted[tid]))
+                    continue;
+                uint32_t tf = csr_tf[i];
+                uint32_t df = term_metas[tid].df;
                 float idf = (df > 0 && N > 0)
                     ? std::log(static_cast<float>(N) / static_cast<float>(df))
                     : 0.0f;
-                pool.push_back({static_cast<float>(tf16) * idf,
-                                static_cast<uint32_t>(rid), tf16});
+                cand.push_back({tf, static_cast<float>(tf) * idf, tid});
             }
-
-            // Prefer distinctive terms over raw-tf collection generalists so
-            // the 24 slots actually feed RM3.
-            size_t take = std::min<size_t>(pool.size(), buildcfg.fwd_terms);
-            // Longer documents have more distinct terms; keep a length-scaled
-            // slice so feedback still sees mid-idf content (capped by the
-            // candidate buffer written at ingest).
-            if (d < doc_lens.size() && doc_lens[d] > 160u) {
-                size_t extra = static_cast<size_t>(doc_lens[d] / 8u);
-                take = std::min(pool.size(), std::max(take, extra));
-                take = std::min(take, static_cast<size_t>(FWD_CANDIDATES));
-            }
-            if (take < pool.size()) {
-                std::partial_sort(pool.begin(), pool.begin() + take, pool.end(),
-                                  [](const auto& a, const auto& b) {
-                                      return std::get<0>(a) > std::get<0>(b);
+            if (cand.size() > FWD_CANDIDATES) {
+                std::partial_sort(cand.begin(),
+                                  cand.begin() + static_cast<std::ptrdiff_t>(FWD_CANDIDATES),
+                                  cand.end(),
+                                  [](const auto& x, const auto& y) {
+                                      return std::get<0>(x) > std::get<0>(y);
                                   });
-                pool.resize(take);
+                cand.resize(FWD_CANDIDATES);
             }
-            kept.clear();
-            kept.reserve(pool.size());
-            for (const auto& t : pool) kept.push_back({std::get<1>(t), std::get<2>(t)});
-            std::sort(kept.begin(), kept.end());
-
-            // count | ef_len | Simple-9 tfs | Elias-Fano rids.
-            // Splitting streams avoids stuffing 3 tf bits into a ~16K mean
-            // rid gap (which pushed almost every varint over a byte boundary).
-            // Simple-9 keeps the real tf for P(w|D); nibbles capped at 15
-            // cost ~0.03 nDCG on this collection.
-            out.clear();
-            const uint32_t nk = static_cast<uint32_t>(kept.size());
-            write_vbyte(out, nk);
-            ef_scratch.clear();
-            std::vector<uint32_t> tfs_u32;
-            tfs_u32.reserve(nk);
-            for (uint32_t i = 0; i < nk; ++i) {
-                ef_scratch.push_back(kept[i].first);
-                tfs_u32.push_back(kept[i].second);
+            size_t w = 0;
+            for (size_t i = 0; i < cand.size(); ++i) {
+                uint32_t df = term_metas[std::get<2>(cand[i])].df;
+                if (df >= df_band_min && df <= df_max) cand[w++] = cand[i];
             }
-            std::vector<uint8_t> tf_block;
-            if (nk) simple9_pack(tf_block, tfs_u32.data(), nk);
-            ef_block.clear();
-            if (nk) ef_pack(ef_block, ef_scratch.data(), nk);
-            write_vbyte(out, static_cast<uint32_t>(ef_block.size()));
-            out.insert(out.end(), tf_block.begin(), tf_block.end());
-            out.insert(out.end(), ef_block.begin(), ef_block.end());
-            f_fwd.write(reinterpret_cast<const char*>(out.data()), out.size());
-            offset += static_cast<uint32_t>(out.size());
+            cand.resize(w);
+            size_t take = std::min(cand.size(), static_cast<size_t>(fwd_keep));
+            if (take < cand.size()) {
+                std::partial_sort(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(take),
+                                  cand.end(),
+                                  [](const auto& x, const auto& y) {
+                                      return std::get<1>(x) > std::get<1>(y);
+                                  });
+                cand.resize(take);
+            }
+            std::sort(cand.begin(), cand.end(),
+                      [](const auto& x, const auto& y) {
+                          return std::get<2>(x) < std::get<2>(y);
+                      });
+            new_off[d] = static_cast<uint32_t>(new_tid.size());
+            for (const auto& t : cand) {
+                new_tid.push_back(std::get<2>(t));
+                new_tf.push_back(std::get<0>(t));
+            }
         }
-        const uint8_t fwd_pad[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        f_fwd.write(reinterpret_cast<const char*>(fwd_pad), 8);
+        new_off[N] = static_cast<uint32_t>(new_tid.size());
+        csr_off.swap(new_off);
+        csr_tid.swap(new_tid);
+        csr_tf.swap(new_tf);
     }
 
     // =======================================================================
@@ -722,29 +740,6 @@ public:
         }
     }
 
-    void load_rm3_map(const std::string& index_dir) {
-        rm3_to_tid.clear();
-        std::ifstream f(index_dir + "/rm3map.bin", std::ios::binary | std::ios::ate);
-        if (!f.is_open()) return;
-        std::streamsize sz = f.tellg();
-        if (sz < static_cast<std::streamsize>(sizeof(uint32_t))) return;
-        f.seekg(0);
-        std::vector<uint8_t> buf(static_cast<size_t>(sz));
-        f.read(reinterpret_cast<char*>(buf.data()), sz);
-        uint32_t M = 0;
-        std::memcpy(&M, buf.data(), sizeof(M));
-        rm3_to_tid.resize(M);
-        const uint8_t* p = buf.data() + sizeof(M);
-        uint32_t tid = 0;
-        for (uint32_t i = 0; i < M; ++i) {
-            tid += read_vbyte(p);
-            rm3_to_tid[i] = tid;
-            uint64_t cf_extra = read_vbyte64(p);
-            if (tid < term_metas.size())
-                term_metas[tid].cf = cf_extra + term_metas[tid].df;
-        }
-    }
-
     void load_index(const std::string& index_dir) {
         {
             // Query tokenisation must match index tokenisation exactly.
@@ -759,6 +754,9 @@ public:
                 }
                 f.read(reinterpret_cast<char*>(&tokcfg.stemmer), 1);
                 f.read(reinterpret_cast<char*>(&tokcfg.remove_stop), 1);
+                f.read(reinterpret_cast<char*>(&fwd_keep), sizeof(fwd_keep));
+                f.read(reinterpret_cast<char*>(&buildcfg.rm3_df_frac), sizeof(float));
+                if (fwd_keep == 0) fwd_keep = 20;
             }
         }
         {
@@ -767,7 +765,45 @@ public:
             uint16_t id_len = 0;
             f.read(reinterpret_cast<char*>(&id_len), sizeof(id_len));
             doc_ids.assign(N, std::string());
-            if (id_len > 0) {
+            if (id_len & 0x8000u) {
+                const uint16_t L = id_len & 0x7FFFu;
+                uint8_t asz = 0, bw = 0;
+                f.read(reinterpret_cast<char*>(&asz), 1);
+                std::string alphabet(asz, '\0');
+                if (asz) f.read(&alphabet[0], asz);
+                f.read(reinterpret_cast<char*>(&bw), 1);
+                std::ifstream::pos_type here = f.tellg();
+                f.seekg(0, std::ios::end);
+                std::streamsize rest = f.tellg() - here;
+                f.seekg(here);
+                std::vector<uint8_t> body(static_cast<size_t>(rest));
+                if (rest) f.read(reinterpret_cast<char*>(body.data()), rest);
+                const uint64_t A = asz;
+                uint64_t bitpos = 0;
+                auto get_bits = [&](int w) -> uint64_t {
+                    uint64_t v = 0;
+                    int got = 0;
+                    while (got < w) {
+                        uint64_t byte = body[bitpos / 8];
+                        int off = static_cast<int>(bitpos % 8);
+                        int take = std::min(w - got, 8 - off);
+                        uint64_t chunk = (byte >> off) & ((take == 8) ? 0xFFull : ((1ull << take) - 1ull));
+                        v |= chunk << got;
+                        bitpos += static_cast<uint64_t>(take);
+                        got += take;
+                    }
+                    return v;
+                };
+                for (uint32_t i = 0; i < N; ++i) {
+                    uint64_t code = get_bits(bw);
+                    std::string id(L, ' ');
+                    for (int k = static_cast<int>(L) - 1; k >= 0; --k) {
+                        id[static_cast<size_t>(k)] = alphabet[static_cast<size_t>(code % A)];
+                        code /= A;
+                    }
+                    doc_ids[i] = std::move(id);
+                }
+            } else if (id_len > 0) {
                 for (uint32_t i = 0; i < N; ++i) {
                     doc_ids[i].resize(id_len);
                     f.read(&doc_ids[i][0], id_len);
@@ -810,15 +846,9 @@ public:
         }
 
         load_dictionary(index_dir);
-        load_rm3_map(index_dir);
 
         postings_mmap.map_file(index_dir + "/postings.bin");
-        fwd_mmap.map_file(index_dir + "/fwd.bin");
-        fwdoff_mmap.map_file(index_dir + "/fwdoff.bin");
-        if (fwdoff_mmap.data && fwdoff_mmap.length >= 8) {
-            std::memcpy(&fwd_off_stride, fwdoff_mmap.data + sizeof(uint32_t), sizeof(uint32_t));
-            if (fwd_off_stride == 0) fwd_off_stride = 1;
-        }
+        rebuild_forward();
 
         acc.assign(N, 0.0f);
         touched.clear();
@@ -947,69 +977,16 @@ public:
         out.start.assign(n, 0);
         out.len.assign(n, 0);
         out.arena.clear();
-        if (!fwd_mmap.data || !fwdoff_mmap.data || fwdoff_mmap.length < 8) return;
+        if (csr_off.size() != static_cast<size_t>(N) + 1) return;
         out.arena.reserve(n * 24);
-
-        const uint32_t* offs = reinterpret_cast<const uint32_t*>(
-            fwdoff_mmap.data + 2 * sizeof(uint32_t));
-        const uint32_t n_chk = static_cast<uint32_t>(
-            (fwdoff_mmap.length - 2 * sizeof(uint32_t)) / sizeof(uint32_t));
-        const uint32_t stride = fwd_off_stride ? fwd_off_stride : 1;
-
-        auto skip_record = [](const uint8_t*& p) {
-            uint32_t cnt    = read_vbyte(p);
-            uint32_t ef_len = read_vbyte(p);
-            if (cnt) p = s9_skip(p, cnt);
-            p += ef_len;
-        };
-
-        fwd_order.resize(n);
-        for (size_t i = 0; i < n; ++i) fwd_order[i] = static_cast<uint32_t>(i);
-        std::sort(fwd_order.begin(), fwd_order.end(),
-                  [&target_docs](uint32_t a, uint32_t b) {
-                      return target_docs[a] < target_docs[b];
-                  });
-
-        uint32_t cur_chk = UINT32_MAX;
-        uint32_t cur_sub = 0;
-        const uint8_t* p = nullptr;
-
-        for (uint32_t pos : fwd_order) {
+        for (size_t pos = 0; pos < n; ++pos) {
             const uint32_t d = target_docs[pos];
             if (d >= N) continue;
-            const uint32_t chk = d / stride, sub = d % stride;
-            if (chk >= n_chk) continue;
-            if (chk != cur_chk || sub < cur_sub) {
-                p = fwd_mmap.data + offs[chk];
-                cur_chk = chk;
-                cur_sub = 0;
-            }
-            while (cur_sub < sub) { skip_record(p); ++cur_sub; }
-
-            const uint32_t cnt    = read_vbyte(p);
-            const uint32_t ef_len = read_vbyte(p);
-            const uint8_t* tfp    = p;
-            if (cnt) p = s9_skip(p, cnt);
-            const uint8_t* efp    = p;
-            p += ef_len;
-            ++cur_sub;
-
-            if (!cnt) continue;
-            rid_scratch.resize(cnt);
-            const uint8_t* efc = efp;
-            ef_unpack_docs(efc, rid_scratch.data(), cnt);
-            S9Reader s9; s9.init(tfp);
-
+            const uint32_t a = csr_off[d], b = csr_off[d + 1];
             out.start[pos] = static_cast<uint32_t>(out.arena.size());
-            uint32_t kept = 0;
-            for (uint32_t i = 0; i < cnt; ++i) {
-                const uint32_t rid = rid_scratch[i];
-                const uint32_t tf  = s9.next();
-                if (rid >= rm3_to_tid.size()) continue;
-                out.arena.push_back({rm3_to_tid[rid], tf});
-                ++kept;
-            }
-            out.len[pos] = kept;
+            for (uint32_t i = a; i < b; ++i)
+                out.arena.push_back({csr_tid[i], csr_tf[i]});
+            out.len[pos] = b - a;
         }
     }
 
