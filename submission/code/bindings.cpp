@@ -3,6 +3,7 @@
 #include "ir_config.h"
 #include "codecs.h"
 #include "engine.h"
+#include "analysis.h"
 
 namespace py = pybind11;
 
@@ -10,6 +11,16 @@ PYBIND11_MODULE(cpp_engine, m) {
     m.doc() = "From-scratch inverted index with BM25F+ scoring and RM3 query expansion";
     m.def("check_codecs", &check_codecs,
           "S9Reader/EFReader/s9_skip must match simple9_unpack/ef_unpack_docs");
+    m.def("tokenize", [](const std::string& text, bool remove_stop) {
+            TokenizerCfg cfg;
+            cfg.remove_stop = remove_stop ? 1 : 0;
+            auto toks = cpp_tokenize(text, cfg);
+            std::vector<std::string> out;
+            out.reserve(toks.size());
+            for (const auto& t : toks) out.push_back(t.first);
+            return out;
+        }, py::arg("text"), py::arg("remove_stop") = true,
+        "Same analysis chain as retrieve(): lowercase, alnum, drop length-1, optional stops, Porter.");
     py::class_<CPPEngine>(m, "CPPEngine")
         .def(py::init<>())
         .def("build_index", &CPPEngine::build_index, py::arg("corpus"), py::arg("index_dir"))

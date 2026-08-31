@@ -12,7 +12,7 @@
 constexpr uint32_t FWD_CANDIDATES   = 64;
 constexpr uint32_t FWD_OFF_STRIDE   = 8;
 constexpr int      RM3_POOL         = 250;
-constexpr uint8_t  INDEX_VERSION    = 9;
+constexpr uint8_t  INDEX_VERSION    = 10;
 constexpr uint32_t TF_MAX           = 63;
 constexpr uint32_t TITLE_TF_MAX     = 3;
 constexpr uint32_t POST_VBYTE_DF    = 8;
@@ -70,8 +70,8 @@ struct TermMeta {
 
 struct DocPosting {
     uint32_t doc_id;
-    uint32_t tf;
-    uint32_t title_tf = 0;
+    uint16_t tf;        // clamped to TF_MAX (63) at merge
+    uint16_t title_tf;  // clamped to TITLE_TF_MAX (3) at merge
 };
 
 inline bool build_timing_enabled() {

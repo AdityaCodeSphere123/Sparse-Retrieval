@@ -18,6 +18,7 @@ def test_short_small_collection_matches_shipped_params():
 def test_long_large_collection_uses_newswire_operating_point():
     p = adapt_params(528155, 280.0)
     assert p["k1"] == _NEWS["k1"]
+    assert abs(_NEWS["k1"] - 2.2) < 1e-9
     assert p["b"] == _NEWS["b"]
     assert p["b"] < PARAMS["b"]
     assert p["mu"] == _NEWS["mu"]

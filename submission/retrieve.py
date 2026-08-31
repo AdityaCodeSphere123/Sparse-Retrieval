@@ -45,15 +45,16 @@ except ImportError:
 # Two measured operating points, not an interpolation through one.
 #   SHORT  — abstract-length collections (TREC-COVID, Cranfield, CACM).
 #            Verified locally on the released dev set.
-#   NEWS   — newswire-length collections (Robust04-style): long documents,
-#            2-3 term title topics, N in the 10^5-10^6 range.
+#   NEWS   — longer documents / title queries. k1/b from a first-pass
+#            retrieve_bm25_only sweep on BEIR Touché-2020 (382k docs,
+#            avgdl≈154; best nDCG@10 at k1=2.2, b=0.4). Not k1=0.9.
 _SHORT = dict(
     k1=2.1, b=0.60, delta=0.80, w_title=0.0, title_bonus=0.60,
     use_rm3=True, fb_docs=30, fb_terms=40, alpha=0.62, mu=9000.0,
     rm3_pool=250, fb_temp=20.0, use_fusion=False,
 )
 _NEWS = dict(
-    k1=0.9, b=0.40, delta=0.70, w_title=0.0, title_bonus=0.0,
+    k1=2.2, b=0.40, delta=0.70, w_title=0.0, title_bonus=0.0,
     use_rm3=True, fb_docs=10, fb_terms=20, alpha=0.50, mu=1000.0,
     rm3_pool=1000, fb_temp=20.0, use_fusion=False,
 )
@@ -105,6 +106,12 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     out["fb_docs"] = int(_clip(round(out["fb_docs"]), 5, max(5, n // 100)))
     out["fb_terms"] = int(round(out["fb_terms"]))
     out["rm3_pool"] = int(min(round(out["rm3_pool"]), max(50, n // 4)))
+    # RM3 needs a tight first-pass cluster (TREC-COVID, Cranfield). On
+    # short-document Q&A/forums the feedback set is mostly non-relevant
+    # and expansion hurts nDCG/MAP (measured on FiQA and CACM). Long
+    # queries are handled in the C++ retrieve path, not here.
+    if avg < 85.0:
+        out["use_rm3"] = False
     return out
 
 
@@ -218,20 +225,31 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     return bm25.score(query, k, k1=_ACTIVE["k1"], b=_ACTIVE["b"], delta=_ACTIVE["delta"])
 
 
-def retrieve_bm25_only(query: str, k: int = 10) -> List[Tuple[str, float]]:
+def retrieve_bm25_only(
+    query: str,
+    k: int = 10,
+    k1: Optional[float] = None,
+    b: Optional[float] = None,
+    delta: Optional[float] = None,
+    w_title: Optional[float] = None,
+    title_bonus: Optional[float] = None,
+) -> List[Tuple[str, float]]:
     """First-pass BM25F+ only, with no relevance feedback.
 
-    Not part of the harness interface — this is for the ablation table in the
-    report (Boolean/VSM vs. BM25 vs. full system) and for the k1/b sweep,
-    where you want to isolate first-pass scoring from the RM3 stage.
+    Optional k1/b/… override _ACTIVE so a parameter sweep can isolate the
+    first pass from RM3 without mutating load-time knobs.
     """
+    k1 = _ACTIVE["k1"] if k1 is None else k1
+    b = _ACTIVE["b"] if b is None else b
+    delta = _ACTIVE["delta"] if delta is None else delta
+    w_title = _ACTIVE["w_title"] if w_title is None else w_title
+    title_bonus = _ACTIVE["title_bonus"] if title_bonus is None else title_bonus
     if HAS_CPP:
         if _CPP_ENGINE is None:
             raise RuntimeError("load_index() must be called before retrieve()")
         return _CPP_ENGINE.retrieve_bm25(
-            query, k, _ACTIVE["k1"], _ACTIVE["b"], _ACTIVE["delta"],
-            _ACTIVE["w_title"], _ACTIVE["title_bonus"]
+            query, k, k1, b, delta, w_title, title_bonus
         )
     if _INDEX is None:
         raise RuntimeError("load_index() must be called before retrieve()")
-    return bm25.score(query, k, k1=_ACTIVE["k1"], b=_ACTIVE["b"], delta=_ACTIVE["delta"])
+    return bm25.score(query, k, k1=k1, b=b, delta=delta)

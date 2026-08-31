@@ -181,8 +181,11 @@ public:
                     for (const auto& kv : term_data) {
                         auto ttf = title_tf.find(kv.first);
                         sh.postings[kv.first].push_back(
-                            DocPosting{doc_int_id, kv.second,
-                                       (ttf == title_tf.end()) ? 0u : ttf->second});
+                            DocPosting{doc_int_id,
+                                       static_cast<uint16_t>(std::min(kv.second, 65535u)),
+                                       static_cast<uint16_t>(
+                                           (ttf == title_tf.end()) ? 0u
+                                                                  : std::min(ttf->second, 65535u))});
                     }
                 }
             } catch (...) {
@@ -456,9 +459,9 @@ public:
             uint32_t n_title_hits = 0;
             for (uint32_t i = 0; i < df; ++i) {
                 scratch_gaps[i] = merged[i].doc_id;
-                uint32_t tf = std::min(merged[i].tf, TF_MAX);
+                uint32_t tf = std::min<uint32_t>(merged[i].tf, TF_MAX);
                 scratch_tfs[i] = tf ? tf - 1 : 0;   // Simple-9 stores tf-1
-                scratch_titles[i] = std::min(merged[i].title_tf, TITLE_TF_MAX);
+                scratch_titles[i] = std::min<uint32_t>(merged[i].title_tf, TITLE_TF_MAX);
                 if (scratch_titles[i]) { has_title = 1; ++n_title_hits; }
             }
             if (df < POST_VBYTE_DF) {
@@ -610,8 +613,8 @@ public:
         csr_tid.clear();
         csr_tf.clear();
         if (N == 0 || term_metas.empty()) return;
-        // Ingest used to keep each doc's top-64 tfs (any df), then the RM3
-        // df band, then tf×idf. Rebuild the same cuts from postings.
+        // Mid-df filter first, then tf×idf. Cutting by raw tf before the
+        // df band emptied RM3 rows on long documents. Cap is length-scaled.
         const uint32_t df_band_min = 5;
         const uint32_t df_max = std::max<uint32_t>(
             df_band_min, static_cast<uint32_t>(buildcfg.rm3_df_frac * static_cast<float>(N)));
@@ -650,29 +653,34 @@ public:
                 uint32_t tid = csr_tid[i];
                 if (tid >= terms_sorted.size() || STOPWORDS.count(terms_sorted[tid]))
                     continue;
-                uint32_t tf = csr_tf[i];
                 uint32_t df = term_metas[tid].df;
+                if (df < df_band_min || df > df_max) continue;
+                uint32_t tf = csr_tf[i];
                 float idf = (df > 0 && N > 0)
                     ? std::log(static_cast<float>(N) / static_cast<float>(df))
                     : 0.0f;
                 cand.push_back({tf, static_cast<float>(tf) * idf, tid});
             }
+            // Rank the candidate cut by tf*idf, not raw tf. On long documents
+            // raw tf selects the most common words, which the df band then
+            // discards -- leaving RM3 with near-empty feedback rows.
             if (cand.size() > FWD_CANDIDATES) {
                 std::partial_sort(cand.begin(),
                                   cand.begin() + static_cast<std::ptrdiff_t>(FWD_CANDIDATES),
                                   cand.end(),
                                   [](const auto& x, const auto& y) {
-                                      return std::get<0>(x) > std::get<0>(y);
+                                      return std::get<1>(x) > std::get<1>(y);
                                   });
                 cand.resize(FWD_CANDIDATES);
             }
-            size_t w = 0;
-            for (size_t i = 0; i < cand.size(); ++i) {
-                uint32_t df = term_metas[std::get<2>(cand[i])].df;
-                if (df >= df_band_min && df <= df_max) cand[w++] = cand[i];
-            }
-            cand.resize(w);
-            size_t take = std::min(cand.size(), static_cast<size_t>(fwd_keep));
+            // Comment at the top of this function promises length scaling;
+            // this is it. Long documents carry more usable feedback terms.
+            const float lr = (d < quantized_doc_lens.size())
+                ? dequantize_doc_len(quantized_doc_lens[d]) : 1.0f;
+            const uint32_t keep_d = std::min<uint32_t>(
+                FWD_CANDIDATES,
+                static_cast<uint32_t>(fwd_keep * std::min(1.0f + lr, 3.0f) * 0.5f + 0.5f));
+            size_t take = std::min(cand.size(), static_cast<size_t>(std::max(keep_d, 8u)));
             if (take < cand.size()) {
                 std::partial_sort(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(take),
                                   cand.end(),
@@ -1039,11 +1047,22 @@ public:
         if (qsum <= 0.0f) return {};
         for (auto& kv : qw) kv.second /= qsum;
 
+        // Document-as-query (ArguAna, verbose CACM): the query already
+        // names the topic. RM3 then pulls same-stance neighbours, and
+        // BM25+ delta on every matched term swamps tf. Keyword queries
+        // (TREC-COVID, Robust04 titles) never reach these cutoffs.
+        const int qn = static_cast<int>(qw.size());
+        const int ntok = static_cast<int>(tokens.size());
+        if (qn >= 20 || ntok >= 45) {
+            use_rm3 = false;
+            title_bonus = 0.0f;
+            delta = 0.0f;
+        }
+
         // Short keyword queries name fewer concepts than verbose ones, so
         // lean slightly harder on feedback — but do not override the
         // regime's term budget, which is tuned per collection shape.
         if (use_rm3 && (avg_doc_len > 160.0f || N >= 250000u)) {
-            const int qn = static_cast<int>(qw.size());
             if (qn <= 4) {
                 alpha = std::min(alpha, 0.55f);
                 rm3_pool = std::max(rm3_pool, 600);

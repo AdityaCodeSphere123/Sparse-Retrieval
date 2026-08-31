@@ -309,7 +309,7 @@ cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
     uint32_t pos = 0;
 
     auto emit = [&]() {
-        if (current.empty()) return;
+        if (current.size() <= 1) { current.clear(); return; }
         uint32_t this_pos = pos++;
         if (!(cfg.remove_stop && INDEX_STOPWORDS.count(current)))
             tokens.push_back({apply_stem(current, cfg.stemmer), this_pos});
@@ -338,7 +338,7 @@ void accumulate_tf(
     int n = 0;
     uint32_t pos = 0;
     auto emit = [&]() {
-        if (n <= 0) { n = 0; return; }
+        if (n <= 1) { n = 0; return; }
         std::string surface(buf, static_cast<size_t>(n));
         n = 0;
         uint32_t this_pos = pos++;

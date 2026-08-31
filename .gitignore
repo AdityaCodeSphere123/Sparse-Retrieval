@@ -11,3 +11,11 @@ build/
 *.so
 *.dylib
 data/full
+data/proxy_msmarco
+data/proxy_touche
+data/proxy_fiqa
+data/proxy_scifact
+data/proxy_nfcorpus
+data/proxy_arguana
+data/proxy_antique
+data/robust04_topics
