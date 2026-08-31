@@ -37,14 +37,25 @@ def main():
     print(f"Loading '{args.dataset}' via ir_datasets (this downloads and caches the dataset)...")
     dataset = ir_datasets.load(args.dataset)
 
+    def _doc_text(obj) -> str:
+        if hasattr(obj, "default_text"):
+            try:
+                t = obj.default_text()
+                if t:
+                    return t
+            except Exception:
+                pass
+        for attr in ("text", "body", "title"):
+            t = getattr(obj, attr, None)
+            if t:
+                return str(t)
+        return ""
+
     corpus_path = os.path.join(args.out, "corpus.jsonl")
     n_docs = 0
     with open(corpus_path, "w", encoding="utf-8") as f:
         for doc in dataset.docs_iter():
-            # ir_datasets doc objects vary by dataset; `.default_text()` is the
-            # standard cross-dataset accessor for "the text you'd index".
-            text = doc.default_text() if hasattr(doc, "default_text") else getattr(doc, "text", "")
-            f.write(json.dumps({"doc_id": doc.doc_id, "text": text}) + "\n")
+            f.write(json.dumps({"doc_id": str(doc.doc_id), "text": _doc_text(doc)}) + "\n")
             n_docs += 1
     print(f"Wrote {n_docs} documents to {corpus_path}")
 
@@ -52,7 +63,7 @@ def main():
     n_queries = 0
     with open(queries_path, "w", encoding="utf-8") as f:
         for query in dataset.queries_iter():
-            text = query.default_text() if hasattr(query, "default_text") else getattr(query, "text", "")
+            text = _doc_text(query).replace("\t", " ").replace("\n", " ")
             f.write(f"{query.query_id}\t{text}\n")
             n_queries += 1
     print(f"Wrote {n_queries} queries to {queries_path}")
