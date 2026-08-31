@@ -1065,16 +1065,24 @@ public:
             delta = 0.0f;
         }
 
-        // Short keyword queries name fewer concepts than verbose ones, so
-        // lean slightly harder on feedback — but do not override the
-        // regime's term budget, which is tuned per collection shape.
-        if (use_rm3 && (avg_doc_len > 160.0f || N >= 250000u)) {
+        // Query-length α. The mix is α·BM25 + (1-α)·RM3; the two arms are
+        // not on the same scale, so α is not a probability — it is a
+        // regime knob that we then tilt by how under-specified the query is.
+        // Short keyword queries (Robust04 titles, qn≤4) need more expansion.
+        // Verbose queries on a large collection already name the topic.
+        // Document-as-query is killed above, not mixed.
+        if (use_rm3) {
             if (qn <= 4) {
-                alpha = std::min(alpha, 0.55f);
+                float t = (static_cast<float>(qn) - 2.0f) / 2.0f;
+                if (t < 0.0f) t = 0.0f;
+                if (t > 1.0f) t = 1.0f;
+                // qn=2 → 0.42, qn=4 → 0.62 (SHORT midpoint unchanged)
+                const float short_a = 0.42f + 0.20f * t;
+                alpha = std::min(alpha, short_a);
                 rm3_pool = std::max(rm3_pool, 600);
-            } else if (qn >= 10) {
-                alpha = std::max(alpha, 0.65f);
-                fb_terms = std::min(fb_terms, 30);
+            } else if (qn >= 12 && N >= 20000u) {
+                alpha = std::max(alpha, 0.75f);
+                fb_terms = std::min(fb_terms, 25);
             }
         }
 

@@ -46,19 +46,19 @@ except ImportError:
 # RM3 is a discrete policy in adapt_params — it does not interpolate
 # with length the way b does.
 _SHORT = dict(
-    k1=2.1, b=0.60, delta=0.80, w_title=0.0, title_bonus=0.60,
+    k1=2.4, b=0.60, delta=0.80, w_title=0.0, title_bonus=0.60,
     use_rm3=True, fb_docs=30, fb_terms=40, alpha=0.62, mu=9000.0,
     rm3_pool=250, fb_temp=20.0, use_fusion=False,
 )
 _NEWS = dict(
-    k1=2.2, b=0.40, delta=0.70, w_title=0.0, title_bonus=0.0,
+    k1=2.2, b=0.30, delta=0.50, w_title=0.0, title_bonus=0.30,
     use_rm3=True, fb_docs=10, fb_terms=20, alpha=0.50, mu=1000.0,
     rm3_pool=1000, fb_temp=20.0, use_fusion=False,
 )
 PARAMS = dict(_SHORT)   # kept: other modules import PARAMS
 
-# Narrower than 130–260 so Touché (avgdl≈154) is mostly NEWS BM25.
-_BLEND_LO, _BLEND_HI = 120.0, 165.0
+# Touché avgdl≈154 should be full NEWS, not a CORD-weighted mix.
+_BLEND_LO, _BLEND_HI = 120.0, 155.0
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
@@ -79,16 +79,21 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
 
     BM25 (k1, b, δ, title bonus) interpolates SHORT→NEWS on analyzed avgdl.
 
-    RM3 is discrete: it helps a tight abstract cluster and (on paper)
-    newswire titles, and it hurts BEIR-style Q&A and claim retrieval.
+    RM3 interpolation is α·BM25 + (1-α)·expansion. α here is the regime
+    midpoint (typical 5–8 term query); engine.h then tilts it by query
+    length (qn≤4 → more expansion, verbose on large N → stay original).
+
+    μ is the Dirichlet prior on the feedback residual, not an on/off
+    switch. Large-abstract collections use a strong prior (μ=9000) so the
+    mix stays well-conditioned when the first pass is already tight.
+    Small abstract collections use μ≈2·avgdl so expansion actually moves
+    the ranking. Newswire uses μ≈2.5·avgdl.
 
       * avgdl < 90: off (short docs / forums).
-      * N≥100k and avgdl≤135: on, μ=9000 (regularised; TREC-COVID-shaped).
-      * N<20k and 90≤avgdl<120: on, μ≈2·avgdl (Cranfield-shaped; fb
-        already capped to 1% of N).
+      * N≥100k and avgdl≤135: on, strong μ, α=0.62.
+      * N<20k and 90≤avgdl<120: on, μ≈2·avgdl, α=0.45.
       * N≥200k and avgdl≥160: on, μ≈2.5·avgdl, NEWS fb/α (Robust04-shaped).
-        Touché is avgdl≈154 so it gets NEWS BM25 without RM3.
-      * otherwise off. Document-length queries are also cut in C++.
+      * otherwise off. Document-length queries are cut in C++.
     """
     avg = float(avgdl) if avgdl > 0 else 115.0
     n = max(int(n_docs), 1)
@@ -118,7 +123,7 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     elif n < 20_000 and 90.0 <= avg < 120.0:
         out["use_rm3"] = True
         out["mu"] = _clip(2.0 * avg, 200.0, 800.0)
-        out["alpha"] = 0.55
+        out["alpha"] = 0.45
         out["fb_docs"] = int(_clip(5, 5, max(5, n // 100)))
         out["fb_terms"] = 50
         out["rm3_pool"] = int(min(200, max(50, n // 4)))
