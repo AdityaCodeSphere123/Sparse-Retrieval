@@ -28,7 +28,7 @@ import shutil
 import tempfile
 from typing import List, Optional, Tuple
 
-from submission import bm25, boolean_vsm
+from submission import bm25
 from submission.corpus_utils import load_corpus, stream_corpus
 from submission.indexer import InvertedIndex
 
@@ -48,14 +48,14 @@ except ImportError:
 _SHORT = dict(
     k1=2.4, b=0.60, delta=0.80, w_title=0.0, title_bonus=0.60,
     use_rm3=True, fb_docs=30, fb_terms=40, alpha=0.62, mu=9000.0,
-    rm3_pool=250, fb_temp=20.0, use_fusion=False,
+    rm3_pool=250,
 )
 _NEWS = dict(
     k1=2.2, b=0.30, delta=0.50, w_title=0.0, title_bonus=0.30,
     use_rm3=True, fb_docs=10, fb_terms=20, alpha=0.50, mu=1000.0,
-    rm3_pool=250, fb_temp=20.0, use_fusion=False,
+    rm3_pool=250,
 )
-PARAMS = dict(_SHORT)   # kept: other modules import PARAMS
+PARAMS = dict(_SHORT)
 
 # Touché avgdl≈154 should be full NEWS, not a CORD-weighted mix.
 _BLEND_LO, _BLEND_HI = 120.0, 155.0
@@ -338,7 +338,6 @@ def load_index(index_dir: str) -> None:
     else:
         _INDEX = InvertedIndex.load(index_dir)
         bm25.build(_INDEX)
-        boolean_vsm.build(_INDEX)
         n = getattr(_INDEX, "n_docs", None) or getattr(_INDEX, "N", 1)
         avg = getattr(_INDEX, "avgdl", None) or getattr(_INDEX, "avg_dl", 115.0)
         _ACTIVE = adapt_params(int(n), float(avg))

@@ -10,7 +10,6 @@
 #include <thread>
 
 constexpr uint32_t FWD_CANDIDATES   = 64;
-constexpr uint32_t FWD_OFF_STRIDE   = 8;
 constexpr int      RM3_POOL         = 250;
 constexpr uint8_t  INDEX_VERSION    = 10;
 constexpr uint32_t TF_MAX           = 63;
