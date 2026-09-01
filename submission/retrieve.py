@@ -1,4 +1,4 @@
-"""Competition entry: build_index / load_index / retrieve.
+"""build_index / load_index / retrieve.
 
 The harness imports this module and calls those three functions only.
 Names and signatures are fixed. Implementation is the C++ engine

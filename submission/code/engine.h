@@ -75,9 +75,7 @@ public:
         return static_cast<int32_t>(it - terms_sorted.begin());
     }
 
-    // =======================================================================
-    // BUILD
-    // =======================================================================
+    // Build
     // Parallel SPIMI shards → k-way merge into postings.bin + front-coded
     // dict.bin. The RM3 per-document CSR is not written; load_index rebuilds it.
     template <typename Supplier>
@@ -551,10 +549,8 @@ public:
         }, index_dir);
     }
 
-    // -----------------------------------------------------------------------
     // RM3 forward index: walk postings, keep mid-df terms per doc (tf×idf),
     // cap at fwd_keep (more slots on long documents). Not stored on disk.
-    // -----------------------------------------------------------------------
     template <typename Fn>
     void visit_postings(uint32_t tid, Fn&& fn) {
         if (tid >= term_metas.size() || !postings_mmap.data) return;
@@ -753,9 +749,7 @@ public:
         csr_tf.swap(new_tf);
     }
 
-    // =======================================================================
-    // LOAD
-    // =======================================================================
+    // Load
     void load_dictionary(const std::string& index_dir) {
         std::ifstream f(index_dir + "/dict.bin", std::ios::binary | std::ios::ate);
         if (!f.is_open()) throw std::runtime_error("Cannot open dict.bin");
@@ -913,9 +907,7 @@ public:
         touched.reserve(N);
     }
 
-    // =======================================================================
     // SCORING
-    // =======================================================================
     // Term-at-a-time: for each query term, add BM25+ to acc[doc]. Then
     // nth_element + sort the touched docs. Generation stamps skip a full zero.
     //
@@ -1041,9 +1033,7 @@ public:
         return results;
     }
 
-    // -----------------------------------------------------------------------
     // Copy (term_id, tf) rows for the given docs from the CSR.
-    // -----------------------------------------------------------------------
     void get_batch_doc_term_freqs(const std::vector<uint32_t>& target_docs, BatchFwd& out) {
         const size_t n = target_docs.size();
         out.start.assign(n, 0);
@@ -1062,9 +1052,7 @@ public:
         }
     }
 
-    // =======================================================================
-    // ENTRY POINT
-    // =======================================================================
+    //Entry point
     std::vector<std::pair<std::string, float>> retrieve(
         const std::string& query,
         int k,
@@ -1271,6 +1259,7 @@ public:
                     if (pool.empty()) pool = pass1;
                 } else {
                     // Abstracts: mix expansion onto the first-pass pool only.
+                    float length_penalty_lut[256];
                     for (int q = 0; q < 256; ++q) {
                         float ratio = dequantize_doc_len(static_cast<uint8_t>(q));
                         length_penalty_lut[q] = k1 * (1.0f - b + b * ratio);
