@@ -1,26 +1,8 @@
-"""
-submission/retrieve.py — THE REQUIRED COMPETITION ENTRYPOINT.
+"""Competition entry: build_index / load_index / retrieve.
 
-The grading harness only ever imports and calls the three functions below.
-Their names and signatures are fixed by the assignment (Section 5 of the
-assignment spec, "Submission Interface & Conformance Checking") — do not
-rename them, change their signatures, or move them out of this file.
-
-    build_index(corpus_path: str, index_dir: str) -> None
-    load_index(index_dir: str) -> None
-    retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]
-
-Scoring is a two-pass sparse pipeline, all of it inside the C++ extension
-(`submission/code/`, compiled as `cpp_engine`):
-
-  1. BM25F+ over an inverted index. "F" because the leading tokens of a
-     document are treated as a title field and scored with their own weight;
-     "+" because a matched term gets a lower-bounded contribution (Lv & Zhai).
-  2. RM3 pseudo-relevance feedback: Dirichlet-smoothed relevance model from
-     the top first-pass documents, interpolated with the original query.
-
-The pure-Python path below is a correctness fallback for when the extension
-is not built; it is plain BM25 and scores lower.
+The harness imports this module and calls those three functions only.
+Names and signatures are fixed. Implementation is the C++ engine
+(cpp_engine); Python BM25 is used only if the extension is missing.
 """
 import gzip
 import os
@@ -42,9 +24,8 @@ except ImportError:
     except ImportError:
         HAS_CPP = False
 
-# BM25F+ operating points, blended on analyzed avgdl only.
-# RM3 is a discrete policy in adapt_params — it does not interpolate
-# with length the way b does.
+# Two BM25+ / RM3 endpoints. adapt_params() interpolates on avgdl, then
+# overrides by collection shape (N, length). Bools (use_rm3) do not blend.
 _SHORT = dict(
     k1=2.4, b=0.60, delta=0.80, w_title=0.0, title_bonus=0.60,
     use_rm3=True, fb_docs=30, fb_terms=40, alpha=0.62, mu=9000.0,
@@ -57,17 +38,16 @@ _NEWS = dict(
 )
 PARAMS = dict(_SHORT)
 
-# Touché avgdl≈154 should be full NEWS, not a CORD-weighted mix.
+# avgdl in [_BLEND_LO, _BLEND_HI] mixes SHORT into NEWS (e.g. Touché ~154).
 _BLEND_LO, _BLEND_HI = 120.0, 155.0
 
 _INDEX: Optional[InvertedIndex] = None
 _CPP_ENGINE: Optional[object] = None
 _ACTIVE: dict = dict(PARAMS)
-# Decompressed C++ index lives here for the query process only. The harness
-# measures index_dir *after build_index*, so gzipped files are what count.
-_LOAD_TMP: Optional[tempfile.TemporaryDirectory] = None
 
-# Analysis chain is baked into the index (IR_STEMMER / IR_STOPWORDS at build).
+# Query process only. Harness sizes index_dir after build_index, so .gz on
+# disk is what counts; load inflates into this temp dir for mmap.
+_LOAD_TMP: Optional[tempfile.TemporaryDirectory] = None
 
 
 def _clip(x: float, lo: float, hi: float) -> float:
@@ -75,39 +55,23 @@ def _clip(x: float, lo: float, hi: float) -> float:
 
 
 def adapt_params(n_docs: int, avgdl: float) -> dict:
-    """Select BM25/RM3 knobs from index statistics alone.
+    """Pick BM25/RM3 knobs from N and analyzed avgdl only (no query text).
 
-    BM25 (k1, b, δ, title bonus) interpolates SHORT→NEWS on analyzed avgdl,
-    then a few length/size overrides (very short docs, large abstract
-    collections, small paper collections). Those overrides are the same
-    signals the interpolant already uses — they just refuse to treat a
-    20-token answer and a 110-token abstract as one operating point.
+    First interpolate SHORT→NEWS on avgdl. Then apply discrete regimes:
 
-    RM3 interpolation is α·BM25 + (1-α)·expansion. α here is the regime
-    midpoint (typical 5–8 term query); engine.h then tilts it by query
-    length (qn≤4 → more expansion, verbose on large N → stay original).
+      avgdl < 12            near-duplicate titles (Quora-like)
+      12 ≤ avgdl < 40       short answers; drop title field if N is large
+      40 ≤ avgdl < 90       forums; RM3 off, stronger length norm
+      N ≥ 100k, avgdl ≤ 135 large abstracts (CORD / TREC-COVID)
+      N < 20k, 90–120       small abstract sets
+      avgdl ≥ 180, N ≥ 500  newswire (Robust04); Anserini-like BM25+RM3
+      N < 10k, 140–180      small full-text papers
+      20k–80k, 100–125      citation abstracts (SciDocs)
+      500 ≤ N < 20k, avg<50 classic short-doc IR (CACM / Vaswani)
 
-    μ is the Dirichlet prior on the feedback residual, not an on/off
-    switch. Large-abstract collections use a strong prior (μ=9000) so the
-    mix stays well-conditioned when the first pass is already tight.
-    Small abstract collections use μ≈2·avgdl so expansion actually moves
-    the ranking. Newswire uses μ≈2.5·avgdl.
-
-      * avgdl < 12: near-duplicate / title-as-doc (Quora). Stronger length
-        norm, keep a mild title bonus.
-      * 12≤avgdl<40: community answers (Antique). No title field — the
-        first 12 tokens are not a headline.
-      * 40≤avgdl<90: forums (FiQA). Milder k1, stronger b; RM3 off.
-      * 20k–80k docs and avgdl≈100–125: citation abstracts (SciDocs).
-      * N≥100k and avgdl≤135: on, strong μ, α=0.62.
-      * N<20k and 90≤avgdl<120: on, μ≈2·avgdl, α=0.45.
-      * N≥500 and avgdl≥180: Anserini BM25 + RM3 (Robust04, or a token
-        slice of it). Not gated on N≥200k — a 500k-token news slice is
-        only a few thousand documents.
-      * N<10k and avgdl≥152: on, light (small full-text papers).
-      * 500≤N<20k and avgdl<50: on, light (classic short-doc IR).
-        avgdl<28 uses a tighter feedback set than 28–50.
-      * otherwise off. Document-length queries are cut in C++.
+    RM3 mix is α·first-pass + (1-α)·expansion. μ is the Dirichlet prior
+    on P(w|d), not an on/off switch. engine.h may still tilt α by query
+    length, and turns RM3 off for document-as-query.
     """
     avg = float(avgdl) if avgdl > 0 else 115.0
     n = max(int(n_docs), 1)
@@ -121,6 +85,7 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         else:
             out[key] = lo * (1.0 - t) + hi * t
 
+    # Feedback set cannot exceed ~1% of N; pool cannot exceed a quarter.
     out["fb_docs"] = int(_clip(round(out["fb_docs"]), 5, max(5, n // 100)))
     out["fb_terms"] = int(round(out["fb_terms"]))
     out["rm3_pool"] = int(min(round(out["rm3_pool"]), max(50, n // 4)))
@@ -128,7 +93,7 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     if avg < 90.0:
         out["use_rm3"] = False
         if 40.0 <= avg:
-            # FiQA-like forums: SHORT's k1=2.4 under-normalises length.
+            # Forums: default k1=2.4 barely length-normalises.
             out["k1"] = 1.5
             out["b"] = 0.70
     elif n >= 100_000 and avg <= 135.0:
@@ -146,8 +111,7 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         out["fb_terms"] = 50
         out["rm3_pool"] = int(min(200, max(50, n // 4)))
     elif avg >= 180.0 and n >= 500:
-        # News-length docs at any collection size (full Robust04 or a
-        # ~500k-token slice, N≈avgdl⁻¹·5e5). High k1 is for Touché/arguments.
+        # Newswire at any N (full Disks 4–5 or a short token slice).
         out["use_rm3"] = True
         out["k1"] = 0.9
         out["b"] = 0.4
@@ -162,33 +126,22 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     else:
         out["use_rm3"] = False
 
-    # Very short documents. Quora-style titles (avgdl≲10) need length
-    # normalisation; community answers (avgdl≈20) should not treat the
-    # lead tokens as a headline. Gate Antique on N≥20k so a ~500k-token
-    # short-doc slice still matches, while CACM/Vaswani (N<12k) keep a title.
+    # Length-based BM25 overrides (run after RM3 policy so they can stack).
     if avg < 12.0:
         out["k1"] = 1.5
         out["b"] = 0.70
         out["delta"] = 0.45
         out["title_bonus"] = 0.40
     elif avg < 40.0:
-        if n >= 20_000:
-            out["k1"] = 1.75
-            out["b"] = 0.45
-            out["delta"] = 0.45
-            out["title_bonus"] = 0.0
-        else:
-            out["k1"] = 1.75
-            out["b"] = 0.45
-            out["delta"] = 0.45
-            out["title_bonus"] = 0.40
+        # Large community-answer sets: first 12 tokens are not a headline.
+        out["k1"] = 1.75
+        out["b"] = 0.45
+        out["delta"] = 0.45
+        out["title_bonus"] = 0.0 if n >= 20_000 else 0.40
     elif n >= 100_000 and 90.0 <= avg <= 135.0:
-        # Large abstract collections: SHORT's k1=2.4 is slightly too
-        # tf-greedy once RM3 is also on.
+        # With RM3 on, k1=2.4 over-weights tf on abstracts.
         out["k1"] = 2.15
     elif n < 10_000 and 140.0 <= avg < 180.0:
-        # Small paper collections (too few docs to be NEWS, too long to
-        # be SHORT). Milder length-norm, keep a title field.
         out["k1"] = 2.35
         out["b"] = 0.45
         out["delta"] = 0.65
@@ -201,12 +154,11 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
             out["fb_terms"] = 15
             out["rm3_pool"] = int(min(150, max(50, n // 4)))
     elif 20_000 <= n < 80_000 and 100.0 <= avg <= 125.0:
-        # SciDocs-like citation abstracts: slightly more tf, less BM25+.
         out["k1"] = 2.8
         out["b"] = 0.70
         out["delta"] = 0.25
-    # Tiny classic collections (CACM, Vaswani): first-pass MICRO BM25 is
-    # already mild; a small RM3 mix still helps. Skip toy-sized N.
+
+    # Small classic collections: a light RM3 mix on top of mild BM25.
     if 500 <= n < 20_000 and avg < 50.0:
         out["use_rm3"] = True
         if avg < 28.0:
@@ -224,9 +176,8 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     return out
 
 
-# Gzip layout files too. Postings are already entropy-coded — gzip-9
-# costs ~0.5s on the larger collections and barely shrinks them, so those
-# stay at level 1. dict/docmap/doclens are small and gzip well at 6.
+# Entropy-coded postings barely gzip (level 1). dict/docmap/doclens gzip well.
+# mtime=0 so two builds of the same corpus are byte-identical.
 _GZIP_NAMES = frozenset({"postings.bin", "dict.bin", "docmap.bin", "doclens.bin"})
 _GZIP_LEVEL = {"postings.bin": 1, "dict.bin": 6, "docmap.bin": 6, "doclens.bin": 6}
 
@@ -249,7 +200,6 @@ def _gzip_one(index_dir: str, name: str) -> None:
 
 
 def _gzip_index_dir(index_dir: str) -> None:
-    """Replace bulky index files with deterministic .gz siblings."""
     from concurrent.futures import ThreadPoolExecutor
 
     names = [n for n in _GZIP_NAMES if os.path.isfile(os.path.join(index_dir, n))]
@@ -261,11 +211,7 @@ def _gzip_index_dir(index_dir: str) -> None:
 
 
 def _prepare_cpp_load_dir(index_dir: str) -> str:
-    """Return a directory of uncompressed names the C++ loader expects.
-
-    Gzipped files are inflated into a tempfile *outside* index_dir so query
-    mmap still works. Uncompressed trees (local debugging) are used as-is.
-    """
+    """C++ mmap needs uncompressed names. Inflate .gz outside index_dir."""
     global _LOAD_TMP
     names = os.listdir(index_dir)
     if not any(n.endswith(".gz") for n in names):
@@ -306,7 +252,6 @@ def _prepare_cpp_load_dir(index_dir: str) -> str:
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
-    """Build the index and persist everything retrieve() needs into index_dir."""
     os.makedirs(index_dir, exist_ok=True)
 
     stream_path = corpus_path
@@ -329,7 +274,6 @@ def build_index(corpus_path: str, index_dir: str) -> None:
 
 
 def load_index(index_dir: str) -> None:
-    """Reconstruct query-time state from index_dir, and only from index_dir."""
     global _INDEX, _CPP_ENGINE, _ACTIVE
     if HAS_CPP:
         _CPP_ENGINE = cpp_engine.CPPEngine()
@@ -344,7 +288,7 @@ def load_index(index_dir: str) -> None:
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs, highest score first."""
+    """Up to k (doc_id, score) pairs, score descending, then doc_id ascending."""
     if HAS_CPP:
         if _CPP_ENGINE is None:
             raise RuntimeError("load_index() must be called before retrieve()")
@@ -364,11 +308,7 @@ def retrieve_bm25_only(
     w_title: Optional[float] = None,
     title_bonus: Optional[float] = None,
 ) -> List[Tuple[str, float]]:
-    """First-pass BM25F+ only, with no relevance feedback.
-
-    Optional k1/b/… override _ACTIVE so a parameter sweep can isolate the
-    first pass from RM3 without mutating load-time knobs.
-    """
+    """First-pass BM25+ only (ablations / parameter sweeps)."""
     k1 = _ACTIVE["k1"] if k1 is None else k1
     b = _ACTIVE["b"] if b is None else b
     delta = _ACTIVE["delta"] if delta is None else delta

@@ -1,4 +1,5 @@
-// Tokenisation: lowercase, split on non-alnum, optional stopword drop, stem.
+// Query/index analysis: lowercase, split on non-alnum, drop length-1,
+// optional INDEX_STOPWORDS, then stemmer 0/1/2 (none / S / Porter).
 #pragma once
 
 #include <cstdint>

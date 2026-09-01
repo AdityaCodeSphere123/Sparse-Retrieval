@@ -8,7 +8,7 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(cpp_engine, m) {
-    m.doc() = "From-scratch inverted index with BM25F+ scoring and RM3 query expansion";
+    m.doc() = "Inverted index, BM25+ scoring, optional RM3 expansion";
     m.def("check_codecs", &check_codecs,
           "S9Reader/EFReader/s9_skip must match simple9_unpack/ef_unpack_docs");
     m.def("tokenize", [](const std::string& text, bool remove_stop) {

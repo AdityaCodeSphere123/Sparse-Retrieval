@@ -1,5 +1,5 @@
 #pragma once
-// Index build, load, and BM25F+/RM3 retrieve — the CPPEngine class.
+// Inverted index: SPIMI build, mmap load, BM25+ term-at-a-time, optional RM3.
 
 #include "ir_config.h"
 #include "codecs.h"
@@ -36,10 +36,7 @@ public:
     TokenizerCfg tokcfg;          // read from meta.bin at load; must match build
     BuildCfg buildcfg;            // build-time only; never needed at query time
 
-    // ---- dictionary, held as parallel sorted arrays -------------------------
-    // Sorted term array + binary search rather than a hash map: on a corpus
-    // with millions of distinct terms this loads faster and uses far less
-    // memory, and the array index is the term id used when rebuilding RM3 rows.
+    // ---- dictionary (sorted arrays; term id = index into these) -------------
     std::vector<std::string> terms_sorted;
     std::vector<TermMeta> term_metas;
 
@@ -58,8 +55,8 @@ public:
     };
 
     // ---- query-time scratch -------------------------------------------------
-    // Dense accumulator + dirty list. A generation stamp avoids O(touched)
-    // zeroing at the end of every query (the old max-latency tail).
+    // acc[d] is live iff acc_stamp[d] == score_gen. Bump score_gen instead of
+    // zeroing the whole acc array after each query.
     std::vector<float> acc;
     std::vector<uint32_t> acc_stamp;
     uint32_t score_gen = 1;
@@ -81,14 +78,8 @@ public:
     // =======================================================================
     // BUILD
     // =======================================================================
-    //
-    // Three stages:
-    //   1. SPIMI  — tokenise, buffer postings in memory, spill sorted runs.
-    //   2. MERGE  — k-way merge the runs into postings.bin, writing dict.bin
-    //               front-coded in the same sorted pass.
-    //   3. RM3 rows — rebuild a truncated per-document term CSR from postings
-    //               (not written to disk; query load does the same walk).
-    //
+    // Parallel SPIMI shards → k-way merge into postings.bin + front-coded
+    // dict.bin. The RM3 per-document CSR is not written; load_index rebuilds it.
     template <typename Supplier>
     void build_common(Supplier&& next_doc, const std::string& index_dir,
                       const std::vector<std::pair<const char*, size_t>>* line_spans = nullptr,
@@ -103,10 +94,8 @@ public:
         total_corpus_tokens = 0;
         N = 0;
 
-        // Analysis chain is chosen at build time and frozen into the index.
-        // Overridable from the environment so the two configurations can be
-        // A/B-ed without editing and recompiling:
-        //     IR_STEMMER=0|1|2   IR_STOPWORDS=0|1
+        // Stemmer / stop policy are frozen in meta.bin. Override with
+        // IR_STEMMER=0|1|2 and IR_STOPWORDS=0|1 (no recompile).
         buildcfg = read_build_cfg();
         tokcfg = TokenizerCfg{};
         if (const char* e = std::getenv("IR_STEMMER"))
@@ -462,6 +451,9 @@ public:
                 scratch_titles[i] = std::min<uint32_t>(merged[i].title_tf, TITLE_TF_MAX);
                 if (scratch_titles[i]) { has_title = 1; ++n_title_hits; }
             }
+            // Short lists: vbyte doc-gaps. LSB flags packed==1 (body tf=1, no
+            // title) so the extra byte can be omitted. Longer lists: Simple-9
+            // body (tf−1), then optional title sidecar, then Elias-Fano docs.
             if (df < POST_VBYTE_DF) {
                 uint32_t prev_doc_id = 0;
                 for (uint32_t i = 0; i < df; ++i) {
@@ -516,16 +508,13 @@ public:
         f_dict.seekp(0);
         f_dict.write(reinterpret_cast<const char*>(&num_written_terms), sizeof(num_written_terms));
         f_dict.close();
-        // Pad so the last Elias-Fano list can over-read up to 7 bytes in
-        // bit_get without walking off the mmap (page-multiple postings.bin).
+        // EFReader may pull extra bytes; 8 zero pad keeps the last list in-bounds.
         const uint8_t pad[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         f_postings.write(reinterpret_cast<const char*>(pad), 8);
         f_postings.close();
         mem_runs.clear();
         stamp("merge", t0);
-        // CSR is rebuilt at load_index (it is not on disk). Skipping it here
-        // is the whole build-time saving: the harness times this process
-        // separately from query load.
+        // Forward index is rebuilt at load (harness times build, not load).
     }
 
     void build_index(const std::vector<std::pair<std::string, std::string>>& corpus,
@@ -563,9 +552,8 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // RM3 forward rows: rebuilt from postings at load (nothing extra on disk).
-    // Keep the mid-df terms in each document, ranked by tf*idf, capped at
-    // fwd_keep (length-scaled for long docs).
+    // RM3 forward index: walk postings, keep mid-df terms per doc (tf×idf),
+    // cap at fwd_keep (more slots on long documents). Not stored on disk.
     // -----------------------------------------------------------------------
     template <typename Fn>
     void visit_postings(uint32_t tid, Fn&& fn) {
@@ -584,6 +572,7 @@ public:
                 fn(current_doc, tf);
             }
         } else {
+            // Layout: Simple-9 tfs | [title sidecar] | Elias-Fano docs.
             const uint8_t* p_ef = s9_skip(ptr, df);
             if (meta.has_title) {
                 uint32_t n_title_hits = read_vbyte(p_ef);
@@ -690,6 +679,8 @@ public:
                 for (uint32_t i = a; i < b; ++i) {
                     uint32_t tid = csr_tid[i];
                     if (tid >= terms_sorted.size()) continue;
+                    // Large collections: aggressive Fox-style list. Small:
+                    // English+question words only (same as indexing).
                     if (small_col ? INDEX_STOPWORDS.count(terms_sorted[tid])
                                   : STOPWORDS.count(terms_sorted[tid]))
                         continue;
@@ -786,6 +777,7 @@ public:
         uint64_t prev_postings_offset = 0;
 
         for (uint32_t i = 0; i < num_terms; ++i) {
+            // Front-coded: shared prefix with previous term, then the suffix.
             uint32_t prefix = read_vbyte(p);
             uint32_t suffix_len = read_vbyte(p);
             std::string term = prev_term.substr(0, prefix);
@@ -901,8 +893,7 @@ public:
             quantized_doc_lens.resize(N);
             f.read(reinterpret_cast<char*>(quantized_doc_lens.data()), N * sizeof(uint8_t));
 
-            // Approximate exact lengths back out of the quantised ratios; RM3's
-            // Dirichlet smoothing only needs them to within a few percent.
+            // Reconstruct |d| from the 8-bit ratio; RM3 Dirichlet uses |d|+μ.
             doc_lens.resize(N);
             for (uint32_t i = 0; i < N; ++i) {
                 doc_lens[i] = static_cast<uint32_t>(dequantize_doc_len(quantized_doc_lens[i]) * avg_doc_len);
@@ -925,13 +916,14 @@ public:
     // =======================================================================
     // SCORING
     // =======================================================================
+    // Term-at-a-time: for each query term, add BM25+ to acc[doc]. Then
+    // nth_element + sort the touched docs. Generation stamps skip a full zero.
     //
-    // Term-at-a-time accumulation into a dense array, then one partial_sort.
-    //
-    // The previous version maintained the top-k list inside the posting loop
-    // with a linear search plus a full std::sort *per posting*, which is
-    // O(P * k log k) for P postings — that was the dominant query cost.
-    //
+    // Score for a hit:  w * ( tf_norm + δ + [title_bonus if title_tf>0] )
+    //   w       = query_weight * RSJ idf
+    //   tf_norm = tf_eff * (k1+1) / (tf_eff + k1*(1-b+b*|d|/avgdl))
+    //   tf_eff  = body_tf [+ w_title * title_tf]
+    // Title is the first title_window tokens of the document (build time).
     std::vector<std::pair<uint32_t, float>> raw_retrieve(
         const std::vector<std::pair<int32_t, float>>& qterms,
         int top_k, float k1, float b, float delta, float w_title, float title_bonus)
@@ -996,7 +988,7 @@ public:
                         scratch_titles[h] = (prev << 2) | (coded & 3u);
                     }
                 } else if (meta.has_title) {
-                    // Title sidecar sits after EF; skip decoding it.
+                    // Title sidecar is between Simple-9 and EF; skip it.
                     n_title_hits = read_vbyte(p_ef);
                     for (uint32_t h = 0; h < n_title_hits; ++h) (void)read_vbyte(p_ef);
                     n_title_hits = 0;
@@ -1050,8 +1042,7 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Term frequencies for the RM3 feedback documents, straight out of the
-    // forward index. O(feedback docs) instead of O(vocabulary).
+    // Copy (term_id, tf) rows for the given docs from the CSR.
     // -----------------------------------------------------------------------
     void get_batch_doc_term_freqs(const std::vector<uint32_t>& target_docs, BatchFwd& out) {
         const size_t n = target_docs.size();
@@ -1103,10 +1094,9 @@ public:
         if (qsum <= 0.0f) return {};
         for (auto& kv : qw) kv.second /= qsum;
 
-        // Query length. ArguAna-style document-as-query still disables RM3
-        // (expansion grabs same-stance neighbours). Robust04 *description*
-        // topics are 15–40 tokens and must keep RM3 — that is what Anserini
-        // does. Only dump-length news queries get the hard cut.
+        // Long queries: RM3 on a document-as-query (e.g. ArguAna) pulls
+        // same-stance neighbours. News descriptions (~15–40 terms) keep RM3;
+        // only dump-length news queries (ntok≥90 or qn≥40) turn it off.
         const int qn = static_cast<int>(qw.size());
         const int ntok = static_cast<int>(tokens.size());
         const bool news_rm3 = (avg_doc_len >= 180.0f && N >= 500u);
@@ -1122,17 +1112,14 @@ public:
             delta = 0.0f;
         }
 
-        // Query-length α. The mix is α·BM25 + (1-α)·RM3; the two arms are
-        // not on the same scale, so α is not a probability — it is a
-        // regime knob that we then tilt by how under-specified the query is.
-        // Short keyword queries on abstract collections need more expansion.
-        // Robust04 titles keep α near the Anserini 0.5 original-query weight
-        // and run a full second pass instead of a 250-doc pool rerank.
+        // Mix is α·original + (1-α)·expansion; scores are not probabilities.
+        // Short keyword queries on abstracts get more expansion. News titles
+        // stay near α=0.5; news then does a full second BM25 pass.
         if (use_rm3) {
             if (news_rm3) {
                 if (qn <= 2) alpha = std::min(alpha, 0.45f);
                 else if (qn >= 8 || ntok >= 18) {
-                    // Description/narrative: stay on the original query.
+                    // Description/narrative: weight the original query more.
                     alpha = std::max(alpha, 0.65f);
                     fb_terms = std::min(fb_terms, 10);
                     title_bonus = 0.0f;
@@ -1141,7 +1128,7 @@ public:
                 float t = (static_cast<float>(qn) - 2.0f) / 2.0f;
                 if (t < 0.0f) t = 0.0f;
                 if (t > 1.0f) t = 1.0f;
-                // qn=2 → 0.42, qn=4 → 0.62 (SHORT midpoint unchanged)
+                // qn=2 → α≤0.42; qn=4 → α≤0.62 (SHORT default).
                 const float short_a = 0.42f + 0.20f * t;
                 alpha = std::min(alpha, short_a);
                 rm3_pool = std::max(rm3_pool, 250);
@@ -1180,13 +1167,11 @@ public:
             var /= std::max(num_fb, 1);
 
             if (var < 1e-6f) {
+                // First-pass scores are identical: expansion would be uniform noise.
                 pool = pass1;
             } else {
-                // P(d|R): mix uniform (Anserini RM3) with a scale-free
-                // score weight. Raw BM25+ is not a probability — s_i/Σs
-                // lets one large score own the relevance model. log1p
-                // compresses that. News leans uniform; abstracts keep
-                // more of the first-pass ranking.
+                // P(d|R): λ·uniform + (1-λ)·log1p(score)/Σ. Normalising raw
+                // BM25 lets one large score dominate. News λ=0.70; abstracts 0.25.
                 fb_wts.resize(num_fb);
                 float wsum = 0.0f;
                 for (int i = 0; i < num_fb; ++i) {
@@ -1212,6 +1197,7 @@ public:
 
                 const float alpha_rm3 = alpha;
                 const int keep_rm3 = fb_terms;
+                // Large feedback sets: drop terms that appear in only one fb doc.
                 const uint32_t min_sup = (num_fb >= 12) ? 2u : 1u;
 
                 std::unordered_map<int32_t, float> p_w_r;
@@ -1226,6 +1212,7 @@ public:
                         int32_t tid = static_cast<int32_t>(tf_kv.first);
                         if (tid < 0 || tid >= static_cast<int32_t>(term_metas.size())) continue;
                         const float tf = static_cast<float>(tf_kv.second);
+                        // Dirichlet: P(w|d) = (tf + μ P(w|C)) / (|d| + μ)
                         float p_w_c = (total_corpus_tokens > 0)
                             ? (static_cast<float>(term_metas[tid].cf) / total_corpus_tokens)
                             : 1e-4f;
@@ -1262,9 +1249,8 @@ public:
                 }
 
                 if (news_rm3) {
-                    // Interpolate the query model and score the whole collection.
-                    // Pool rerank cannot promote a relevant news article that
-                    // BM25 left outside the top-250.
+                    // Full second BM25 pass. Reranking the first-pass pool
+                    // cannot recover a news doc that never entered the top-250.
                     float esum = 0.0f;
                     for (const auto& kv : exp_rm3) {
                         auto it = p_w_r.find(static_cast<int32_t>(kv.first));
@@ -1284,7 +1270,7 @@ public:
                     pool = raw_retrieve(q2, k, k1, b, delta, w_title, title_bonus);
                     if (pool.empty()) pool = pass1;
                 } else {
-                    float length_penalty_lut[256];
+                    // Abstracts: mix expansion onto the first-pass pool only.
                     for (int q = 0; q < 256; ++q) {
                         float ratio = dequantize_doc_len(static_cast<uint8_t>(q));
                         length_penalty_lut[q] = k1 * (1.0f - b + b * ratio);
@@ -1334,10 +1320,7 @@ public:
         return results;
     }
 
-    // -----------------------------------------------------------------------
-    // First-pass scoring only: no relevance feedback. Needed for the report's
-    // ablation table and to sweep k1/b in isolation from RM3.
-    // -----------------------------------------------------------------------
+    // BM25+ only (no RM3). Used by retrieve_bm25_only in Python.
     std::vector<std::pair<std::string, float>> retrieve_bm25(
         const std::string& query, int k, float k1, float b, float delta,
         float w_title, float title_bonus)

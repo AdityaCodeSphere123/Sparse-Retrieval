@@ -4,6 +4,8 @@
 #include <cstring>
 #include <string_view>
 
+// Aggressive Fox-style list: used only when pruning the RM3 forward index
+// on large collections (N ≥ 20k). Indexing uses INDEX_STOPWORDS instead.
 const std::unordered_set<std::string> STOPWORDS = {
     "a", "about", "above", "across", "after", "again", "against", "all", "almost", "alone", "along",
     "already", "also", "although", "always", "among", "an", "and", "another", "any", "anybody", "anyone",
@@ -44,6 +46,7 @@ const std::unordered_set<std::string> STOPWORDS = {
     "work", "worked", "working", "works", "would", "x", "y", "year", "years", "yet", "you", "your", "yours"
 };
 
+// Lucene English stops including question words. Applied at index + query.
 const std::unordered_set<std::string> INDEX_STOPWORDS = {
     "i","me","my","myself","we","our","ours","ourselves","you","your","yours",
     "yourself","yourselves","he","him","his","himself","she","her","hers","herself",
@@ -278,8 +281,7 @@ public:
     }
 };
 
-// Light S-stemmer (plural stripping only) — the previous default, kept so the
-// two stemmers can be compared for the report.
+// Plural-only S-stemmer (IR_STEMMER=1). Default at build is Porter (2).
 static inline std::string s_stem(const std::string& word) {
     if (word.size() <= 3) return word;
     if (word.back() != 's') return word;
@@ -324,7 +326,8 @@ const std::string& apply_stem(const std::string& w, uint8_t stemmer) {
     return g_stem_cache.emplace(w, std::move(s)).first->second;
 }
 
-// Returns (term, original_token_position) pairs.
+// Query path: (stemmed term, token index). Token index is unused at retrieve
+// but kept so title_window could be applied to queries if needed.
 std::vector<std::pair<std::string, uint32_t>>
 cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
     std::vector<std::pair<std::string, uint32_t>> tokens;
@@ -333,7 +336,7 @@ cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
     uint32_t pos = 0;
 
     auto emit = [&]() {
-        if (current.size() <= 1) { current.clear(); return; }
+        if (current.size() <= 1) { current.clear(); return; }  // drop 1-char tokens
         uint32_t this_pos = pos++;
         if (!(cfg.remove_stop && INDEX_STOPWORDS.count(current)))
             tokens.push_back({apply_stem(current, cfg.stemmer), this_pos});
@@ -350,7 +353,7 @@ cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
     return tokens;
 }
 
-// Build-path tokenisation: one pass into tf maps, no per-token std::string vector.
+// Index path: fill body tf and title tf (tokens with position < title_window).
 void accumulate_tf(
     std::string_view text, const TokenizerCfg& cfg, uint32_t title_window,
     std::unordered_map<std::string, uint32_t>& term_data,

@@ -1,5 +1,5 @@
 #pragma once
-// Memory-map index files / the corpus, and parse {"doc_id","text"} JSONL.
+// mmap for index/corpus files; JSONL parser for {"doc_id","text"}.
 
 #include <cstdint>
 #include <cstddef>

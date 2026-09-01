@@ -1,4 +1,9 @@
-// Postings codecs: packed tf byte, Simple-9, Elias-Fano, vbyte.
+// Postings codecs used by engine.h.
+//
+// pack_tf: bits 0–5 body tf (1..63), bits 6–7 title tf (0..3).
+// Simple-9: 4-byte words, top 4 bits = selector, rest packed integers.
+// Elias-Fano: increasing doc ids (unary high bits + l low bits).
+// vbyte: 7-bit payload, MSB=continue.
 #pragma once
 
 #include "ir_config.h"
@@ -14,6 +19,7 @@ inline uint8_t pack_tf(uint32_t body_tf, uint32_t title_tf) {
     return static_cast<uint8_t>(b | (t << 6));
 }
 
+// Selector s packs S9_N[s] values of S9_B[s] bits each (fits in 28 payload bits).
 constexpr uint8_t S9_N[9] = {28, 14, 9, 7, 5, 4, 3, 2, 1};
 constexpr uint8_t S9_B[9] = { 1,  2, 3, 4, 5, 7, 9,14,28};
 
@@ -23,6 +29,7 @@ void ef_pack(std::vector<uint8_t>& out, const uint32_t* docs, uint32_t n);
 void ef_unpack_docs(const uint8_t*& ptr, uint32_t* docs, uint32_t n);
 void check_codecs();
 
+// Sequential Elias-Fano: unary run of zeros then a 1 for each high-bit delta.
 struct EFReader {
     const uint8_t* p = nullptr;
     uint64_t buf = 0;
@@ -84,6 +91,7 @@ struct S9Reader {
     }
 };
 
+// Advance past n Simple-9 values without unpacking (selector is in byte 3).
 inline const uint8_t* s9_skip(const uint8_t* p, uint32_t n) {
     uint32_t i = 0;
     while (i < n) { i += S9_N[static_cast<uint32_t>(p[3]) >> 4]; p += 4; }

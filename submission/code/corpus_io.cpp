@@ -1,5 +1,6 @@
 #include "corpus_io.h"
 
+// Fast path: find "doc_id" / "text" keys; unescape only if a backslash is present.
 bool parse_jsonl_sv(std::string_view line, std::string& doc_id, std::string& text) {
     if (line.empty()) return false;
     size_t id_pos = line.find("\"doc_id\"");

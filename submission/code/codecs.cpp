@@ -2,6 +2,7 @@
 #include <random>
 #include <algorithm>
 
+// Greedy: pick the smallest selector that still holds the next k values.
 void simple9_pack(std::vector<uint8_t>& out, const uint32_t* vals, uint32_t n) {
     uint32_t i = 0;
     while (i < n) {

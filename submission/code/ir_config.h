@@ -1,5 +1,4 @@
-// Build/query constants, index version, and the small types shared by every
-// translation unit. Nothing here allocates.
+// Shared constants and on-disk types (no allocations).
 #pragma once
 
 #include <cstdint>
@@ -9,17 +8,17 @@
 #include <string>
 #include <thread>
 
-constexpr uint32_t FWD_CANDIDATES   = 64;
-constexpr int      RM3_POOL         = 250;
-constexpr uint8_t  INDEX_VERSION    = 10;
-constexpr uint32_t TF_MAX           = 63;
-constexpr uint32_t TITLE_TF_MAX     = 3;
-constexpr uint32_t POST_VBYTE_DF    = 8;
+constexpr uint32_t FWD_CANDIDATES   = 64;   // prune width before per-doc keep
+constexpr int      RM3_POOL         = 250;  // abstract collections: rerank this many
+constexpr uint8_t  INDEX_VERSION    = 10;   // bump when dict/postings layout changes
+constexpr uint32_t TF_MAX           = 63;   // 6 bits in pack_tf
+constexpr uint32_t TITLE_TF_MAX     = 3;    // 2 bits in pack_tf
+constexpr uint32_t POST_VBYTE_DF    = 8;    // df below this: vbyte, else S9+EF
 
 struct BuildCfg {
-    uint32_t title_window   = 12;
-    uint32_t fwd_terms      = 20;
-    float    rm3_df_frac    = 0.13f;
+    uint32_t title_window   = 12;     // leading tokens treated as "title"
+    uint32_t fwd_terms      = 20;     // CSR terms kept per doc (scaled by length)
+    float    rm3_df_frac    = 0.13f;  // drop terms with df > this fraction of N
     uint32_t min_df         = 1;
 };
 
@@ -49,6 +48,7 @@ inline int build_workers_for_docs(uint32_t n_docs) {
     return n;
 }
 
+// Store |d|/avgdl as 8-bit log2 so doclens.bin stays small; BM25 only needs ~%.
 inline uint8_t quantize_doc_len(float len_ratio) {
     if (len_ratio <= 0.0f) return 0;
     float val = 64.0f * std::log2(1.0f + len_ratio);
