@@ -79,6 +79,15 @@ def test_small_short_docs_enable_light_rm3():
     assert abs(p["alpha"] - 0.65) < 1e-9
 
 
-def test_toy_sized_collection_does_not_force_rm3():
-    p = adapt_params(20, 15.0)
+def test_news_length_token_slice_still_uses_anserini():
+    """~500k tokens of Disks 45 is only a few thousand docs."""
+    p = adapt_params(1800, 280.0)
+    assert abs(p["k1"] - 0.9) < 1e-9
+    assert abs(p["b"] - 0.4) < 1e-9
+    assert p["use_rm3"] is True
+
+
+def test_short_answer_slice_drops_title_bonus():
+    p = adapt_params(25000, 20.0)
+    assert abs(p["title_bonus"] - 0.0) < 1e-9
     assert p["use_rm3"] is False

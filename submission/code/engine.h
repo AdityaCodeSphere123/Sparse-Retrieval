@@ -1134,7 +1134,7 @@ public:
             delta = 0.0f;
         }
 
-        const bool news_rm3 = (N >= 200000u && avg_doc_len >= 160.0f);
+        const bool news_rm3 = (avg_doc_len >= 180.0f && N >= 500u);
 
         // Query-length α. The mix is α·BM25 + (1-α)·RM3; the two arms are
         // not on the same scale, so α is not a probability — it is a

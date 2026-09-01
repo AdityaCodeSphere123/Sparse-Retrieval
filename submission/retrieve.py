@@ -101,8 +101,9 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
       * 20k–80k docs and avgdl≈100–125: citation abstracts (SciDocs).
       * N≥100k and avgdl≤135: on, strong μ, α=0.62.
       * N<20k and 90≤avgdl<120: on, μ≈2·avgdl, α=0.45.
-      * N≥200k and avgdl≥160: Anserini BM25 (k1=0.9, b=0.4) + RM3
-        second pass (Robust04 / Disks 45).
+      * N≥500 and avgdl≥180: Anserini BM25 + RM3 (Robust04, or a token
+        slice of it). Not gated on N≥200k — a 500k-token news slice is
+        only a few thousand documents.
       * N<10k and avgdl≥152: on, light (small full-text papers).
       * 500≤N<20k and avgdl<50: on, light (classic short-doc IR).
         avgdl<28 uses a tighter feedback set than 28–50.
@@ -144,11 +145,9 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         out["fb_docs"] = int(_clip(5, 5, max(5, n // 100)))
         out["fb_terms"] = 50
         out["rm3_pool"] = int(min(200, max(50, n // 4)))
-    elif n >= 200_000 and avg >= 160.0:
-        # Disks 45 / Robust04-shaped newswire: Anserini BM25 (k1=0.9, b=0.4)
-        # plus RM3 with a full-collection second pass (see engine.h). High k1
-        # from NEWS is the Touché/argument operating point (avgdl≈154) and
-        # over-promotes repeated terms in 200–400 token news articles.
+    elif avg >= 180.0 and n >= 500:
+        # News-length docs at any collection size (full Robust04 or a
+        # ~500k-token slice, N≈avgdl⁻¹·5e5). High k1 is for Touché/arguments.
         out["use_rm3"] = True
         out["k1"] = 0.9
         out["b"] = 0.4
@@ -163,19 +162,17 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     else:
         out["use_rm3"] = False
 
-    # Very short documents (community answers, titles-as-docs): high k1/δ
-    # over-promotes a single title hit. Keep this below the forum/abstract
-    # band (avg≈70–110) where the SHORT point is still the right one.
     # Very short documents. Quora-style titles (avgdl≲10) need length
     # normalisation; community answers (avgdl≈20) should not treat the
-    # lead tokens as a headline.
+    # lead tokens as a headline. Gate Antique on N≥20k so a ~500k-token
+    # short-doc slice still matches, while CACM/Vaswani (N<12k) keep a title.
     if avg < 12.0:
         out["k1"] = 1.5
         out["b"] = 0.70
         out["delta"] = 0.45
         out["title_bonus"] = 0.40
     elif avg < 40.0:
-        if n >= 50_000:
+        if n >= 20_000:
             out["k1"] = 1.75
             out["b"] = 0.45
             out["delta"] = 0.45
@@ -189,7 +186,7 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         # Large abstract collections: SHORT's k1=2.4 is slightly too
         # tf-greedy once RM3 is also on.
         out["k1"] = 2.15
-    elif n < 10_000 and avg >= 140.0:
+    elif n < 10_000 and 140.0 <= avg < 180.0:
         # Small paper collections (too few docs to be NEWS, too long to
         # be SHORT). Milder length-norm, keep a title field.
         out["k1"] = 2.35
