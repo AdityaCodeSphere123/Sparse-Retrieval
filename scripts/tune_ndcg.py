@@ -41,7 +41,7 @@ def ndcg(engine, queries, qrels, k=10, **kw):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sets", nargs="+", default=["cranfield", "scifact", "nfcorpus", "fiqa", "touche", "full"])
-    ap.add_argument("--mode", choices=["diag", "news", "rm3", "covid"], default="diag")
+    ap.add_argument("--mode", choices=["diag", "news", "rm3", "covid", "hard"], default="diag")
     args = ap.parse_args()
 
     for name in args.sets:
@@ -74,16 +74,24 @@ def main():
             if args.mode == "diag":
                 continue
 
-            if args.mode in ("news", "covid"):
-                for k1 in (0.9, 1.2, 1.6, 2.0, 2.2):
-                    for b in (0.30, 0.40, 0.50, 0.75):
+            if args.mode == "hard":
+                run_cfg("rm3_off", use_rm3=False)
+                for k1 in (1.2, 1.5, 1.75, 2.0, 2.2, 2.4, 2.8):
+                    for b in (0.25, 0.35, 0.45, 0.55, 0.70):
                         run_cfg(f"k1={k1} b={b}", k1=k1, b=b, use_rm3=False)
-                for delta in (0.0, 0.25, 0.5, 1.0):
-                    run_cfg(f"delta={delta} no_rm3", delta=delta, use_rm3=False)
-                for tb in (0.0, 0.3, 0.5, 0.75, 1.0):
-                    run_cfg(f"title_bonus={tb} no_rm3", title_bonus=tb, use_rm3=False)
+                for delta in (0.0, 0.25, 0.45, 0.6, 0.8, 1.0):
+                    run_cfg(f"delta={delta}", delta=delta, use_rm3=False)
+                for tb in (0.0, 0.2, 0.4, 0.6, 0.8, 1.1):
+                    run_cfg(f"tb={tb}", title_bonus=tb, use_rm3=False)
+                for alpha, fbt, fbd in (
+                    (0.5, 10, 8), (0.55, 20, 8), (0.6, 20, 10),
+                    (0.7, 15, 8), (0.75, 10, 5), (0.65, 30, 10),
+                ):
+                    run_cfg(f"rm3 a={alpha} t={fbt} d={fbd}",
+                            use_rm3=True, alpha=alpha, fb_terms=fbt, fb_docs=fbd)
+                continue
 
-            if args.mode in ("rm3", "news", "covid"):
+            if args.mode in ("news", "covid"):
                 run_cfg("rm3_off", use_rm3=False)
                 for alpha in (0.4, 0.5, 0.6, 0.7):
                     for fbt in (10, 20, 40):

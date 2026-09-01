@@ -39,6 +39,22 @@ def test_small_collection_caps_feedback_at_one_percent():
 def test_very_short_docs_use_milder_bm25():
     p = adapt_params(400000, 20.0)
     assert abs(p["k1"] - 1.75) < 1e-9
+    assert abs(p["b"] - 0.45) < 1e-9
+    assert abs(p["title_bonus"] - 0.0) < 1e-9
+    assert p["use_rm3"] is False
+
+
+def test_near_duplicate_titles_use_strong_length_norm():
+    p = adapt_params(522931, 5.76)
+    assert abs(p["k1"] - 1.5) < 1e-9
+    assert abs(p["b"] - 0.70) < 1e-9
+    assert p["use_rm3"] is False
+
+
+def test_forum_docs_use_milder_k1():
+    p = adapt_params(57638, 71.03)
+    assert abs(p["k1"] - 1.5) < 1e-9
+    assert abs(p["b"] - 0.70) < 1e-9
     assert p["use_rm3"] is False
 
 

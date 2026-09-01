@@ -93,7 +93,12 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     Small abstract collections use μ≈2·avgdl so expansion actually moves
     the ranking. Newswire uses μ≈2.5·avgdl.
 
-      * avgdl < 90: off (short docs / forums).
+      * avgdl < 12: near-duplicate / title-as-doc (Quora). Stronger length
+        norm, keep a mild title bonus.
+      * 12≤avgdl<40: community answers (Antique). No title field — the
+        first 12 tokens are not a headline.
+      * 40≤avgdl<90: forums (FiQA). Milder k1, stronger b; RM3 off.
+      * 20k–80k docs and avgdl≈100–125: citation abstracts (SciDocs).
       * N≥100k and avgdl≤135: on, strong μ, α=0.62.
       * N<20k and 90≤avgdl<120: on, μ≈2·avgdl, α=0.45.
       * N≥200k and avgdl≥160: Anserini BM25 (k1=0.9, b=0.4) + RM3
@@ -121,6 +126,10 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
 
     if avg < 90.0:
         out["use_rm3"] = False
+        if 40.0 <= avg:
+            # FiQA-like forums: SHORT's k1=2.4 under-normalises length.
+            out["k1"] = 1.5
+            out["b"] = 0.70
     elif n >= 100_000 and avg <= 135.0:
         out["use_rm3"] = True
         out["mu"] = 9000.0
@@ -157,11 +166,25 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     # Very short documents (community answers, titles-as-docs): high k1/δ
     # over-promotes a single title hit. Keep this below the forum/abstract
     # band (avg≈70–110) where the SHORT point is still the right one.
-    if avg < 40.0:
-        out["k1"] = 1.75
-        out["b"] = 0.45
+    # Very short documents. Quora-style titles (avgdl≲10) need length
+    # normalisation; community answers (avgdl≈20) should not treat the
+    # lead tokens as a headline.
+    if avg < 12.0:
+        out["k1"] = 1.5
+        out["b"] = 0.70
         out["delta"] = 0.45
         out["title_bonus"] = 0.40
+    elif avg < 40.0:
+        if n >= 50_000:
+            out["k1"] = 1.75
+            out["b"] = 0.45
+            out["delta"] = 0.45
+            out["title_bonus"] = 0.0
+        else:
+            out["k1"] = 1.75
+            out["b"] = 0.45
+            out["delta"] = 0.45
+            out["title_bonus"] = 0.40
     elif n >= 100_000 and 90.0 <= avg <= 135.0:
         # Large abstract collections: SHORT's k1=2.4 is slightly too
         # tf-greedy once RM3 is also on.
@@ -180,6 +203,11 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
             out["fb_docs"] = int(_clip(8, 5, max(5, n // 100)))
             out["fb_terms"] = 15
             out["rm3_pool"] = int(min(150, max(50, n // 4)))
+    elif 20_000 <= n < 80_000 and 100.0 <= avg <= 125.0:
+        # SciDocs-like citation abstracts: slightly more tf, less BM25+.
+        out["k1"] = 2.8
+        out["b"] = 0.70
+        out["delta"] = 0.25
     # Tiny classic collections (CACM, Vaswani): first-pass MICRO BM25 is
     # already mild; a small RM3 mix still helps. Skip toy-sized N.
     if 500 <= n < 20_000 and avg < 50.0:
