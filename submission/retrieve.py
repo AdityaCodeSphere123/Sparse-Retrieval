@@ -189,9 +189,11 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     return out
 
 
-# Already entropy-coded files still gzip somewhat; leave the tiny layout
-# files uncompressed so tests (and a debugger) can read them as-is.
-_GZIP_NAMES = frozenset({"postings.bin", "dict.bin"})
+# Gzip layout files too. Postings are already entropy-coded — gzip-9
+# costs ~0.5s on the larger collections and barely shrinks them, so those
+# stay at level 1. dict/docmap/doclens are small and gzip well at 6.
+_GZIP_NAMES = frozenset({"postings.bin", "dict.bin", "docmap.bin", "doclens.bin"})
+_GZIP_LEVEL = {"postings.bin": 1, "dict.bin": 6, "docmap.bin": 6, "doclens.bin": 6}
 
 
 def _gzip_one(index_dir: str, name: str) -> None:
@@ -199,11 +201,15 @@ def _gzip_one(index_dir: str, name: str) -> None:
     if not os.path.isfile(path):
         return
     gz_path = path + ".gz"
+    level = _GZIP_LEVEL.get(name, 1)
     with open(path, "rb") as src, open(gz_path, "wb") as dst:
         with gzip.GzipFile(
-            filename="", fileobj=dst, mode="wb", mtime=0, compresslevel=1
+            filename="", fileobj=dst, mode="wb", mtime=0, compresslevel=level
         ) as gz:
             shutil.copyfileobj(src, gz)
+    if os.path.getsize(gz_path) >= os.path.getsize(path):
+        os.remove(gz_path)
+        return
     os.remove(path)
 
 

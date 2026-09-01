@@ -110,7 +110,13 @@ def test_ragged_doc_ids_roundtrip_front_coded_docmap():
             f.write('{"doc_id": "midid", "text": "beta gamma"}\n')
         index_dir = os.path.join(tmp, "index")
         r.build_index(corpus, index_dir)
-        docmap = open(os.path.join(index_dir, "docmap.bin"), "rb").read()
+        raw = os.path.join(index_dir, "docmap.bin")
+        gz = raw + ".gz"
+        if os.path.isfile(gz):
+            import gzip
+            docmap = gzip.open(gz, "rb").read()
+        else:
+            docmap = open(raw, "rb").read()
         n, id_len = struct.unpack_from("<IH", docmap, 0)
         assert n == 3
         assert id_len == 0, "mixed widths must take the front-coded path"

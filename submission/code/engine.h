@@ -5,7 +5,6 @@
 #include "codecs.h"
 #include "analysis.h"
 #include "corpus_io.h"
-
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -291,7 +290,7 @@ public:
             bool packed = false;
             std::string alphabet;
             int bits = 0;
-            if (id_len > 0 && id_len <= 12) {
+            if (id_len > 0 && id_len <= 24) {
                 bool seen[256] = {};
                 for (const auto& id : doc_ids)
                     for (unsigned char c : id) seen[c] = true;
