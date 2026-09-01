@@ -18,16 +18,15 @@ def test_short_small_collection_matches_shipped_params():
 
 def test_long_large_collection_uses_newswire_operating_point():
     p = adapt_params(528155, 280.0)
-    assert p["k1"] == _NEWS["k1"]
-    assert abs(_NEWS["k1"] - 2.2) < 1e-9
-    assert p["b"] == _NEWS["b"]
-    assert p["b"] < PARAMS["b"]
+    assert abs(p["k1"] - 0.9) < 1e-9
+    assert abs(p["b"] - 0.4) < 1e-9
+    assert abs(p["delta"] - 1.0) < 1e-9
     assert abs(p["mu"] - 700.0) < 1e-9
-    assert p["fb_docs"] == _NEWS["fb_docs"]
-    assert p["fb_terms"] == _NEWS["fb_terms"]
-    assert p["rm3_pool"] == _NEWS["rm3_pool"]
-    assert abs(p["title_bonus"] - _NEWS["title_bonus"]) < 1e-9
+    assert p["fb_docs"] == 10
+    assert p["fb_terms"] == 10
     assert p["use_rm3"] is True
+    assert abs(p["alpha"] - 0.50) < 1e-9
+    assert abs(p["title_bonus"] - 0.4) < 1e-9
 
 
 def test_small_collection_caps_feedback_at_one_percent():

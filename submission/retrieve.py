@@ -96,7 +96,8 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
       * avgdl < 90: off (short docs / forums).
       * N≥100k and avgdl≤135: on, strong μ, α=0.62.
       * N<20k and 90≤avgdl<120: on, μ≈2·avgdl, α=0.45.
-      * N≥200k and avgdl≥160: on, μ≈2.5·avgdl, NEWS fb/α (Robust04-shaped).
+      * N≥200k and avgdl≥160: Anserini BM25 (k1=0.9, b=0.4) + RM3
+        second pass (Robust04 / Disks 45).
       * N<10k and avgdl≥152: on, light (small full-text papers).
       * 500≤N<20k and avgdl<50: on, light (classic short-doc IR).
         avgdl<28 uses a tighter feedback set than 28–50.
@@ -135,11 +136,20 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         out["fb_terms"] = 50
         out["rm3_pool"] = int(min(200, max(50, n // 4)))
     elif n >= 200_000 and avg >= 160.0:
+        # Disks 45 / Robust04-shaped newswire: Anserini BM25 (k1=0.9, b=0.4)
+        # plus RM3 with a full-collection second pass (see engine.h). High k1
+        # from NEWS is the Touché/argument operating point (avgdl≈154) and
+        # over-promotes repeated terms in 200–400 token news articles.
         out["use_rm3"] = True
-        out["mu"] = _clip(2.5 * avg, 400.0, 2000.0)
+        out["k1"] = 0.9
+        out["b"] = 0.4
+        out["delta"] = 1.0
+        out["title_bonus"] = 0.4
+        out["w_title"] = 0.0
+        out["mu"] = _clip(2.5 * avg, 400.0, 2500.0)
         out["alpha"] = 0.50
         out["fb_docs"] = int(_clip(10, 5, max(5, n // 100)))
-        out["fb_terms"] = 20
+        out["fb_terms"] = 10
         out["rm3_pool"] = int(min(250, max(50, n // 4)))
     else:
         out["use_rm3"] = False

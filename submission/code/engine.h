@@ -1134,28 +1134,30 @@ public:
             delta = 0.0f;
         }
 
+        const bool news_rm3 = (N >= 200000u && avg_doc_len >= 160.0f);
+
         // Query-length α. The mix is α·BM25 + (1-α)·RM3; the two arms are
         // not on the same scale, so α is not a probability — it is a
         // regime knob that we then tilt by how under-specified the query is.
-        // Short keyword queries (Robust04 titles, qn≤4) need more expansion.
-        // Verbose queries on a large collection already name the topic.
-        // Document-as-query is killed above, not mixed.
+        // Short keyword queries on abstract collections need more expansion.
+        // Robust04 titles keep α near the Anserini 0.5 original-query weight
+        // and run a full second pass instead of a 250-doc pool rerank.
         if (use_rm3) {
-            if (qn <= 4) {
+            if (news_rm3) {
+                if (qn <= 2) alpha = std::min(alpha, 0.45f);
+            } else if (qn <= 4) {
                 float t = (static_cast<float>(qn) - 2.0f) / 2.0f;
                 if (t < 0.0f) t = 0.0f;
                 if (t > 1.0f) t = 1.0f;
                 // qn=2 → 0.42, qn=4 → 0.62 (SHORT midpoint unchanged)
                 const float short_a = 0.42f + 0.20f * t;
                 alpha = std::min(alpha, short_a);
-                // nDCG@10 does not need a 600-doc pool; 250 matches the
-                // CORD operating point and cuts the RM3 CSR walk.
                 rm3_pool = std::max(rm3_pool, 250);
             } else if (qn >= 12 && N >= 20000u) {
                 alpha = std::max(alpha, 0.75f);
                 fb_terms = std::min(fb_terms, 25);
             }
-            if (rm3_pool > 250) rm3_pool = 250;
+            if (!news_rm3 && rm3_pool > 250) rm3_pool = 250;
         }
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
@@ -1163,7 +1165,7 @@ public:
         const int f_prf2 = prf2_docs;
         const int f_rm3  = fb_docs;
         int pass1_depth = std::max(std::max(std::max(f_prf2, f_rm3), k),
-                                   use_rm3 ? std::max(rm3_pool, k) : k);
+                                   (use_rm3 && !news_rm3) ? std::max(rm3_pool, k) : k);
         auto pass1 = raw_retrieve(q_vec, pass1_depth, k1, b, delta, w_title, title_bonus);
         if (pass1.empty()) return {};
 
@@ -1302,6 +1304,30 @@ public:
                 auto exp_rm3 = top_rm3();
                 auto exp_prf2 = use_fusion ? top_prf2() : std::unordered_map<uint32_t, float>{};
 
+                if (news_rm3 && !use_fusion) {
+                    // Classic RM3: interpolate the query model and score the
+                    // whole collection. Pool rerank cannot promote a relevant
+                    // news article that BM25 left outside the top-250.
+                    float esum = 0.0f;
+                    for (const auto& kv : exp_rm3) {
+                        auto it = p_w_r.find(static_cast<int32_t>(kv.first));
+                        if (it != p_w_r.end()) esum += it->second;
+                    }
+                    if (esum <= 0.0f) esum = 1.0f;
+                    std::unordered_map<int32_t, float> mixed;
+                    for (const auto& kv : qw)
+                        mixed[kv.first] += alpha_rm3 * kv.second;
+                    for (const auto& kv : exp_rm3) {
+                        int32_t tid = static_cast<int32_t>(kv.first);
+                        auto it = p_w_r.find(tid);
+                        const float p = (it == p_w_r.end()) ? 0.0f : it->second;
+                        mixed[tid] += (1.0f - alpha_rm3) * (p / esum);
+                    }
+                    std::vector<std::pair<int32_t, float>> q2(mixed.begin(), mixed.end());
+                    pool = raw_retrieve(q2, k, k1, b, delta, w_title, title_bonus);
+                    if (pool.empty()) pool = pass1;
+                } else {
+
                 auto merge_exp = [&]() {
                     auto out = exp_rm3;
                     for (const auto& kv : exp_prf2) out[kv.first] += kv.second;
@@ -1431,6 +1457,7 @@ public:
                     if (static_cast<int>(pool.size()) > k)
                         pool.resize(static_cast<size_t>(std::max(k, 0)));
                 }
+                } // news_rm3 full second pass vs pool rerank
             }
         }
 
