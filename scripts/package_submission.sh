@@ -57,7 +57,7 @@ cp -r "${ROOT_DIR}/tests" "${BUILD_DIR}/"
 
 # Starter scripts only (no local sweeps / proxy builders).
 mkdir -p "${BUILD_DIR}/scripts"
-for f in package_submission.sh smoke_test.sh download_full_corpus.py error_analysis.py; do
+for f in smoke_test.sh download_full_corpus.py error_analysis.py; do
   cp "${ROOT_DIR}/scripts/${f}" "${BUILD_DIR}/scripts/"
 done
 

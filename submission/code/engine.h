@@ -1103,19 +1103,24 @@ public:
         if (qsum <= 0.0f) return {};
         for (auto& kv : qw) kv.second /= qsum;
 
-        // Document-as-query (ArguAna, verbose CACM): the query already
-        // names the topic. RM3 then pulls same-stance neighbours, and
-        // BM25+ delta on every matched term swamps tf. Keyword queries
-        // (TREC-COVID, Robust04 titles) never reach these cutoffs.
+        // Query length. ArguAna-style document-as-query still disables RM3
+        // (expansion grabs same-stance neighbours). Robust04 *description*
+        // topics are 15–40 tokens and must keep RM3 — that is what Anserini
+        // does. Only dump-length news queries get the hard cut.
         const int qn = static_cast<int>(qw.size());
         const int ntok = static_cast<int>(tokens.size());
-        if (qn >= 20 || ntok >= 45) {
+        const bool news_rm3 = (avg_doc_len >= 180.0f && N >= 500u);
+        if (news_rm3) {
+            if (ntok >= 90 || qn >= 40) {
+                use_rm3 = false;
+                title_bonus = 0.0f;
+                delta = 0.0f;
+            }
+        } else if (qn >= 20 || ntok >= 45) {
             use_rm3 = false;
             title_bonus = 0.0f;
             delta = 0.0f;
         }
-
-        const bool news_rm3 = (avg_doc_len >= 180.0f && N >= 500u);
 
         // Query-length α. The mix is α·BM25 + (1-α)·RM3; the two arms are
         // not on the same scale, so α is not a probability — it is a
@@ -1126,6 +1131,12 @@ public:
         if (use_rm3) {
             if (news_rm3) {
                 if (qn <= 2) alpha = std::min(alpha, 0.45f);
+                else if (qn >= 8 || ntok >= 18) {
+                    // Description/narrative: stay on the original query.
+                    alpha = std::max(alpha, 0.65f);
+                    fb_terms = std::min(fb_terms, 10);
+                    title_bonus = 0.0f;
+                }
             } else if (qn <= 4) {
                 float t = (static_cast<float>(qn) - 2.0f) / 2.0f;
                 if (t < 0.0f) t = 0.0f;
@@ -1171,11 +1182,27 @@ public:
             if (var < 1e-6f) {
                 pool = pass1;
             } else {
-                float norm = 0.0f;
-                for (int i = 0; i < num_fb; ++i) norm += pass1[i].second;
-                if (norm <= 0.0f) norm = 1.0f;
+                // P(d|R): mix uniform (Anserini RM3) with a scale-free
+                // score weight. Raw BM25+ is not a probability — s_i/Σs
+                // lets one large score own the relevance model. log1p
+                // compresses that. News leans uniform; abstracts keep
+                // more of the first-pass ranking.
                 fb_wts.resize(num_fb);
-                for (int i = 0; i < num_fb; ++i) fb_wts[i] = pass1[i].second / norm;
+                float wsum = 0.0f;
+                for (int i = 0; i < num_fb; ++i) {
+                    float s = pass1[i].second;
+                    if (s < 0.0f) s = 0.0f;
+                    fb_wts[i] = std::log1p(s);
+                    wsum += fb_wts[i];
+                }
+                const float lam_u = news_rm3 ? 0.70f : 0.25f;
+                const float invk = 1.0f / static_cast<float>(std::max(num_fb, 1));
+                if (wsum <= 1e-12f) {
+                    for (int i = 0; i < num_fb; ++i) fb_wts[i] = invk;
+                } else {
+                    for (int i = 0; i < num_fb; ++i)
+                        fb_wts[i] = lam_u * invk + (1.0f - lam_u) * (fb_wts[i] / wsum);
+                }
 
                 std::vector<uint32_t> pool_ids;
                 pool_ids.reserve(pass1.size());
@@ -1185,8 +1212,10 @@ public:
 
                 const float alpha_rm3 = alpha;
                 const int keep_rm3 = fb_terms;
+                const uint32_t min_sup = (num_fb >= 12) ? 2u : 1u;
 
                 std::unordered_map<int32_t, float> p_w_r;
+                std::unordered_map<int32_t, uint32_t> fb_df;
                 for (int i = 0; i < num_fb; ++i) {
                     uint32_t doc_id = pass1[i].first;
                     float d_len = static_cast<float>(doc_lens[doc_id]);
@@ -1201,6 +1230,7 @@ public:
                             ? (static_cast<float>(term_metas[tid].cf) / total_corpus_tokens)
                             : 1e-4f;
                         p_w_r[tid] += fb_wts[i] * (tf + mu * p_w_c) / denom;
+                        fb_df[tid] += 1u;
                     }
                 }
 
@@ -1211,8 +1241,11 @@ public:
 
                 std::vector<std::pair<int32_t, float>> expansion;
                 expansion.reserve(p_w_r.size());
-                for (const auto& e : p_w_r)
+                for (const auto& e : p_w_r) {
+                    auto sit = fb_df.find(e.first);
+                    if (sit == fb_df.end() || sit->second < min_sup) continue;
                     expansion.push_back({e.first, e.second * idf_of(e.first)});
+                }
                 size_t keep = std::min(static_cast<size_t>(std::max(keep_rm3, 0)), expansion.size());
                 std::unordered_map<uint32_t, float> exp_rm3;
                 if (keep > 0) {
