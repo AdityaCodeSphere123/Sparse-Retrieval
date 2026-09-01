@@ -24,6 +24,8 @@
 #include <exception>
 #include <string_view>
 #include <cstddef>
+#include <atomic>
+#include <chrono>
 
 class CPPEngine {
 public:
@@ -52,21 +54,24 @@ public:
     std::vector<uint32_t> csr_tf;
     uint32_t fwd_keep = 20;
 
-    // ---- query-time scratch -------------------------------------------------
-    // A dense accumulator plus a dirty list. Scoring touches acc[doc] directly
-    // (no hashing) and only the touched entries are reset after each query.
-    std::vector<float> acc;
-    std::vector<uint32_t> touched;
-    std::vector<uint32_t> scratch_gaps;
-    std::vector<uint32_t> scratch_tfs;
-    std::vector<uint32_t> scratch_titles;
-    std::vector<float> fb_wts;
-
     struct BatchFwd {
         std::vector<std::pair<uint32_t, uint32_t>> arena;
         std::vector<uint32_t> start;
         std::vector<uint32_t> len;
     };
+
+    // ---- query-time scratch -------------------------------------------------
+    // Dense accumulator + dirty list. A generation stamp avoids O(touched)
+    // zeroing at the end of every query (the old max-latency tail).
+    std::vector<float> acc;
+    std::vector<uint32_t> acc_stamp;
+    uint32_t score_gen = 1;
+    std::vector<uint32_t> touched;
+    std::vector<uint32_t> scratch_gaps;
+    std::vector<uint32_t> scratch_tfs;
+    std::vector<uint32_t> scratch_titles;
+    std::vector<float> fb_wts;
+    BatchFwd fwd_batch;
 
     CPPEngine() = default;
 
@@ -419,7 +424,6 @@ public:
 
         std::vector<DocPosting> merged;
         std::vector<uint8_t> block_data;
-        std::vector<uint64_t> cfs_in_order;
 
         while (true) {
             const std::string* min_term = nullptr;
@@ -435,14 +439,11 @@ public:
 
             merged.clear();
             merged.reserve(df);
-            uint64_t merged_cf = 0;
 
             for (auto& r : readers) {
                 if (!r.active() || r.term() != term) continue;
-                for (const auto& dp : r.posts()) {
-                    merged_cf += dp.tf;
+                for (const auto& dp : r.posts())
                     merged.push_back(dp);
-                }
                 r.next();
             }
 
@@ -489,7 +490,6 @@ public:
             }
             f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
             current_postings_offset += block_data.size();
-            cfs_in_order.push_back(merged_cf);
 
             // -------- dict entry, front-coded against the previous term ----
             size_t prefix = 0;
@@ -526,15 +526,9 @@ public:
         f_postings.close();
         mem_runs.clear();
         stamp("merge", t0);
-
-        // -------- stage 3: RM3 CSR from postings (not persisted) -----------
-        load_dictionary(index_dir);
-        for (size_t i = 0; i < term_metas.size() && i < cfs_in_order.size(); ++i)
-            term_metas[i].cf = cfs_in_order[i];
-        postings_mmap.map_file(index_dir + "/postings.bin");
-        fwd_keep = buildcfg.fwd_terms;
-        rebuild_forward();
-        stamp("forward", t0);
+        // CSR is rebuilt at load_index (it is not on disk). Skipping it here
+        // is the whole build-time saving: the harness times this process
+        // separately from query load.
     }
 
     void build_index(const std::vector<std::pair<std::string, std::string>>& corpus,
@@ -613,99 +607,159 @@ public:
         csr_tid.clear();
         csr_tf.clear();
         if (N == 0 || term_metas.empty()) return;
-        // Mid-df filter first, then tf×idf. Cutting by raw tf before the
-        // df band emptied RM3 rows on long documents. Cap is length-scaled.
-        // Small collections: keep rare terms. df_min=5 dropped the
-        // technical vocabulary RM3 needs when N is a few thousand.
+
         const bool small_col = (N < 20000u);
         const uint32_t df_band_min = small_col ? 1u : 5u;
         const uint32_t df_max = small_col ? N : std::max<uint32_t>(
             df_band_min, static_cast<uint32_t>(buildcfg.rm3_df_frac * static_cast<float>(N)));
+
+        const uint32_t nterms = static_cast<uint32_t>(term_metas.size());
+        int W = build_workers_for_docs(N);
+        if (nterms < 512u || N < 512u) W = 1;
+        if (W > static_cast<int>(nterms)) W = static_cast<int>(nterms);
+        if (W < 1) W = 1;
+
+        auto run_W = [&](auto&& fn) {
+            if (W <= 1) { fn(0); return; }
+            std::vector<std::thread> pool;
+            pool.reserve(static_cast<size_t>(W));
+            for (int w = 0; w < W; ++w) pool.emplace_back(fn, w);
+            for (auto& t : pool) t.join();
+        };
+
+        // Pass 1: df-band occupancy + collection frequency, terms sharded.
+        std::vector<std::vector<uint32_t>> cnt_w(static_cast<size_t>(W),
+                                                 std::vector<uint32_t>(N, 0));
+        run_W([&](int w) {
+            const uint32_t lo = static_cast<uint32_t>((static_cast<uint64_t>(w) * nterms) / W);
+            const uint32_t hi = static_cast<uint32_t>((static_cast<uint64_t>(w + 1) * nterms) / W);
+            auto& cnt = cnt_w[static_cast<size_t>(w)];
+            for (uint32_t tid = lo; tid < hi; ++tid) {
+                uint64_t cf = 0;
+                visit_postings(tid, [&](uint32_t d, uint32_t tf) {
+                    if (d < N) ++cnt[d];
+                    cf += tf;
+                });
+                term_metas[tid].cf = cf;
+            }
+        });
         std::vector<uint32_t> cnt(N, 0);
-        for (uint32_t tid = 0; tid < term_metas.size(); ++tid) {
-            uint64_t cf = 0;
-            visit_postings(tid, [&](uint32_t d, uint32_t tf) {
-                if (d < N) ++cnt[d];
-                cf += tf;
-            });
-            term_metas[tid].cf = cf;
+        for (int w = 0; w < W; ++w) {
+            const auto& src = cnt_w[static_cast<size_t>(w)];
+            for (uint32_t d = 0; d < N; ++d) cnt[d] += src[d];
         }
+        cnt_w.clear();
+        cnt_w.shrink_to_fit();
+
         csr_off.assign(static_cast<size_t>(N) + 1, 0);
         for (uint32_t d = 0; d < N; ++d) csr_off[d + 1] = csr_off[d] + cnt[d];
         csr_tid.assign(csr_off[N], 0);
         csr_tf.assign(csr_off[N], 0);
-        std::vector<uint32_t> cursor(csr_off.begin(), csr_off.end() - 1);
-        for (uint32_t tid = 0; tid < term_metas.size(); ++tid) {
-            visit_postings(tid, [&](uint32_t d, uint32_t tf) {
-                if (d >= N) return;
-                uint32_t at = cursor[d]++;
-                csr_tid[at] = tid;
-                csr_tf[at] = tf;
-            });
-        }
+
+        // Pass 2: scatter postings into CSR. Each term is owned by one
+        // worker; docs collide, so the write cursor is atomic.
+        std::vector<std::atomic<uint32_t>> cursor(N);
+        for (uint32_t d = 0; d < N; ++d)
+            cursor[d].store(csr_off[d], std::memory_order_relaxed);
+        run_W([&](int w) {
+            const uint32_t lo = static_cast<uint32_t>((static_cast<uint64_t>(w) * nterms) / W);
+            const uint32_t hi = static_cast<uint32_t>((static_cast<uint64_t>(w + 1) * nterms) / W);
+            for (uint32_t tid = lo; tid < hi; ++tid) {
+                visit_postings(tid, [&](uint32_t d, uint32_t tf) {
+                    if (d >= N) return;
+                    uint32_t at = cursor[d].fetch_add(1u, std::memory_order_relaxed);
+                    csr_tid[at] = tid;
+                    csr_tf[at] = tf;
+                });
+            }
+        });
+
+        // Pass 3: per-doc tf×idf prune — independent across documents.
+        std::vector<uint32_t> keep_n(N, 0);
+        std::vector<std::vector<uint32_t>> keep_tid(static_cast<size_t>(W));
+        std::vector<std::vector<uint32_t>> keep_tf(static_cast<size_t>(W));
+        run_W([&](int w) {
+            const uint32_t lo = static_cast<uint32_t>((static_cast<uint64_t>(w) * N) / W);
+            const uint32_t hi = static_cast<uint32_t>((static_cast<uint64_t>(w + 1) * N) / W);
+            auto& out_tid = keep_tid[static_cast<size_t>(w)];
+            auto& out_tf = keep_tf[static_cast<size_t>(w)];
+            out_tid.reserve(static_cast<size_t>(hi - lo) * std::min<uint32_t>(fwd_keep, 32));
+            out_tf.reserve(out_tid.capacity());
+            std::vector<std::tuple<uint32_t, float, uint32_t>> cand;
+            for (uint32_t d = lo; d < hi; ++d) {
+                uint32_t a = csr_off[d], b = csr_off[d + 1];
+                cand.clear();
+                cand.reserve(b - a);
+                for (uint32_t i = a; i < b; ++i) {
+                    uint32_t tid = csr_tid[i];
+                    if (tid >= terms_sorted.size()) continue;
+                    if (small_col ? INDEX_STOPWORDS.count(terms_sorted[tid])
+                                  : STOPWORDS.count(terms_sorted[tid]))
+                        continue;
+                    uint32_t df = term_metas[tid].df;
+                    if (df < df_band_min || df > df_max) continue;
+                    uint32_t tf = csr_tf[i];
+                    float idf = (df > 0 && N > 0)
+                        ? std::log(static_cast<float>(N) / static_cast<float>(df))
+                        : 0.0f;
+                    cand.push_back({tf, static_cast<float>(tf) * idf, tid});
+                }
+                const uint32_t cand_cap = small_col ? 256u : FWD_CANDIDATES;
+                if (cand.size() > cand_cap) {
+                    std::partial_sort(cand.begin(),
+                                      cand.begin() + static_cast<std::ptrdiff_t>(cand_cap),
+                                      cand.end(),
+                                      [](const auto& x, const auto& y) {
+                                          return std::get<1>(x) > std::get<1>(y);
+                                      });
+                    cand.resize(cand_cap);
+                }
+                const float lr = (d < quantized_doc_lens.size())
+                    ? dequantize_doc_len(quantized_doc_lens[d]) : 1.0f;
+                const uint32_t keep_d = small_col
+                    ? 128u
+                    : std::min<uint32_t>(
+                        FWD_CANDIDATES,
+                        static_cast<uint32_t>(fwd_keep * std::min(1.0f + lr, 3.0f) * 0.5f + 0.5f));
+                size_t take = std::min(cand.size(), static_cast<size_t>(std::max(keep_d, 8u)));
+                if (take < cand.size()) {
+                    std::partial_sort(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(take),
+                                      cand.end(),
+                                      [](const auto& x, const auto& y) {
+                                          return std::get<1>(x) > std::get<1>(y);
+                                      });
+                    cand.resize(take);
+                }
+                std::sort(cand.begin(), cand.end(),
+                          [](const auto& x, const auto& y) {
+                              return std::get<2>(x) < std::get<2>(y);
+                          });
+                keep_n[d] = static_cast<uint32_t>(cand.size());
+                for (const auto& t : cand) {
+                    out_tid.push_back(std::get<2>(t));
+                    out_tf.push_back(std::get<0>(t));
+                }
+            }
+        });
+
         std::vector<uint32_t> new_off(static_cast<size_t>(N) + 1, 0);
-        std::vector<uint32_t> new_tid, new_tf;
-        new_tid.reserve(static_cast<size_t>(N) * std::min<uint32_t>(fwd_keep, 32));
-        new_tf.reserve(new_tid.capacity());
-        std::vector<std::tuple<uint32_t, float, uint32_t>> cand;  // tf, tf*idf, tid
-        for (uint32_t d = 0; d < N; ++d) {
-            uint32_t a = csr_off[d], b = csr_off[d + 1];
-            cand.clear();
-            cand.reserve(b - a);
-            for (uint32_t i = a; i < b; ++i) {
-                uint32_t tid = csr_tid[i];
-                if (tid >= terms_sorted.size()) continue;
-                if (small_col ? INDEX_STOPWORDS.count(terms_sorted[tid])
-                              : STOPWORDS.count(terms_sorted[tid]))
-                    continue;
-                uint32_t df = term_metas[tid].df;
-                if (df < df_band_min || df > df_max) continue;
-                uint32_t tf = csr_tf[i];
-                float idf = (df > 0 && N > 0)
-                    ? std::log(static_cast<float>(N) / static_cast<float>(df))
-                    : 0.0f;
-                cand.push_back({tf, static_cast<float>(tf) * idf, tid});
-            }
-            // Rank the candidate cut by tf*idf, not raw tf. On long documents
-            // raw tf selects the most common words, which the df band then
-            // discards -- leaving RM3 with near-empty feedback rows.
-            const uint32_t cand_cap = small_col ? 256u : FWD_CANDIDATES;
-            if (cand.size() > cand_cap) {
-                std::partial_sort(cand.begin(),
-                                  cand.begin() + static_cast<std::ptrdiff_t>(cand_cap),
-                                  cand.end(),
-                                  [](const auto& x, const auto& y) {
-                                      return std::get<1>(x) > std::get<1>(y);
-                                  });
-                cand.resize(cand_cap);
-            }
-            const float lr = (d < quantized_doc_lens.size())
-                ? dequantize_doc_len(quantized_doc_lens[d]) : 1.0f;
-            const uint32_t keep_d = small_col
-                ? 128u
-                : std::min<uint32_t>(
-                    FWD_CANDIDATES,
-                    static_cast<uint32_t>(fwd_keep * std::min(1.0f + lr, 3.0f) * 0.5f + 0.5f));
-            size_t take = std::min(cand.size(), static_cast<size_t>(std::max(keep_d, 8u)));
-            if (take < cand.size()) {
-                std::partial_sort(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(take),
-                                  cand.end(),
-                                  [](const auto& x, const auto& y) {
-                                      return std::get<1>(x) > std::get<1>(y);
-                                  });
-                cand.resize(take);
-            }
-            std::sort(cand.begin(), cand.end(),
-                      [](const auto& x, const auto& y) {
-                          return std::get<2>(x) < std::get<2>(y);
-                      });
-            new_off[d] = static_cast<uint32_t>(new_tid.size());
-            for (const auto& t : cand) {
-                new_tid.push_back(std::get<2>(t));
-                new_tf.push_back(std::get<0>(t));
+        for (uint32_t d = 0; d < N; ++d) new_off[d + 1] = new_off[d] + keep_n[d];
+        std::vector<uint32_t> new_tid(new_off[N]), new_tf(new_off[N]);
+        for (int w = 0; w < W; ++w) {
+            const uint32_t lo = static_cast<uint32_t>((static_cast<uint64_t>(w) * N) / W);
+            const uint32_t hi = static_cast<uint32_t>((static_cast<uint64_t>(w + 1) * N) / W);
+            const auto& src_tid = keep_tid[static_cast<size_t>(w)];
+            const auto& src_tf = keep_tf[static_cast<size_t>(w)];
+            size_t j = 0;
+            for (uint32_t d = lo; d < hi; ++d) {
+                uint32_t at = new_off[d];
+                uint32_t n = keep_n[d];
+                for (uint32_t k = 0; k < n; ++k, ++j) {
+                    new_tid[at + k] = src_tid[j];
+                    new_tf[at + k] = src_tf[j];
+                }
             }
         }
-        new_off[N] = static_cast<uint32_t>(new_tid.size());
         csr_off.swap(new_off);
         csr_tid.swap(new_tid);
         csr_tf.swap(new_tf);
@@ -865,6 +919,8 @@ public:
         rebuild_forward();
 
         acc.assign(N, 0.0f);
+        acc_stamp.assign(N, 0);
+        score_gen = 1;
         touched.clear();
         touched.reserve(N);
     }
@@ -885,13 +941,19 @@ public:
     {
         if (qterms.empty() || N == 0 || !postings_mmap.data) return {};
 
-        // Length-normalisation denominator for each of the 256 quantised
-        // length buckets, computed once per query rather than per posting.
+        if (++score_gen == 0) {
+            std::fill(acc_stamp.begin(), acc_stamp.end(), 0);
+            score_gen = 1;
+        }
+        touched.clear();
+
         float length_penalty_lut[256];
         for (int q = 0; q < 256; ++q) {
             float ratio = dequantize_doc_len(static_cast<uint8_t>(q));
             length_penalty_lut[q] = k1 * (1.0f - b + b * ratio);
         }
+        const float k1p1 = k1 + 1.0f;
+        const bool use_title = (w_title != 0.0f) || (title_bonus != 0.0f);
 
         for (const auto& qt : qterms) {
             int32_t tid = qt.first;
@@ -904,7 +966,6 @@ public:
             if (w <= 0.0f) continue;
 
             const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
-            const float k1p1 = k1 + 1.0f;
             const uint32_t df = meta.df;
             if (df < POST_VBYTE_DF) {
                 uint32_t current_doc = 0;
@@ -912,19 +973,23 @@ public:
                     uint32_t coded = read_vbyte(ptr);
                     current_doc += coded >> 1;
                     uint8_t packed = (coded & 1u) ? 1 : *ptr++;
-                    uint8_t ttf = packed >> 6;
-                    float tf_eff = static_cast<float>(packed & 0x3F) +
-                                   w_title * static_cast<float>(ttf);
+                    uint8_t ttf = use_title ? static_cast<uint8_t>(packed >> 6) : 0;
+                    float tf_eff = static_cast<float>(packed & 0x3F);
+                    if (w_title != 0.0f) tf_eff += w_title * static_cast<float>(ttf);
                     float tf_norm = (tf_eff * k1p1) /
                                     (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
                     float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
-                    if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
+                    if (acc_stamp[current_doc] != score_gen) {
+                        acc_stamp[current_doc] = score_gen;
+                        acc[current_doc] = 0.0f;
+                        touched.push_back(current_doc);
+                    }
                     acc[current_doc] += contrib;
                 }
             } else {
                 const uint8_t* p_ef = s9_skip(ptr, df);
                 uint32_t n_title_hits = 0;
-                if (meta.has_title) {
+                if (use_title && meta.has_title) {
                     n_title_hits = read_vbyte(p_ef);
                     scratch_titles.resize(n_title_hits);
                     uint32_t prev = 0;
@@ -933,6 +998,11 @@ public:
                         prev += coded >> 2;
                         scratch_titles[h] = (prev << 2) | (coded & 3u);
                     }
+                } else if (meta.has_title) {
+                    // Title sidecar sits after EF; skip decoding it.
+                    n_title_hits = read_vbyte(p_ef);
+                    for (uint32_t h = 0; h < n_title_hits; ++h) (void)read_vbyte(p_ef);
+                    n_title_hits = 0;
                 }
 
                 S9Reader s9; s9.init(ptr);
@@ -946,20 +1016,22 @@ public:
                         ttf = static_cast<uint8_t>(scratch_titles[hi] & 3u);
                         ++hi;
                     }
-                    float tf_eff = static_cast<float>(tf_raw + 1u) +
-                                   w_title * static_cast<float>(ttf);
+                    float tf_eff = static_cast<float>(tf_raw + 1u);
+                    if (w_title != 0.0f) tf_eff += w_title * static_cast<float>(ttf);
                     float tf_norm = (tf_eff * k1p1) /
                                     (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
                     float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
-                    if (acc[current_doc] == 0.0f) touched.push_back(current_doc);
+                    if (acc_stamp[current_doc] != score_gen) {
+                        acc_stamp[current_doc] = score_gen;
+                        acc[current_doc] = 0.0f;
+                        touched.push_back(current_doc);
+                    }
                     acc[current_doc] += contrib;
                 }
             }
         }
 
         size_t want = std::min(static_cast<size_t>(std::max(top_k, 0)), touched.size());
-        // nth_element rather than partial_sort: we only need the top `want`
-        // as a set (exact order is imposed by the std::sort below).
         if (want < touched.size()) {
             std::nth_element(touched.begin(), touched.begin() + want, touched.end(),
                              [this](uint32_t a, uint32_t x) {
@@ -976,8 +1048,6 @@ public:
         std::vector<std::pair<uint32_t, float>> results;
         results.reserve(want);
         for (size_t i = 0; i < want; ++i) results.push_back({touched[i], acc[touched[i]]});
-
-        for (uint32_t d : touched) acc[d] = 0.0f;   // reset only what we dirtied
         touched.clear();
         return results;
     }
@@ -1079,11 +1149,14 @@ public:
                 // qn=2 → 0.42, qn=4 → 0.62 (SHORT midpoint unchanged)
                 const float short_a = 0.42f + 0.20f * t;
                 alpha = std::min(alpha, short_a);
-                rm3_pool = std::max(rm3_pool, 600);
+                // nDCG@10 does not need a 600-doc pool; 250 matches the
+                // CORD operating point and cuts the RM3 CSR walk.
+                rm3_pool = std::max(rm3_pool, 250);
             } else if (qn >= 12 && N >= 20000u) {
                 alpha = std::max(alpha, 0.75f);
                 fb_terms = std::min(fb_terms, 25);
             }
+            if (rm3_pool > 250) rm3_pool = 250;
         }
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
@@ -1142,8 +1215,8 @@ public:
                 std::vector<uint32_t> pool_ids;
                 pool_ids.reserve(pass1.size());
                 for (const auto& p : pass1) pool_ids.push_back(p.first);
-                BatchFwd batch;
-                get_batch_doc_term_freqs(pool_ids, batch);
+                get_batch_doc_term_freqs(pool_ids, fwd_batch);
+                BatchFwd& batch = fwd_batch;
 
                 const float alpha_rm3 = alpha;
                 const int keep_rm3 = fb_terms;
@@ -1289,10 +1362,12 @@ public:
                 if (!use_fusion || fusion_kind == 0) {
                     std::vector<size_t> ord(n);
                     for (size_t i = 0; i < n; ++i) ord[i] = i;
-                    std::sort(ord.begin(), ord.end(),
-                              [&](size_t a, size_t b) { return better(a, b, s_rm3); });
-                    pool.clear();
                     const size_t want_n = std::min(n, static_cast<size_t>(std::max(k, 0)));
+                    auto cmp = [&](size_t a, size_t b) { return better(a, b, s_rm3); };
+                    if (want_n < n)
+                        std::nth_element(ord.begin(), ord.begin() + want_n, ord.end(), cmp);
+                    std::sort(ord.begin(), ord.begin() + want_n, cmp);
+                    pool.clear();
                     pool.reserve(want_n);
                     for (size_t i = 0; i < want_n; ++i)
                         pool.push_back({pass1[ord[i]].first, s_rm3[ord[i]]});

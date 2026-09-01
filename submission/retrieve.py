@@ -53,7 +53,7 @@ _SHORT = dict(
 _NEWS = dict(
     k1=2.2, b=0.30, delta=0.50, w_title=0.0, title_bonus=0.30,
     use_rm3=True, fb_docs=10, fb_terms=20, alpha=0.50, mu=1000.0,
-    rm3_pool=1000, fb_temp=20.0, use_fusion=False,
+    rm3_pool=250, fb_temp=20.0, use_fusion=False,
 )
 PARAMS = dict(_SHORT)   # kept: other modules import PARAMS
 
@@ -140,7 +140,7 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         out["alpha"] = 0.50
         out["fb_docs"] = int(_clip(10, 5, max(5, n // 100)))
         out["fb_terms"] = 20
-        out["rm3_pool"] = int(min(1000, max(50, n // 4)))
+        out["rm3_pool"] = int(min(250, max(50, n // 4)))
     else:
         out["use_rm3"] = False
 
@@ -235,16 +235,32 @@ def _prepare_cpp_load_dir(index_dir: str) -> str:
         _LOAD_TMP.cleanup()
     _LOAD_TMP = tempfile.TemporaryDirectory(prefix="a1_idx_")
     out = _LOAD_TMP.name
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    jobs = []
+    copies = []
     for name in names:
         src = os.path.join(index_dir, name)
         if not os.path.isfile(src):
             continue
         if name.endswith(".gz"):
-            dest = os.path.join(out, name[:-3])
-            with gzip.open(src, "rb") as gzf, open(dest, "wb") as dst:
-                shutil.copyfileobj(gzf, dst)
+            jobs.append((src, os.path.join(out, name[:-3])))
         else:
-            shutil.copy2(src, os.path.join(out, name))
+            copies.append((src, os.path.join(out, name)))
+
+    def _inflate(pair):
+        src, dest = pair
+        with gzip.open(src, "rb") as gzf, open(dest, "wb") as dst:
+            shutil.copyfileobj(gzf, dst, length=1024 * 1024)
+
+    def _copy(pair):
+        shutil.copy2(pair[0], pair[1])
+
+    workers = min(4, max(1, len(jobs) + len(copies)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_inflate, jobs))
+        list(pool.map(_copy, copies))
     return out
 
 
