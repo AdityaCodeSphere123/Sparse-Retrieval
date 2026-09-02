@@ -1,5 +1,5 @@
-// Query/index analysis: lowercase, split on non-alnum, drop length-1,
-// optional INDEX_STOPWORDS, then stemmer 0/1/2 (none / S / Porter).
+// Query/index analysis: lowercase, split on non-alnum, fold dotted
+// initials (U.S. → us), drop leftover length-1, optional stops, stem.
 #pragma once
 
 #include <cstdint>

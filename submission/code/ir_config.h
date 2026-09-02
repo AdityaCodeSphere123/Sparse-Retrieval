@@ -10,7 +10,7 @@
 
 constexpr uint32_t FWD_CANDIDATES   = 64;   // prune width before per-doc keep
 constexpr int      RM3_POOL         = 250;  // abstract collections: rerank this many
-constexpr uint8_t  INDEX_VERSION    = 10;   // bump when dict/postings layout changes
+constexpr uint8_t  INDEX_VERSION    = 11;  // bump on postings layout OR analysis change
 constexpr uint32_t TF_MAX           = 63;   // 6 bits in pack_tf
 constexpr uint32_t TITLE_TF_MAX     = 3;    // 2 bits in pack_tf
 constexpr uint32_t POST_VBYTE_DF    = 8;    // df below this: vbyte, else S9+EF

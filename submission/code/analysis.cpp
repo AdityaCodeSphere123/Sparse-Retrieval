@@ -326,61 +326,74 @@ const std::string& apply_stem(const std::string& w, uint8_t stemmer) {
     return g_stem_cache.emplace(w, std::move(s)).first->second;
 }
 
-// Query path: (stemmed term, token index). Token index is unused at retrieve
-// but kept so title_window could be applied to queries if needed.
+// Dotted initials: "U.S." / "F.B.I." are otherwise three length-1 tokens and
+// vanish. Glue single letters separated only by '.' (u.s. → us). A lone
+// letter or "a. m." with a space still drops. Shared by query and index.
+template <typename Fn>
+static void each_surface(std::string_view text, Fn&& emit) {
+    (void)g_tok_inited;
+    std::string tok;
+    std::string acro;
+    tok.reserve(32);
+    acro.reserve(8);
+
+    auto flush_acro = [&]() {
+        if (acro.size() >= 2) emit(std::string_view(acro));
+        acro.clear();
+    };
+
+    auto take_tok = [&]() {
+        if (tok.empty()) return;
+        if (tok.size() == 1 && tok[0] >= 'a' && tok[0] <= 'z') {
+            acro.push_back(tok[0]);
+        } else {
+            flush_acro();
+            if (tok.size() > 1) emit(std::string_view(tok));
+        }
+        tok.clear();
+    };
+
+    for (unsigned char uc : text) {
+        if (g_tok_alnum[uc]) {
+            tok.push_back(static_cast<char>(g_tok_lower[uc]));
+        } else {
+            take_tok();
+            if (uc != static_cast<unsigned char>('.')) flush_acro();
+        }
+    }
+    take_tok();
+    flush_acro();
+}
+
 std::vector<std::pair<std::string, uint32_t>>
 cpp_tokenize(const std::string& text, const TokenizerCfg& cfg) {
     std::vector<std::pair<std::string, uint32_t>> tokens;
     tokens.reserve(text.size() / 6);
-    std::string current;
     uint32_t pos = 0;
 
-    auto emit = [&]() {
-        if (current.size() <= 1) { current.clear(); return; }  // drop 1-char tokens
+    each_surface(text, [&](std::string_view sv) {
+        std::string surface(sv);
         uint32_t this_pos = pos++;
-        if (!(cfg.remove_stop && INDEX_STOPWORDS.count(current)))
-            tokens.push_back({apply_stem(current, cfg.stemmer), this_pos});
-        current.clear();
-    };
-
-    for (unsigned char uc : text) {
-        if (g_tok_alnum[uc])
-            current += static_cast<char>(g_tok_lower[uc]);
-        else
-            emit();
-    }
-    emit();
+        if (cfg.remove_stop && INDEX_STOPWORDS.count(surface)) return;
+        tokens.push_back({apply_stem(surface, cfg.stemmer), this_pos});
+    });
     return tokens;
 }
 
-// Index path: fill body tf and title tf (tokens with position < title_window).
 void accumulate_tf(
     std::string_view text, const TokenizerCfg& cfg, uint32_t title_window,
     std::unordered_map<std::string, uint32_t>& term_data,
     std::unordered_map<std::string, uint32_t>& title_tf,
     uint32_t& d_len)
 {
-    (void)g_tok_inited;
-    char buf[96];
-    int n = 0;
     uint32_t pos = 0;
-    auto emit = [&]() {
-        if (n <= 1) { n = 0; return; }
-        std::string surface(buf, static_cast<size_t>(n));
-        n = 0;
+    each_surface(text, [&](std::string_view sv) {
+        std::string surface(sv);
         uint32_t this_pos = pos++;
         if (cfg.remove_stop && INDEX_STOPWORDS.count(surface)) return;
         const std::string& stem = apply_stem(surface, cfg.stemmer);
         term_data[stem]++;
         if (this_pos < title_window) title_tf[stem]++;
         ++d_len;
-    };
-    for (unsigned char uc : text) {
-        if (g_tok_alnum[uc]) {
-            if (n < 95) buf[n++] = static_cast<char>(g_tok_lower[uc]);
-        } else {
-            emit();
-        }
-    }
-    emit();
+    });
 }
