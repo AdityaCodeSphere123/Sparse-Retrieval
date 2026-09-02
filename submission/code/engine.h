@@ -1139,10 +1139,10 @@ public:
         //   news + (ntok≥90 | qn≥40)     → RM3 off, δ=0, title_bonus=0
         //   !news + (qn≥20 | ntok≥45)    → RM3 off, δ=0, title_bonus=0
         //   news + RM3 + qn≤2            → α = min(α, 0.45)
-        //   news + RM3 + (qn≥8 | ntok≥18)→ α = max(α, 0.65), fb_terms≤10, title_bonus=0
         //   !news + RM3 + qn≤4           → α = min(α, 0.42+0.20*(qn-2)/2), pool≥250
         //   !news + RM3 + qn≥12 + N≥20k  → α = max(α, 0.75), fb_terms≤25
         //   !news + RM3                  → pool = min(pool, 250)
+        // News descriptions keep Anserini α=0.5 / title_bonus (no extra cut).
         // retrieve_bm25 skips this block so ablations stay BM25+.
         if (apply_qlen_heuristics) {
             // Long queries: RM3 on a document-as-query pulls same-stance
@@ -1162,13 +1162,8 @@ public:
             // Mix is α·original + (1-α)·expansion; scores are not probabilities.
             if (use_rm3) {
                 if (news_rm3) {
+                    // Short Robust04 titles: a little more expansion than α=0.5.
                     if (qn <= 2) alpha = std::min(alpha, 0.45f);
-                    else if (qn >= 8 || ntok >= 18) {
-                        // Description/narrative: weight the original query more.
-                        alpha = std::max(alpha, 0.65f);
-                        fb_terms = std::min(fb_terms, 10);
-                        title_bonus = 0.0f;
-                    }
                 } else if (qn <= 4) {
                     float t = (static_cast<float>(qn) - 2.0f) / 2.0f;
                     if (t < 0.0f) t = 0.0f;
@@ -1216,8 +1211,9 @@ public:
                 // First-pass scores are identical: expansion would be uniform noise.
                 pool = pass1;
             } else {
-                // P(d|R): λ·uniform + (1-λ)·log1p(score)/Σ. Normalising raw
-                // BM25 lets one large score dominate. News λ=0.70; abstracts 0.25.
+                // P(d|R): λ·uniform + (1-λ)·log1p(score)/Σ. Anserini RM3 is
+                // uniform on the feedback set (news). Abstracts keep a score
+                // mix so the first-pass ranking still matters.
                 fb_wts.resize(num_fb);
                 float wsum = 0.0f;
                 for (int i = 0; i < num_fb; ++i) {
@@ -1226,7 +1222,7 @@ public:
                     fb_wts[i] = std::log1p(s);
                     wsum += fb_wts[i];
                 }
-                const float lam_u = news_rm3 ? 0.70f : 0.25f;
+                const float lam_u = news_rm3 ? 1.00f : 0.25f;
                 const float invk = 1.0f / static_cast<float>(std::max(num_fb, 1));
                 if (wsum <= 1e-12f) {
                     for (int i = 0; i < num_fb; ++i) fb_wts[i] = invk;

@@ -122,7 +122,10 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         out["delta"] = 1.0
         out["title_bonus"] = 0.4
         out["w_title"] = 0.0
-        out["mu"] = _clip(2.5 * avg, 400.0, 2500.0)
+        # Anserini RM3: μ=1000, α=0.5, 10 fb docs / 10 fb terms, then a
+        # full second BM25 pass (engine.h news_rm3). k1/b are the Robust04
+        # regression defaults; δ=1 is BM25+ (Lv & Zhai) on top of that.
+        out["mu"] = 1000.0
         out["alpha"] = 0.50
         out["fb_docs"] = int(_clip(10, 5, max(5, n // 100)))
         out["fb_terms"] = 10

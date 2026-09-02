@@ -21,7 +21,7 @@ def test_long_large_collection_uses_newswire_operating_point():
     assert abs(p["k1"] - 0.9) < 1e-9
     assert abs(p["b"] - 0.4) < 1e-9
     assert abs(p["delta"] - 1.0) < 1e-9
-    assert abs(p["mu"] - 700.0) < 1e-9
+    assert abs(p["mu"] - 1000.0) < 1e-9
     assert p["fb_docs"] == 10
     assert p["fb_terms"] == 10
     assert p["use_rm3"] is True
