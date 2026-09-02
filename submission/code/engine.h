@@ -45,7 +45,7 @@ public:
     // RM3 forward index, rebuilt at load from postings (not persisted).
     std::vector<uint32_t> csr_off;   // N+1
     std::vector<uint32_t> csr_tid;
-    std::vector<uint32_t> csr_tf;
+    std::vector<uint8_t>  csr_tf;
     uint32_t fwd_keep = 20;
 
     struct BatchFwd {
@@ -442,16 +442,29 @@ public:
             scratch_titles.resize(df);
             uint8_t has_title = 0;
             uint32_t n_title_hits = 0;
+            bool unit_tf = true;
             for (uint32_t i = 0; i < df; ++i) {
                 scratch_gaps[i] = merged[i].doc_id;
                 uint32_t tf = std::min<uint32_t>(merged[i].tf, TF_MAX);
                 scratch_tfs[i] = tf ? tf - 1 : 0;   // Simple-9 stores tf-1
+                if (scratch_tfs[i]) unit_tf = false;
                 scratch_titles[i] = std::min<uint32_t>(merged[i].title_tf, TITLE_TF_MAX);
                 if (scratch_titles[i]) { has_title = 1; ++n_title_hits; }
             }
-            // Short lists: vbyte doc-gaps. LSB flags packed==1 (body tf=1, no
-            // title) so the extra byte can be omitted. Longer lists: Simple-9
-            // body (tf−1), then optional title sidecar, then Elias-Fano docs.
+            auto append_title_sidecar = [&](std::vector<uint8_t>& out) {
+                if (!has_title) return;
+                write_vbyte(out, n_title_hits);
+                uint32_t prev = 0;
+                for (uint32_t i = 0; i < df; ++i) {
+                    if (!scratch_titles[i]) continue;
+                    write_vbyte(out, ((i - prev) << 2) | scratch_titles[i]);
+                    prev = i;
+                }
+            };
+            // Short lists: vbyte. Long lists always S9+EF — vbyte can be a
+            // few bytes smaller but is much slower to decode on high-df terms.
+            // All-ones body tf: omit the S9 payload (faster and smaller).
+            uint8_t codec = CODEC_VBYTE;
             if (df < POST_VBYTE_DF) {
                 uint32_t prev_doc_id = 0;
                 for (uint32_t i = 0; i < df; ++i) {
@@ -463,17 +476,10 @@ public:
                     prev_doc_id = scratch_gaps[i];
                 }
             } else {
-                simple9_pack(block_data, scratch_tfs.data(), df);
-                if (has_title) {
-                    write_vbyte(block_data, n_title_hits);
-                    uint32_t prev = 0;
-                    for (uint32_t i = 0; i < df; ++i) {
-                        if (!scratch_titles[i]) continue;
-                        write_vbyte(block_data, ((i - prev) << 2) | scratch_titles[i]);
-                        prev = i;
-                    }
-                }
+                if (!unit_tf) simple9_pack(block_data, scratch_tfs.data(), df);
+                append_title_sidecar(block_data);
                 ef_pack(block_data, scratch_gaps.data(), df);
+                codec = unit_tf ? CODEC_S9EF_UNIT : CODEC_S9EF;
             }
             f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
             current_postings_offset += block_data.size();
@@ -487,7 +493,7 @@ public:
             write_vbyte(dict_buf, static_cast<uint32_t>(prefix));
             write_vbyte(dict_buf, static_cast<uint32_t>(term.size() - prefix));
             dict_buf.insert(dict_buf.end(), term.begin() + prefix, term.end());
-            write_vbyte(dict_buf, (df << 1) | has_title);
+            write_vbyte(dict_buf, (df << 3) | (static_cast<uint32_t>(codec) << 1) | has_title);
             write_vbyte64(dict_buf, term_postings_start - prev_postings_offset);
             prev_postings_offset = term_postings_start;
             prev_term = term;
@@ -558,7 +564,7 @@ public:
         if (meta.df == 0) return;
         const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
         const uint32_t df = meta.df;
-        if (df < POST_VBYTE_DF) {
+        if (meta.codec == CODEC_VBYTE) {
             uint32_t current_doc = 0;
             for (uint32_t i = 0; i < df; ++i) {
                 uint32_t coded = read_vbyte(ptr);
@@ -568,18 +574,22 @@ public:
                 fn(current_doc, tf);
             }
         } else {
-            // Layout: Simple-9 tfs | [title sidecar] | Elias-Fano docs.
-            const uint8_t* p_ef = s9_skip(ptr, df);
+            const bool unit = (meta.codec == CODEC_S9EF_UNIT);
+            const uint8_t* p_ef = unit ? ptr : s9_skip(ptr, df);
             if (meta.has_title) {
                 uint32_t n_title_hits = read_vbyte(p_ef);
                 for (uint32_t h = 0; h < n_title_hits; ++h) (void)read_vbyte(p_ef);
             }
-            S9Reader s9; s9.init(ptr);
-            EFReader ef; ef.init(p_ef);
-            for (uint32_t i = 0; i < df; ++i) {
-                const uint32_t tf_raw = s9.next();
-                const uint32_t current_doc = ef.next();
-                fn(current_doc, tf_raw + 1u);
+            if (unit) {
+                EFReader ef; ef.init(p_ef);
+                for (uint32_t i = 0; i < df; ++i) fn(ef.next(), 1u);
+            } else {
+                S9Reader s9; s9.init(ptr);
+                EFReader ef; ef.init(p_ef);
+                for (uint32_t i = 0; i < df; ++i) {
+                    const uint32_t tf_raw = s9.next();
+                    fn(ef.next(), tf_raw + 1u);
+                }
             }
         }
     }
@@ -651,7 +661,7 @@ public:
                     if (d >= N) return;
                     uint32_t at = cursor[d].fetch_add(1u, std::memory_order_relaxed);
                     csr_tid[at] = tid;
-                    csr_tf[at] = tf;
+                    csr_tf[at] = static_cast<uint8_t>(tf > 255u ? 255u : tf);
                 });
             }
         });
@@ -728,7 +738,8 @@ public:
 
         std::vector<uint32_t> new_off(static_cast<size_t>(N) + 1, 0);
         for (uint32_t d = 0; d < N; ++d) new_off[d + 1] = new_off[d] + keep_n[d];
-        std::vector<uint32_t> new_tid(new_off[N]), new_tf(new_off[N]);
+        std::vector<uint32_t> new_tid(new_off[N]);
+        std::vector<uint8_t> new_tf(new_off[N]);
         for (int w = 0; w < W; ++w) {
             const uint32_t lo = static_cast<uint32_t>((static_cast<uint64_t>(w) * N) / W);
             const uint32_t hi = static_cast<uint32_t>((static_cast<uint64_t>(w + 1) * N) / W);
@@ -740,7 +751,7 @@ public:
                 uint32_t n = keep_n[d];
                 for (uint32_t k = 0; k < n; ++k, ++j) {
                     new_tid[at + k] = src_tid[j];
-                    new_tf[at + k] = src_tf[j];
+                    new_tf[at + k] = static_cast<uint8_t>(src_tf[j]);
                 }
             }
         }
@@ -780,8 +791,9 @@ public:
 
             TermMeta m;
             uint32_t df_coded = read_vbyte(p);
-            m.df = df_coded >> 1;
             m.has_title = static_cast<uint8_t>(df_coded & 1u);
+            m.codec = static_cast<uint8_t>((df_coded >> 1) & 3u);
+            m.df = df_coded >> 3;
             m.postings_offset = prev_postings_offset + read_vbyte64(p);
             prev_postings_offset = m.postings_offset;
 
@@ -948,7 +960,7 @@ public:
 
             const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
             const uint32_t df = meta.df;
-            if (df < POST_VBYTE_DF) {
+            if (meta.codec == CODEC_VBYTE) {
                 uint32_t current_doc = 0;
                 for (uint32_t i = 0; i < df; ++i) {
                     uint32_t coded = read_vbyte(ptr);
@@ -956,6 +968,44 @@ public:
                     uint8_t packed = (coded & 1u) ? 1 : *ptr++;
                     uint8_t ttf = use_title ? static_cast<uint8_t>(packed >> 6) : 0;
                     float tf_eff = static_cast<float>(packed & 0x3F);
+                    if (w_title != 0.0f) tf_eff += w_title * static_cast<float>(ttf);
+                    float tf_norm = (tf_eff * k1p1) /
+                                    (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
+                    float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
+                    if (acc_stamp[current_doc] != score_gen) {
+                        acc_stamp[current_doc] = score_gen;
+                        acc[current_doc] = 0.0f;
+                        touched.push_back(current_doc);
+                    }
+                    acc[current_doc] += contrib;
+                }
+            } else if (meta.codec == CODEC_S9EF_UNIT) {
+                const uint8_t* p_ef = ptr;
+                uint32_t n_title_hits = 0;
+                if (use_title && meta.has_title) {
+                    n_title_hits = read_vbyte(p_ef);
+                    scratch_titles.resize(n_title_hits);
+                    uint32_t prev = 0;
+                    for (uint32_t h = 0; h < n_title_hits; ++h) {
+                        uint32_t coded = read_vbyte(p_ef);
+                        prev += coded >> 2;
+                        scratch_titles[h] = (prev << 2) | (coded & 3u);
+                    }
+                } else if (meta.has_title) {
+                    n_title_hits = read_vbyte(p_ef);
+                    for (uint32_t h = 0; h < n_title_hits; ++h) (void)read_vbyte(p_ef);
+                    n_title_hits = 0;
+                }
+                EFReader ef; ef.init(p_ef);
+                uint32_t hi = 0;
+                for (uint32_t i = 0; i < df; ++i) {
+                    const uint32_t current_doc = ef.next();
+                    uint8_t ttf = 0;
+                    if (hi < n_title_hits && (scratch_titles[hi] >> 2) == i) {
+                        ttf = static_cast<uint8_t>(scratch_titles[hi] & 3u);
+                        ++hi;
+                    }
+                    float tf_eff = 1.0f;
                     if (w_title != 0.0f) tf_eff += w_title * static_cast<float>(ttf);
                     float tf_norm = (tf_eff * k1p1) /
                                     (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
@@ -980,7 +1030,6 @@ public:
                         scratch_titles[h] = (prev << 2) | (coded & 3u);
                     }
                 } else if (meta.has_title) {
-                    // Title sidecar is between Simple-9 and EF; skip it.
                     n_title_hits = read_vbyte(p_ef);
                     for (uint32_t h = 0; h < n_title_hits; ++h) (void)read_vbyte(p_ef);
                     n_title_hits = 0;

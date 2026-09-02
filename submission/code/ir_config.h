@@ -10,10 +10,13 @@
 
 constexpr uint32_t FWD_CANDIDATES   = 64;   // prune width before per-doc keep
 constexpr int      RM3_POOL         = 250;  // abstract collections: rerank this many
-constexpr uint8_t  INDEX_VERSION    = 13;  // bump on postings layout OR analysis change
+constexpr uint8_t  INDEX_VERSION    = 14;  // bump on postings layout OR analysis change
 constexpr uint32_t TF_MAX           = 63;   // 6 bits in pack_tf
 constexpr uint32_t TITLE_TF_MAX     = 3;    // 2 bits in pack_tf
-constexpr uint32_t POST_VBYTE_DF    = 8;    // df below this: vbyte, else S9+EF
+constexpr uint32_t POST_VBYTE_DF    = 8;    // df below this: always vbyte
+constexpr uint8_t  CODEC_S9EF       = 0;    // Simple-9 tfs + optional title + EF docs
+constexpr uint8_t  CODEC_VBYTE      = 1;    // gap+tf vbyte (LSB flags tf==1)
+constexpr uint8_t  CODEC_S9EF_UNIT  = 2;    // all body tf==1: no Simple-9 payload
 // Fine log (|d|/avgdl) in one byte. Scale 64 matches ~1% relative steps
 // on typical docs (CORD/FiQA). Scale 32 reached ~250× but coarsened the
 // bulk of the range and dropped local nDCG. Code 255 is reserved for
@@ -69,6 +72,7 @@ inline float dequantize_doc_len(uint8_t q) {
 struct TermMeta {
     uint32_t df = 0;
     uint8_t  has_title = 0;
+    uint8_t  codec = CODEC_S9EF;  // on-disk: packed with df (not a separate field)
     uint64_t cf = 0;
     uint64_t postings_offset = 0;
 };

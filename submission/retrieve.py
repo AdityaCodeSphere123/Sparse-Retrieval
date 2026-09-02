@@ -180,10 +180,11 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
     return out
 
 
-# Entropy-coded postings barely gzip (level 1). dict/docmap/doclens gzip well.
+# Postings are already entropy-coded; gzip-6 still shaves a bit vs 1 and
+# is cheaper than 9. dict/docmap/doclens are small — level 9 is free.
 # mtime=0 so two builds of the same corpus are byte-identical.
 _GZIP_NAMES = frozenset({"postings.bin", "dict.bin", "docmap.bin", "doclens.bin"})
-_GZIP_LEVEL = {"postings.bin": 1, "dict.bin": 6, "docmap.bin": 6, "doclens.bin": 6}
+_GZIP_LEVEL = {"postings.bin": 6, "dict.bin": 9, "docmap.bin": 9, "doclens.bin": 9}
 
 
 def _gzip_one(index_dir: str, name: str) -> None:

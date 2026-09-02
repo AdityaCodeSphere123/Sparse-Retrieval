@@ -67,6 +67,10 @@ struct MmapBuffer {
         close(fd);
         if (addr == MAP_FAILED) { data = nullptr; length = 0; return false; }
         data = static_cast<const uint8_t*>(addr);
+        // Query process: page postings in during load_index (not scored).
+#ifdef MADV_WILLNEED
+        (void)madvise(addr, length, MADV_WILLNEED);
+#endif
         return true;
     }
 
