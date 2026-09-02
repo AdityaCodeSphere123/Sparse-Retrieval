@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <algorithm>
+#include <cstring>
 
 inline uint8_t pack_tf(uint32_t body_tf, uint32_t title_tf) {
     uint32_t b = std::min(body_tf, TF_MAX);
@@ -77,8 +78,7 @@ struct S9Reader {
     inline void init(const uint8_t* q) { p = q; left = 0; }
     inline uint32_t next() {
         if (!left) {
-            word = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
-                 | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+            std::memcpy(&word, p, 4);
             p += 4;
             const uint32_t sel = word >> 28;
             left = S9_N[sel]; b = S9_B[sel];

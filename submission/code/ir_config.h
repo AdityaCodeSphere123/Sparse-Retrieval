@@ -7,6 +7,7 @@
 #include <cmath>
 #include <string>
 #include <thread>
+#include <vector>
 
 constexpr uint32_t FWD_CANDIDATES   = 64;   // prune width before per-doc keep
 constexpr int      RM3_POOL         = 250;  // abstract collections: rerank this many
@@ -17,6 +18,9 @@ constexpr uint32_t POST_VBYTE_DF    = 8;    // df below this: always vbyte
 constexpr uint8_t  CODEC_S9EF       = 0;    // Simple-9 tfs + optional title + EF docs
 constexpr uint8_t  CODEC_VBYTE      = 1;    // gap+tf vbyte (LSB flags tf==1)
 constexpr uint8_t  CODEC_S9EF_UNIT  = 2;    // all body tf==1: no Simple-9 payload
+// Grading VM is 4 cores. Never request more, even if hardware_concurrency
+// reports SMT siblings or IR_BUILD_WORKERS is set above this.
+constexpr int      IR_MAX_THREADS   = 4;
 // Fine log (|d|/avgdl) in one byte. Scale 64 matches ~1% relative steps
 // on typical docs (CORD/FiQA). Scale 32 reached ~250× but coarsened the
 // bulk of the range and dropped local nDCG. Code 255 is reserved for
@@ -41,10 +45,10 @@ inline BuildCfg read_build_cfg() {
 
 inline int build_workers() {
     int hw = static_cast<int>(std::thread::hardware_concurrency());
-    int n = (hw > 0) ? std::min(hw, 4) : 4;
+    int n = (hw > 0) ? std::min(hw, IR_MAX_THREADS) : IR_MAX_THREADS;
     if (const char* e = std::getenv("IR_BUILD_WORKERS")) n = std::atoi(e);
     if (n < 1) n = 1;
-    if (n > 8) n = 8;
+    if (n > IR_MAX_THREADS) n = IR_MAX_THREADS;
     return n;
 }
 
@@ -54,6 +58,19 @@ inline int build_workers_for_docs(uint32_t n_docs) {
     if (n_docs >= 800000u) n = 1;
     else if (n_docs >= 400000u) n = std::min(n, 2);
     return n;
+}
+
+// W workers, caller is worker 0. Spawns at most IR_MAX_THREADS-1 extra
+// threads so a 4-core box is never oversubscribed.
+template <typename Fn>
+inline void run_parallel(int W, Fn&& fn) {
+    if (W > IR_MAX_THREADS) W = IR_MAX_THREADS;
+    if (W <= 1) { fn(0); return; }
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(W - 1));
+    for (int w = 1; w < W; ++w) pool.emplace_back(fn, w);
+    fn(0);
+    for (auto& t : pool) t.join();
 }
 
 // Store |d|/avgdl as 8-bit log2 so doclens.bin stays small; BM25 only needs ~%.
@@ -73,9 +90,17 @@ struct TermMeta {
     uint32_t df = 0;
     uint8_t  has_title = 0;
     uint8_t  codec = CODEC_S9EF;  // on-disk: packed with df (not a separate field)
+    uint32_t s9_bytes = 0;      // in-memory: S9 payload length (0 if none)
     uint64_t cf = 0;
     uint64_t postings_offset = 0;
+    float    idf = 0.0f;        // in-memory: RSJ idf, filled at load
 };
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define IR_PREFETCH(p) __builtin_prefetch((p), 1, 1)
+#else
+#  define IR_PREFETCH(p) ((void)0)
+#endif
 
 struct DocPosting {
     uint32_t doc_id;

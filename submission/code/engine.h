@@ -66,6 +66,24 @@ public:
     std::vector<uint32_t> scratch_titles;
     std::vector<float> fb_wts;
     BatchFwd fwd_batch;
+    float deq_lut[256]{};
+    float lp_lut[256]{};
+    float lp_k1 = -1.0f;
+    float lp_b = -1.0f;
+
+    void fill_deq_lut() {
+        deq_lut[255] = LEN_Q_SATURATED;
+        for (int i = 0; i < 255; ++i)
+            deq_lut[i] = std::pow(2.0f, static_cast<float>(i) / LEN_Q_SCALE) - 1.0f;
+    }
+
+    void ensure_lp(float k1, float b) {
+        if (k1 == lp_k1 && b == lp_b) return;
+        lp_k1 = k1;
+        lp_b = b;
+        for (int q = 0; q < 256; ++q)
+            lp_lut[q] = k1 * (1.0f - b + b * deq_lut[q]);
+    }
 
     CPPEngine() = default;
 
@@ -127,6 +145,7 @@ public:
         int W = build_workers_for_docs(Ndocs);
         if (Ndocs == 0) W = 1;
         else if (static_cast<uint32_t>(W) > Ndocs) W = static_cast<int>(Ndocs);
+        if (W > IR_MAX_THREADS) W = IR_MAX_THREADS;
 
         struct Shard {
             std::unordered_map<std::string, std::vector<DocPosting>> postings;
@@ -146,6 +165,11 @@ public:
                 if (line_spans) sh.ids.reserve(hi - lo);
 
                 thread_local std::string tls_id, tls_text;
+                thread_local std::unordered_map<std::string, uint32_t> tls_term_data;
+                thread_local std::unordered_map<std::string, uint32_t> tls_title_tf;
+                // Reuse per-doc maps across documents (same thread). Reserve
+                // the shard map once so ingest does not rehash on every term.
+                sh.postings.reserve(static_cast<size_t>(hi - lo) * 2u + 1024u);
                 for (uint32_t doc_int_id = lo; doc_int_id < hi; ++doc_int_id) {
                     std::string_view text_sv;
                     if (line_spans) {
@@ -159,22 +183,22 @@ public:
                     } else {
                         text_sv = all_texts[doc_int_id];
                     }
-                    std::unordered_map<std::string, uint32_t> term_data;
-                    std::unordered_map<std::string, uint32_t> title_tf;
+                    tls_term_data.clear();
+                    tls_title_tf.clear();
                     uint32_t d_len = 0;
                     accumulate_tf(text_sv, tokcfg, buildcfg.title_window,
-                                  term_data, title_tf, d_len);
+                                  tls_term_data, tls_title_tf, d_len);
                     sh.doc_lens.push_back(d_len);
                     sh.tokens += d_len;
 
-                    for (const auto& kv : term_data) {
-                        auto ttf = title_tf.find(kv.first);
+                    for (const auto& kv : tls_term_data) {
+                        auto ttf = tls_title_tf.find(kv.first);
                         sh.postings[kv.first].push_back(
                             DocPosting{doc_int_id,
                                        static_cast<uint16_t>(std::min(kv.second, 65535u)),
                                        static_cast<uint16_t>(
-                                           (ttf == title_tf.end()) ? 0u
-                                                                  : std::min(ttf->second, 65535u))});
+                                           (ttf == tls_title_tf.end()) ? 0u
+                                                                      : std::min(ttf->second, 65535u))});
                     }
                 }
             } catch (...) {
@@ -182,14 +206,7 @@ public:
             }
         };
 
-        if (W <= 1) {
-            ingest_range(0);
-        } else {
-            std::vector<std::thread> pool;
-            pool.reserve(static_cast<size_t>(W));
-            for (int w = 0; w < W; ++w) pool.emplace_back(ingest_range, w);
-            for (auto& t : pool) t.join();
-        }
+        run_parallel(W, ingest_range);
         for (auto& sh : shards) {
             if (sh.err) std::rethrow_exception(sh.err);
         }
@@ -230,13 +247,7 @@ public:
             std::sort(dst.begin(), dst.end(),
                       [](const auto& a, const auto& b) { return a.first < b.first; });
         };
-        if (W <= 1) {
-            sort_shard(0);
-        } else {
-            std::vector<std::thread> pool;
-            for (int w = 0; w < W; ++w) pool.emplace_back(sort_shard, w);
-            for (auto& t : pool) t.join();
-        }
+        run_parallel(W, sort_shard);
         stamp("sort_runs", t0);
 
         N = Ndocs;
@@ -374,6 +385,9 @@ public:
         }
 
         // -------- stage 2: k-way merge of in-memory shard runs -------------
+        // Split the vocabulary into W contiguous ranges, merge+encode each
+        // range on its own thread, then concatenate. Dict front-coding stays
+        // serial so W=1 and W=4 write identical dict.bin / postings.bin.
         struct MemCursor {
             TermRun* lists = nullptr;
             size_t i = 0;
@@ -384,11 +398,162 @@ public:
             void next() { ++i; }
         };
 
-        std::vector<MemCursor> readers(static_cast<size_t>(W));
-        for (int w = 0; w < W; ++w) {
-            readers[static_cast<size_t>(w)].lists = &mem_runs[static_cast<size_t>(w)];
-            readers[static_cast<size_t>(w)].i = 0;
+        auto encode_list = [](const std::vector<DocPosting>& merged,
+                              std::vector<uint8_t>& block_data,
+                              uint8_t& codec,
+                              uint8_t& has_title,
+                              std::vector<uint32_t>& gaps,
+                              std::vector<uint32_t>& tfs,
+                              std::vector<uint32_t>& titles) {
+            const uint32_t df = static_cast<uint32_t>(merged.size());
+            block_data.clear();
+            gaps.resize(df);
+            tfs.resize(df);
+            titles.resize(df);
+            has_title = 0;
+            uint32_t n_title_hits = 0;
+            bool unit_tf = true;
+            for (uint32_t i = 0; i < df; ++i) {
+                gaps[i] = merged[i].doc_id;
+                uint32_t tf = std::min<uint32_t>(merged[i].tf, TF_MAX);
+                tfs[i] = tf ? tf - 1 : 0;   // Simple-9 stores tf-1
+                if (tfs[i]) unit_tf = false;
+                titles[i] = std::min<uint32_t>(merged[i].title_tf, TITLE_TF_MAX);
+                if (titles[i]) { has_title = 1; ++n_title_hits; }
+            }
+            auto append_title_sidecar = [&](std::vector<uint8_t>& out) {
+                if (!has_title) return;
+                write_vbyte(out, n_title_hits);
+                uint32_t prev = 0;
+                for (uint32_t i = 0; i < df; ++i) {
+                    if (!titles[i]) continue;
+                    write_vbyte(out, ((i - prev) << 2) | titles[i]);
+                    prev = i;
+                }
+            };
+            // Short lists: vbyte. Long lists always S9+EF — vbyte can be a
+            // few bytes smaller but is much slower to decode on high-df terms.
+            // All-ones body tf: omit the S9 payload (faster and smaller).
+            codec = CODEC_VBYTE;
+            if (df < POST_VBYTE_DF) {
+                uint32_t prev_doc_id = 0;
+                for (uint32_t i = 0; i < df; ++i) {
+                    uint32_t gap = gaps[i] - prev_doc_id;
+                    uint8_t packed = pack_tf(merged[i].tf, titles[i]);
+                    uint32_t plain = (packed == 1) ? 1u : 0u;
+                    write_vbyte(block_data, (gap << 1) | plain);
+                    if (!plain) block_data.push_back(packed);
+                    prev_doc_id = gaps[i];
+                }
+            } else {
+                if (!unit_tf) simple9_pack(block_data, tfs.data(), df);
+                append_title_sidecar(block_data);
+                ef_pack(block_data, gaps.data(), df);
+                codec = unit_tf ? CODEC_S9EF_UNIT : CODEC_S9EF;
+            }
+        };
+
+        struct RangeOut {
+            std::vector<uint8_t> postings;
+            std::vector<std::string> terms;
+            std::vector<uint32_t> dfs;
+            std::vector<uint8_t> codecs;
+            std::vector<uint8_t> has_titles;
+            std::vector<uint32_t> block_sizes;
+            std::exception_ptr err;
+        };
+
+        int nmerge = 1;
+        std::vector<const std::string*> split_lo(static_cast<size_t>(W), nullptr);
+        std::vector<const std::string*> split_hi(static_cast<size_t>(W), nullptr);
+        if (W > 1) {
+            size_t longest = 0;
+            for (int w = 1; w < W; ++w)
+                if (mem_runs[static_cast<size_t>(w)].size() > mem_runs[longest].size())
+                    longest = static_cast<size_t>(w);
+            const auto& run = mem_runs[longest];
+            if (run.size() >= static_cast<size_t>(W)) {
+                nmerge = std::min(W, IR_MAX_THREADS);
+                for (int w = 1; w < nmerge; ++w) {
+                    size_t idx = (run.size() * static_cast<size_t>(w)) / static_cast<size_t>(nmerge);
+                    split_lo[static_cast<size_t>(w)] = &run[idx].first;
+                    split_hi[static_cast<size_t>(w) - 1] = &run[idx].first;
+                }
+            }
         }
+
+        std::vector<RangeOut> ranges(static_cast<size_t>(nmerge));
+        auto merge_range = [&](int w) {
+            RangeOut& out = ranges[static_cast<size_t>(w)];
+            const std::string* lo = split_lo[static_cast<size_t>(w)];
+            const std::string* hi = split_hi[static_cast<size_t>(w)];
+            try {
+                std::vector<MemCursor> readers(static_cast<size_t>(W));
+                for (int r = 0; r < W; ++r) {
+                    auto& c = readers[static_cast<size_t>(r)];
+                    c.lists = &mem_runs[static_cast<size_t>(r)];
+                    if (lo && c.lists && !c.lists->empty()) {
+                        auto it = std::lower_bound(
+                            c.lists->begin(), c.lists->end(), *lo,
+                            [](const std::pair<std::string, std::vector<DocPosting>>& a,
+                               const std::string& k) { return a.first < k; });
+                        c.i = static_cast<size_t>(it - c.lists->begin());
+                    } else {
+                        c.i = 0;
+                    }
+                }
+
+                std::vector<DocPosting> merged;
+                std::vector<uint8_t> block_data;
+                std::vector<uint32_t> gaps, tfs, titles;
+                out.terms.reserve(1 << 14);
+                out.postings.reserve(1 << 20);
+
+                while (true) {
+                    const std::string* min_term = nullptr;
+                    for (auto& rdr : readers) {
+                        if (!rdr.active()) continue;
+                        if (hi && !(rdr.term() < *hi)) continue;
+                        if (!min_term || rdr.term() < *min_term) min_term = &rdr.term();
+                    }
+                    if (!min_term) break;
+                    std::string term = *min_term;
+
+                    uint32_t df = 0;
+                    for (auto& rdr : readers) {
+                        if (!rdr.active() || (hi && !(rdr.term() < *hi)) || rdr.term() != term)
+                            continue;
+                        df += rdr.df();
+                    }
+
+                    merged.clear();
+                    merged.reserve(df);
+                    for (auto& rdr : readers) {
+                        if (!rdr.active() || (hi && !(rdr.term() < *hi)) || rdr.term() != term)
+                            continue;
+                        // Runs are produced in increasing doc_id order and
+                        // merged in run order, so `merged` is already sorted.
+                        merged.insert(merged.end(), rdr.posts().begin(), rdr.posts().end());
+                        rdr.next();
+                    }
+                    if (df < buildcfg.min_df) continue;
+
+                    uint8_t codec = CODEC_VBYTE;
+                    uint8_t has_title = 0;
+                    encode_list(merged, block_data, codec, has_title, gaps, tfs, titles);
+                    out.terms.push_back(std::move(term));
+                    out.dfs.push_back(df);
+                    out.codecs.push_back(codec);
+                    out.has_titles.push_back(has_title);
+                    out.block_sizes.push_back(static_cast<uint32_t>(block_data.size()));
+                    out.postings.insert(out.postings.end(), block_data.begin(), block_data.end());
+                }
+            } catch (...) {
+                out.err = std::current_exception();
+            }
+        };
+
+        run_parallel(nmerge, merge_range);
 
         std::ofstream f_postings(index_dir + "/postings.bin", std::ios::binary);
         std::vector<char> post_buf(1 << 20);
@@ -406,107 +571,48 @@ public:
         std::vector<uint8_t> dict_buf;
         dict_buf.reserve(1 << 20);
 
-        std::vector<DocPosting> merged;
-        std::vector<uint8_t> block_data;
-
-        while (true) {
-            const std::string* min_term = nullptr;
-            for (auto& r : readers) {
-                if (!r.active()) continue;
-                if (!min_term || r.term() < *min_term) min_term = &r.term();
+        for (int w = 0; w < nmerge; ++w) {
+            RangeOut& o = ranges[static_cast<size_t>(w)];
+            if (o.err) std::rethrow_exception(o.err);
+            if (!o.postings.empty()) {
+                f_postings.write(reinterpret_cast<const char*>(o.postings.data()),
+                                 static_cast<std::streamsize>(o.postings.size()));
             }
-            if (!min_term) break;
-            std::string term = *min_term;
+            for (size_t i = 0; i < o.terms.size(); ++i) {
+                const std::string& term = o.terms[i];
+                const uint32_t df = o.dfs[i];
+                const uint8_t codec = o.codecs[i];
+                const uint8_t has_title = o.has_titles[i];
+                const uint64_t term_postings_start = current_postings_offset;
+                current_postings_offset += o.block_sizes[i];
 
-            uint32_t df = 0;
-            for (auto& r : readers) if (r.active() && r.term() == term) df += r.df();
+                size_t prefix = 0;
+                size_t maxp = std::min(prev_term.size(), term.size());
+                while (prefix < maxp && prev_term[prefix] == term[prefix]) prefix++;
+                if (prefix > 255) prefix = 255;   // keep the shared prefix in one byte
 
-            merged.clear();
-            merged.reserve(df);
+                write_vbyte(dict_buf, static_cast<uint32_t>(prefix));
+                write_vbyte(dict_buf, static_cast<uint32_t>(term.size() - prefix));
+                dict_buf.insert(dict_buf.end(), term.begin() + prefix, term.end());
+                write_vbyte(dict_buf, (df << 3) | (static_cast<uint32_t>(codec) << 1) | has_title);
+                write_vbyte64(dict_buf, term_postings_start - prev_postings_offset);
+                prev_postings_offset = term_postings_start;
+                prev_term = term;
+                num_written_terms++;
 
-            for (auto& r : readers) {
-                if (!r.active() || r.term() != term) continue;
-                for (const auto& dp : r.posts())
-                    merged.push_back(dp);
-                r.next();
-            }
-
-            // Runs are produced in increasing doc_id order and merged in run
-            // order, so `merged` is already sorted by doc_id.
-            if (df < buildcfg.min_df) continue;
-
-            uint64_t term_postings_start = current_postings_offset;
-            block_data.clear();
-            scratch_gaps.resize(df);
-            scratch_tfs.resize(df);
-            scratch_titles.resize(df);
-            uint8_t has_title = 0;
-            uint32_t n_title_hits = 0;
-            bool unit_tf = true;
-            for (uint32_t i = 0; i < df; ++i) {
-                scratch_gaps[i] = merged[i].doc_id;
-                uint32_t tf = std::min<uint32_t>(merged[i].tf, TF_MAX);
-                scratch_tfs[i] = tf ? tf - 1 : 0;   // Simple-9 stores tf-1
-                if (scratch_tfs[i]) unit_tf = false;
-                scratch_titles[i] = std::min<uint32_t>(merged[i].title_tf, TITLE_TF_MAX);
-                if (scratch_titles[i]) { has_title = 1; ++n_title_hits; }
-            }
-            auto append_title_sidecar = [&](std::vector<uint8_t>& out) {
-                if (!has_title) return;
-                write_vbyte(out, n_title_hits);
-                uint32_t prev = 0;
-                for (uint32_t i = 0; i < df; ++i) {
-                    if (!scratch_titles[i]) continue;
-                    write_vbyte(out, ((i - prev) << 2) | scratch_titles[i]);
-                    prev = i;
+                if (dict_buf.size() > (1 << 20)) {
+                    f_dict.write(reinterpret_cast<const char*>(dict_buf.data()),
+                                 static_cast<std::streamsize>(dict_buf.size()));
+                    dict_buf.clear();
                 }
-            };
-            // Short lists: vbyte. Long lists always S9+EF — vbyte can be a
-            // few bytes smaller but is much slower to decode on high-df terms.
-            // All-ones body tf: omit the S9 payload (faster and smaller).
-            uint8_t codec = CODEC_VBYTE;
-            if (df < POST_VBYTE_DF) {
-                uint32_t prev_doc_id = 0;
-                for (uint32_t i = 0; i < df; ++i) {
-                    uint32_t gap = scratch_gaps[i] - prev_doc_id;
-                    uint8_t packed = pack_tf(merged[i].tf, scratch_titles[i]);
-                    uint32_t plain = (packed == 1) ? 1u : 0u;
-                    write_vbyte(block_data, (gap << 1) | plain);
-                    if (!plain) block_data.push_back(packed);
-                    prev_doc_id = scratch_gaps[i];
-                }
-            } else {
-                if (!unit_tf) simple9_pack(block_data, scratch_tfs.data(), df);
-                append_title_sidecar(block_data);
-                ef_pack(block_data, scratch_gaps.data(), df);
-                codec = unit_tf ? CODEC_S9EF_UNIT : CODEC_S9EF;
             }
-            f_postings.write(reinterpret_cast<const char*>(block_data.data()), block_data.size());
-            current_postings_offset += block_data.size();
-
-            // -------- dict entry, front-coded against the previous term ----
-            size_t prefix = 0;
-            size_t maxp = std::min(prev_term.size(), term.size());
-            while (prefix < maxp && prev_term[prefix] == term[prefix]) prefix++;
-            if (prefix > 255) prefix = 255;   // keep the shared prefix in one byte
-
-            write_vbyte(dict_buf, static_cast<uint32_t>(prefix));
-            write_vbyte(dict_buf, static_cast<uint32_t>(term.size() - prefix));
-            dict_buf.insert(dict_buf.end(), term.begin() + prefix, term.end());
-            write_vbyte(dict_buf, (df << 3) | (static_cast<uint32_t>(codec) << 1) | has_title);
-            write_vbyte64(dict_buf, term_postings_start - prev_postings_offset);
-            prev_postings_offset = term_postings_start;
-            prev_term = term;
-            num_written_terms++;
-
-            if (dict_buf.size() > (1 << 20)) {
-                f_dict.write(reinterpret_cast<const char*>(dict_buf.data()), dict_buf.size());
-                dict_buf.clear();
-            }
+            o.postings.clear();
+            o.postings.shrink_to_fit();
         }
 
         if (!dict_buf.empty()) {
-            f_dict.write(reinterpret_cast<const char*>(dict_buf.data()), dict_buf.size());
+            f_dict.write(reinterpret_cast<const char*>(dict_buf.data()),
+                         static_cast<std::streamsize>(dict_buf.size()));
             dict_buf.clear();
         }
         f_dict.seekp(0);
@@ -611,13 +717,9 @@ public:
         if (W > static_cast<int>(nterms)) W = static_cast<int>(nterms);
         if (W < 1) W = 1;
 
-        auto run_W = [&](auto&& fn) {
-            if (W <= 1) { fn(0); return; }
-            std::vector<std::thread> pool;
-            pool.reserve(static_cast<size_t>(W));
-            for (int w = 0; w < W; ++w) pool.emplace_back(fn, w);
-            for (auto& t : pool) t.join();
-        };
+        if (W > IR_MAX_THREADS) W = IR_MAX_THREADS;
+
+        auto run_W = [&](auto&& fn) { run_parallel(W, fn); };
 
         // Pass 1: df-band occupancy + collection frequency, terms sharded.
         std::vector<std::vector<uint32_t>> cnt_w(static_cast<size_t>(W),
@@ -899,10 +1001,11 @@ public:
             quantized_doc_lens.resize(N);
             f.read(reinterpret_cast<char*>(quantized_doc_lens.data()), N * sizeof(uint8_t));
 
+            fill_deq_lut();
             // Reconstruct |d| from the 8-bit ratio; RM3 Dirichlet uses |d|+μ.
             doc_lens.resize(N);
             for (uint32_t i = 0; i < N; ++i) {
-                doc_lens[i] = static_cast<uint32_t>(dequantize_doc_len(quantized_doc_lens[i]) * avg_doc_len);
+                doc_lens[i] = static_cast<uint32_t>(deq_lut[quantized_doc_lens[i]] * avg_doc_len);
                 if (doc_lens[i] == 0) doc_lens[i] = 1;
             }
         }
@@ -910,6 +1013,19 @@ public:
         load_dictionary(index_dir);
 
         postings_mmap.map_file(index_dir + "/postings.bin");
+        if (postings_mmap.data) {
+            const uint8_t* base = postings_mmap.data;
+            const float Nf = static_cast<float>(N);
+            for (auto& m : term_metas) {
+                m.idf = std::log(1.0f + (Nf - static_cast<float>(m.df) + 0.5f)
+                                 / (static_cast<float>(m.df) + 0.5f));
+                if (m.codec == CODEC_S9EF)
+                    m.s9_bytes = static_cast<uint32_t>(
+                        s9_skip(base + m.postings_offset, m.df) - (base + m.postings_offset));
+                else
+                    m.s9_bytes = 0;
+            }
+        }
         rebuild_forward();
 
         acc.assign(N, 0.0f);
@@ -940,13 +1056,14 @@ public:
         }
         touched.clear();
 
-        float length_penalty_lut[256];
-        for (int q = 0; q < 256; ++q) {
-            float ratio = dequantize_doc_len(static_cast<uint8_t>(q));
-            length_penalty_lut[q] = k1 * (1.0f - b + b * ratio);
-        }
+        ensure_lp(k1, b);
         const float k1p1 = k1 + 1.0f;
         const bool use_title = (w_title != 0.0f) || (title_bonus != 0.0f);
+        float* accp = acc.data();
+        uint32_t* stampp = acc_stamp.data();
+        const uint8_t* lens = quantized_doc_lens.data();
+        const float* lp = lp_lut;
+        const uint32_t gen = score_gen;
 
         for (const auto& qt : qterms) {
             int32_t tid = qt.first;
@@ -954,8 +1071,7 @@ public:
             const TermMeta& meta = term_metas[tid];
             if (meta.df == 0) continue;
 
-            float idf = std::log(1.0f + (static_cast<float>(N) - meta.df + 0.5f) / (meta.df + 0.5f));
-            float w = qt.second * idf;
+            float w = qt.second * meta.idf;
             if (w <= 0.0f) continue;
 
             const uint8_t* ptr = postings_mmap.data + meta.postings_offset;
@@ -969,15 +1085,15 @@ public:
                     uint8_t ttf = use_title ? static_cast<uint8_t>(packed >> 6) : 0;
                     float tf_eff = static_cast<float>(packed & 0x3F);
                     if (w_title != 0.0f) tf_eff += w_title * static_cast<float>(ttf);
-                    float tf_norm = (tf_eff * k1p1) /
-                                    (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
+                    float tf_norm = (tf_eff * k1p1) / (tf_eff + lp[lens[current_doc]]);
                     float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
-                    if (acc_stamp[current_doc] != score_gen) {
-                        acc_stamp[current_doc] = score_gen;
-                        acc[current_doc] = 0.0f;
+                    if (stampp[current_doc] != gen) {
+                        stampp[current_doc] = gen;
+                        accp[current_doc] = contrib;
                         touched.push_back(current_doc);
+                    } else {
+                        accp[current_doc] += contrib;
                     }
-                    acc[current_doc] += contrib;
                 }
             } else if (meta.codec == CODEC_S9EF_UNIT) {
                 const uint8_t* p_ef = ptr;
@@ -1007,18 +1123,18 @@ public:
                     }
                     float tf_eff = 1.0f;
                     if (w_title != 0.0f) tf_eff += w_title * static_cast<float>(ttf);
-                    float tf_norm = (tf_eff * k1p1) /
-                                    (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
+                    float tf_norm = (tf_eff * k1p1) / (tf_eff + lp[lens[current_doc]]);
                     float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
-                    if (acc_stamp[current_doc] != score_gen) {
-                        acc_stamp[current_doc] = score_gen;
-                        acc[current_doc] = 0.0f;
+                    if (stampp[current_doc] != gen) {
+                        stampp[current_doc] = gen;
+                        accp[current_doc] = contrib;
                         touched.push_back(current_doc);
+                    } else {
+                        accp[current_doc] += contrib;
                     }
-                    acc[current_doc] += contrib;
                 }
             } else {
-                const uint8_t* p_ef = s9_skip(ptr, df);
+                const uint8_t* p_ef = ptr + meta.s9_bytes;
                 uint32_t n_title_hits = 0;
                 if (use_title && meta.has_title) {
                     n_title_hits = read_vbyte(p_ef);
@@ -1048,15 +1164,15 @@ public:
                     }
                     float tf_eff = static_cast<float>(tf_raw + 1u);
                     if (w_title != 0.0f) tf_eff += w_title * static_cast<float>(ttf);
-                    float tf_norm = (tf_eff * k1p1) /
-                                    (tf_eff + length_penalty_lut[quantized_doc_lens[current_doc]]);
+                    float tf_norm = (tf_eff * k1p1) / (tf_eff + lp[lens[current_doc]]);
                     float contrib = w * (tf_norm + delta + (ttf ? title_bonus : 0.0f));
-                    if (acc_stamp[current_doc] != score_gen) {
-                        acc_stamp[current_doc] = score_gen;
-                        acc[current_doc] = 0.0f;
+                    if (stampp[current_doc] != gen) {
+                        stampp[current_doc] = gen;
+                        accp[current_doc] = contrib;
                         touched.push_back(current_doc);
+                    } else {
+                        accp[current_doc] += contrib;
                     }
-                    acc[current_doc] += contrib;
                 }
             }
         }
@@ -1074,7 +1190,6 @@ public:
         std::vector<std::pair<uint32_t, float>> results;
         results.reserve(want);
         for (size_t i = 0; i < want; ++i) results.push_back({touched[i], acc[touched[i]]});
-        touched.clear();
         return results;
     }
 
@@ -1264,8 +1379,7 @@ public:
                 }
 
                 auto idf_of = [&](int32_t tid) {
-                    return std::log(1.0f + (static_cast<float>(N) - term_metas[tid].df + 0.5f)
-                                    / (term_metas[tid].df + 0.5f));
+                    return term_metas[tid].idf;
                 };
 
                 std::vector<std::pair<int32_t, float>> expansion;
@@ -1313,11 +1427,7 @@ public:
                     if (pool.empty()) pool = pass1;
                 } else {
                     // Abstracts: mix expansion onto the first-pass pool only.
-                    float length_penalty_lut[256];
-                    for (int q = 0; q < 256; ++q) {
-                        float ratio = dequantize_doc_len(static_cast<uint8_t>(q));
-                        length_penalty_lut[q] = k1 * (1.0f - b + b * ratio);
-                    }
+                    ensure_lp(k1, b);
                     const float k1p1 = k1 + 1.0f;
                     const size_t n = pass1.size();
                     std::vector<float> s_rm3(n, 0.0f);
@@ -1326,7 +1436,7 @@ public:
                         float s = alpha_rm3 * pass1[pi].second;
                         const uint32_t s0 = batch.start[pi], sn = batch.len[pi];
                         if (sn && !exp_rm3.empty()) {
-                            float lp = length_penalty_lut[quantized_doc_lens[d]];
+                            float lp = lp_lut[quantized_doc_lens[d]];
                             for (uint32_t j = 0; j < sn; ++j) {
                                 const auto& tf_kv = batch.arena[s0 + j];
                                 auto e = exp_rm3.find(tf_kv.first);

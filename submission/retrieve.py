@@ -8,6 +8,7 @@ import gzip
 import os
 import shutil
 import tempfile
+import zlib
 from typing import List, Optional, Tuple
 
 from submission import bm25
@@ -186,8 +187,42 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
 # Postings are already entropy-coded; gzip-6 still shaves a bit vs 1 and
 # is cheaper than 9. dict/docmap/doclens are small — level 9 is free.
 # mtime=0 so two builds of the same corpus are byte-identical.
+# Large postings.bin is split into a fixed 4 gzip members (concatenated
+# gzip is valid) so the 4-core VM actually compresses in parallel; the
+# previous 4-file pool was stalling on the one fat file. Never more than
+# 4 worker threads — that is the grading-machine spec.
+_MAX_THREADS = 4
 _GZIP_NAMES = frozenset({"postings.bin", "dict.bin", "docmap.bin", "doclens.bin"})
 _GZIP_LEVEL = {"postings.bin": 6, "dict.bin": 9, "docmap.bin": 9, "doclens.bin": 9}
+_GZIP_CHUNK_BYTES = 2 * 1024 * 1024
+_GZIP_CHUNKS = _MAX_THREADS
+
+
+def _gzip_bytes(data: bytes, level: int) -> bytes:
+    # wbits=16+MAX_WBITS → gzip wrapper, mtime 0, OS 255. Deterministic.
+    c = zlib.compressobj(level, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    return c.compress(data) + c.flush()
+
+
+def _gzip_chunked(data: bytes, level: int, nchunks: int) -> bytes:
+    nchunks = max(1, min(int(nchunks), _MAX_THREADS))
+    if nchunks <= 1 or len(data) < _GZIP_CHUNK_BYTES:
+        return _gzip_bytes(data, level)
+
+    def _slice(i: int) -> bytes:
+        lo = i * len(data) // nchunks
+        hi = (i + 1) * len(data) // nchunks
+        return _gzip_bytes(data[lo:hi], level)
+
+    if nchunks == 1:
+        return _slice(0)
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Caller compresses chunk 0; pool runs the rest. At most 4 in flight.
+    with ThreadPoolExecutor(max_workers=nchunks - 1) as pool:
+        futs = [pool.submit(_slice, i) for i in range(1, nchunks)]
+        first = _slice(0)
+        return first + b"".join(f.result() for f in futs)
 
 
 def _gzip_one(index_dir: str, name: str) -> None:
@@ -196,14 +231,18 @@ def _gzip_one(index_dir: str, name: str) -> None:
         return
     gz_path = path + ".gz"
     level = _GZIP_LEVEL.get(name, 1)
-    with open(path, "rb") as src, open(gz_path, "wb") as dst:
-        with gzip.GzipFile(
-            filename="", fileobj=dst, mode="wb", mtime=0, compresslevel=level
-        ) as gz:
-            shutil.copyfileobj(src, gz)
-    if os.path.getsize(gz_path) >= os.path.getsize(path):
-        os.remove(gz_path)
+    with open(path, "rb") as src:
+        data = src.read()
+    nchunks = (
+        _GZIP_CHUNKS
+        if name == "postings.bin" and len(data) >= _GZIP_CHUNK_BYTES
+        else 1
+    )
+    out = _gzip_chunked(data, level, nchunks)
+    if len(out) >= len(data):
         return
+    with open(gz_path, "wb") as dst:
+        dst.write(out)
     os.remove(path)
 
 
@@ -213,7 +252,14 @@ def _gzip_index_dir(index_dir: str) -> None:
     names = [n for n in _GZIP_NAMES if os.path.isfile(os.path.join(index_dir, n))]
     if not names:
         return
-    workers = min(4, len(names))
+    # Postings owns the 4 cores first (internal chunk pool). The other
+    # files are tiny; gzip them afterwards so we do not oversubscribe.
+    if "postings.bin" in names:
+        _gzip_one(index_dir, "postings.bin")
+        names = [n for n in names if n != "postings.bin"]
+    if not names:
+        return
+    workers = min(_MAX_THREADS, len(names))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(lambda n: _gzip_one(index_dir, n), names))
 
@@ -252,7 +298,7 @@ def _prepare_cpp_load_dir(index_dir: str) -> str:
     def _copy(pair):
         shutil.copy2(pair[0], pair[1])
 
-    workers = min(4, max(1, len(jobs) + len(copies)))
+    workers = min(_MAX_THREADS, max(1, len(jobs) + len(copies)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(_inflate, jobs))
         list(pool.map(_copy, copies))
