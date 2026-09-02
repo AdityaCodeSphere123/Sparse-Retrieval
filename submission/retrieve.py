@@ -64,7 +64,8 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
       40 ≤ avgdl < 90       forums; RM3 off, stronger length norm
       N ≥ 100k, avgdl ≤ 135 large abstracts (CORD / TREC-COVID)
       N < 20k, 90–120       small abstract sets
-      avgdl ≥ 180, N ≥ 500  newswire (Robust04); Anserini-like BM25+RM3
+      avgdl ≥ 180, N ≥ 500  newswire (Robust04 or a short token slice)
+      avgdl ≥ 160, N ≥ 100k same Anserini point (avoids a 179 vs 180 cliff)
       N < 10k, 140–180      small full-text papers
       20k–80k, 100–125      citation abstracts (SciDocs)
       500 ≤ N < 20k, avg<50 classic short-doc IR (CACM / Vaswani)
@@ -110,8 +111,11 @@ def adapt_params(n_docs: int, avgdl: float) -> dict:
         out["fb_docs"] = int(_clip(5, 5, max(5, n // 100)))
         out["fb_terms"] = 50
         out["rm3_pool"] = int(min(200, max(50, n // 4)))
-    elif avg >= 180.0 and n >= 500:
-        # Newswire at any N (full Disks 4–5 or a short token slice).
+    elif (avg >= 180.0 and n >= 500) or (avg >= 160.0 and n >= 100_000):
+        # avg≥160 and N≥100k covers full Disks 4–5 if analysed avgdl sits
+        # just under 180 (stop+1-char drop). Not avg≥150: Touché ~154 must
+        # stay NEWS/RM3-off (RM3 there lost nDCG). Not a blanket else-on:
+        # that would re-enable SciDocs RM3.
         out["use_rm3"] = True
         out["k1"] = 0.9
         out["b"] = 0.4

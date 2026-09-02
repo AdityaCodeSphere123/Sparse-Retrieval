@@ -1087,7 +1087,10 @@ public:
         // only dump-length news queries (ntok≥90 or qn≥40) turn it off.
         const int qn = static_cast<int>(qw.size());
         const int ntok = static_cast<int>(tokens.size());
-        const bool news_rm3 = (avg_doc_len >= 180.0f && N >= 500u);
+        // Same cut as retrieve.adapt_params newswire: classic avgdl≥180 at any
+        // N≥500, plus large collections with analysed avgdl in [160, 180).
+        const bool news_rm3 = (avg_doc_len >= 180.0f && N >= 500u)
+            || (avg_doc_len >= 160.0f && N >= 100000u);
         if (news_rm3) {
             if (ntok >= 90 || qn >= 40) {
                 use_rm3 = false;

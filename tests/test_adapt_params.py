@@ -87,6 +87,25 @@ def test_news_length_token_slice_still_uses_anserini():
     assert p["use_rm3"] is True
 
 
+def test_large_newswire_just_under_180_still_uses_anserini():
+    """Analysed Robust04 can land in 160–179; must not fall into NEWS/RM3-off."""
+    p = adapt_params(528000, 179.0)
+    assert abs(p["k1"] - 0.9) < 1e-9
+    assert abs(p["b"] - 0.4) < 1e-9
+    assert p["use_rm3"] is True
+    assert abs(p["delta"] - 1.0) < 1e-9
+    p = adapt_params(528000, 160.0)
+    assert abs(p["k1"] - 0.9) < 1e-9
+    assert p["use_rm3"] is True
+
+
+def test_touche_length_does_not_take_newswire_rm3():
+    """Touché ~154 / large N stays NEWS-like first-pass; RM3 hurt there."""
+    p = adapt_params(380000, 154.0)
+    assert p["use_rm3"] is False
+    assert abs(p["k1"] - 2.2) < 0.05
+
+
 def test_short_answer_slice_drops_title_bonus():
     p = adapt_params(25000, 20.0)
     assert abs(p["title_bonus"] - 0.0) < 1e-9
