@@ -312,7 +312,11 @@ def retrieve_bm25_only(
     w_title: Optional[float] = None,
     title_bonus: Optional[float] = None,
 ) -> List[Tuple[str, float]]:
-    """First-pass BM25+ only (ablations / parameter sweeps)."""
+    """First-pass BM25+ only (ablations / parameter sweeps).
+
+    Skips RM3 and the query-length cuts in retrieve() that zero δ / title
+    bonus on long queries. Competition retrieve() still applies those cuts.
+    """
     k1 = _ACTIVE["k1"] if k1 is None else k1
     b = _ACTIVE["b"] if b is None else b
     delta = _ACTIVE["delta"] if delta is None else delta

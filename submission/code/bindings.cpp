@@ -33,7 +33,8 @@ PYBIND11_MODULE(cpp_engine, m) {
              py::arg("w_title") = 0.0f, py::arg("title_bonus") = 0.0f,
              py::arg("use_rm3") = true, py::arg("fb_docs") = 10, py::arg("fb_terms") = 25,
              py::arg("alpha") = 0.6f, py::arg("mu") = 1000.0f,
-             py::arg("rm3_pool") = RM3_POOL)
+             py::arg("rm3_pool") = RM3_POOL,
+             py::arg("apply_qlen_heuristics") = true)
         .def("retrieve_bm25", &CPPEngine::retrieve_bm25,
              py::arg("query"), py::arg("k"),
              py::arg("k1") = 1.2f, py::arg("b") = 0.75f, py::arg("delta") = 1.0f,

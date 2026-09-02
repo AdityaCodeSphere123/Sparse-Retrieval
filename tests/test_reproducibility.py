@@ -77,6 +77,56 @@ def test_cpp_tie_break_is_external_doc_id_not_insertion_order():
         assert ranking[0][1] == pytest.approx(ranking[1][1])
 
 
+def test_topk_cut_on_score_tie_uses_external_doc_id():
+    """nth_element and sort must share the spec comparator (score, then doc_id)."""
+    import pytest
+    from submission import retrieve as r
+
+    if not r.HAS_CPP:
+        pytest.skip("cpp_engine not built")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = os.path.join(tmp, "corpus.jsonl")
+        with open(corpus, "w", encoding="utf-8") as f:
+            for did in ("docE", "docD", "docC", "docB", "docA"):
+                f.write('{"doc_id": "%s", "text": "cat cat cat"}\n' % did)
+        index_dir = os.path.join(tmp, "index")
+        r.build_index(corpus, index_dir)
+        r.load_index(index_dir)
+        ranking = r.retrieve_bm25_only("cat", k=3)
+        ids = [doc_id for doc_id, _ in ranking]
+        assert ids == ["docA", "docB", "docC"], ids
+        scores = [score for _doc_id, score in ranking]
+        assert scores[0] == pytest.approx(scores[1])
+        assert scores[1] == pytest.approx(scores[2])
+
+
+def test_retrieve_bm25_only_skips_query_length_heuristics():
+    """Long queries must not zero δ / title_bonus on the BM25 ablation path."""
+    import pytest
+    from submission import retrieve as r
+
+    if not r.HAS_CPP:
+        pytest.skip("cpp_engine not built")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = os.path.join(tmp, "corpus.jsonl")
+        with open(corpus, "w", encoding="utf-8") as f:
+            f.write('{"doc_id": "d1", "text": "cat dog mouse"}\n')
+            f.write('{"doc_id": "d2", "text": "cat bird fish"}\n')
+        index_dir = os.path.join(tmp, "index")
+        r.build_index(corpus, index_dir)
+        r.load_index(index_dir)
+        long_q = " ".join(["cat"] * 50)
+        cut = r._CPP_ENGINE.retrieve(
+            long_q, 10, 1.2, 0.75, 0.8, 0.0, 0.6,
+            False, 10, 25, 0.6, 1000.0, 250, True,
+        )
+        pure = r._CPP_ENGINE.retrieve_bm25(long_q, 10, 1.2, 0.75, 0.8, 0.0, 0.6)
+        assert cut and pure
+        assert cut[0][1] != pytest.approx(pure[0][1])
+
+
 def test_parallel_build_matches_serial(monkeypatch):
     """Contiguous doc-id shards must be byte-identical to a 1-worker build."""
     import pytest

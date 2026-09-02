@@ -10,10 +10,15 @@
 
 constexpr uint32_t FWD_CANDIDATES   = 64;   // prune width before per-doc keep
 constexpr int      RM3_POOL         = 250;  // abstract collections: rerank this many
-constexpr uint8_t  INDEX_VERSION    = 11;  // bump on postings layout OR analysis change
+constexpr uint8_t  INDEX_VERSION    = 13;  // bump on postings layout OR analysis change
 constexpr uint32_t TF_MAX           = 63;   // 6 bits in pack_tf
 constexpr uint32_t TITLE_TF_MAX     = 3;    // 2 bits in pack_tf
 constexpr uint32_t POST_VBYTE_DF    = 8;    // df below this: vbyte, else S9+EF
+// Fine log (|d|/avgdl) in one byte. Scale 64 matches ~1% relative steps
+// on typical docs (CORD/FiQA). Scale 32 reached ~250× but coarsened the
+// bulk of the range and dropped local nDCG. Code 255 is reserved for
+constexpr float    LEN_Q_SCALE      = 64.0f;
+constexpr float    LEN_Q_SATURATED  = 64.0f;
 
 struct BuildCfg {
     uint32_t title_window   = 12;     // leading tokens treated as "title"
@@ -51,13 +56,14 @@ inline int build_workers_for_docs(uint32_t n_docs) {
 // Store |d|/avgdl as 8-bit log2 so doclens.bin stays small; BM25 only needs ~%.
 inline uint8_t quantize_doc_len(float len_ratio) {
     if (len_ratio <= 0.0f) return 0;
-    float val = 64.0f * std::log2(1.0f + len_ratio);
+    float val = LEN_Q_SCALE * std::log2(1.0f + len_ratio);
     if (val >= 255.0f) return 255;
     return static_cast<uint8_t>(val);
 }
 
 inline float dequantize_doc_len(uint8_t q) {
-    return std::pow(2.0f, static_cast<float>(q) / 64.0f) - 1.0f;
+    if (q == 255) return LEN_Q_SATURATED;
+    return std::pow(2.0f, static_cast<float>(q) / LEN_Q_SCALE) - 1.0f;
 }
 
 struct TermMeta {

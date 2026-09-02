@@ -1013,18 +1013,14 @@ public:
         }
 
         size_t want = std::min(static_cast<size_t>(std::max(top_k, 0)), touched.size());
+        auto better = [this](uint32_t a, uint32_t x) {
+            if (acc[a] != acc[x]) return acc[a] > acc[x];
+            return doc_ids[a] < doc_ids[x];
+        };
         if (want < touched.size()) {
-            std::nth_element(touched.begin(), touched.begin() + want, touched.end(),
-                             [this](uint32_t a, uint32_t x) {
-                                 if (acc[a] != acc[x]) return acc[a] > acc[x];
-                                 return a < x;
-                             });
+            std::nth_element(touched.begin(), touched.begin() + want, touched.end(), better);
         }
-        std::sort(touched.begin(), touched.begin() + want,
-                  [this](uint32_t a, uint32_t x) {
-                      if (acc[a] != acc[x]) return acc[a] > acc[x];
-                      return doc_ids[a] < doc_ids[x];
-                  });
+        std::sort(touched.begin(), touched.begin() + want, better);
 
         std::vector<std::pair<uint32_t, float>> results;
         results.reserve(want);
@@ -1066,7 +1062,8 @@ public:
         int fb_terms = 25,
         float alpha = 0.6f,
         float mu = 1000.0f,
-        int rm3_pool = RM3_POOL)
+        int rm3_pool = RM3_POOL,
+        bool apply_qlen_heuristics = true)
     {
         auto tokens = cpp_tokenize(query, tokcfg);
         if (tokens.empty() || N == 0) return {};
@@ -1082,52 +1079,61 @@ public:
         if (qsum <= 0.0f) return {};
         for (auto& kv : qw) kv.second /= qsum;
 
-        // Long queries: RM3 on a document-as-query (e.g. ArguAna) pulls
-        // same-stance neighbours. News descriptions (~15–40 terms) keep RM3;
-        // only dump-length news queries (ntok≥90 or qn≥40) turn it off.
         const int qn = static_cast<int>(qw.size());
         const int ntok = static_cast<int>(tokens.size());
         // Same cut as retrieve.adapt_params newswire: classic avgdl≥180 at any
         // N≥500, plus large collections with analysed avgdl in [160, 180).
         const bool news_rm3 = (avg_doc_len >= 180.0f && N >= 500u)
             || (avg_doc_len >= 160.0f && N >= 100000u);
-        if (news_rm3) {
-            if (ntok >= 90 || qn >= 40) {
+        // Query-length overlay on top of Python adapt_params (collection shape).
+        // Composed table, competition path only (apply_qlen_heuristics=true):
+        //   news + (ntok≥90 | qn≥40)     → RM3 off, δ=0, title_bonus=0
+        //   !news + (qn≥20 | ntok≥45)    → RM3 off, δ=0, title_bonus=0
+        //   news + RM3 + qn≤2            → α = min(α, 0.45)
+        //   news + RM3 + (qn≥8 | ntok≥18)→ α = max(α, 0.65), fb_terms≤10, title_bonus=0
+        //   !news + RM3 + qn≤4           → α = min(α, 0.42+0.20*(qn-2)/2), pool≥250
+        //   !news + RM3 + qn≥12 + N≥20k  → α = max(α, 0.75), fb_terms≤25
+        //   !news + RM3                  → pool = min(pool, 250)
+        // retrieve_bm25 skips this block so ablations stay BM25+.
+        if (apply_qlen_heuristics) {
+            // Long queries: RM3 on a document-as-query pulls same-stance
+            // neighbours. News descriptions keep RM3; dump-length news does not.
+            if (news_rm3) {
+                if (ntok >= 90 || qn >= 40) {
+                    use_rm3 = false;
+                    title_bonus = 0.0f;
+                    delta = 0.0f;
+                }
+            } else if (qn >= 20 || ntok >= 45) {
                 use_rm3 = false;
                 title_bonus = 0.0f;
                 delta = 0.0f;
             }
-        } else if (qn >= 20 || ntok >= 45) {
-            use_rm3 = false;
-            title_bonus = 0.0f;
-            delta = 0.0f;
-        }
 
-        // Mix is α·original + (1-α)·expansion; scores are not probabilities.
-        // Short keyword queries on abstracts get more expansion. News titles
-        // stay near α=0.5; news then does a full second BM25 pass.
-        if (use_rm3) {
-            if (news_rm3) {
-                if (qn <= 2) alpha = std::min(alpha, 0.45f);
-                else if (qn >= 8 || ntok >= 18) {
-                    // Description/narrative: weight the original query more.
-                    alpha = std::max(alpha, 0.65f);
-                    fb_terms = std::min(fb_terms, 10);
-                    title_bonus = 0.0f;
+            // Mix is α·original + (1-α)·expansion; scores are not probabilities.
+            if (use_rm3) {
+                if (news_rm3) {
+                    if (qn <= 2) alpha = std::min(alpha, 0.45f);
+                    else if (qn >= 8 || ntok >= 18) {
+                        // Description/narrative: weight the original query more.
+                        alpha = std::max(alpha, 0.65f);
+                        fb_terms = std::min(fb_terms, 10);
+                        title_bonus = 0.0f;
+                    }
+                } else if (qn <= 4) {
+                    float t = (static_cast<float>(qn) - 2.0f) / 2.0f;
+                    if (t < 0.0f) t = 0.0f;
+                    if (t > 1.0f) t = 1.0f;
+                    // qn=2 → α≤0.42; qn=4 → α≤0.62 (SHORT default).
+                    const float short_a = 0.42f + 0.20f * t;
+                    alpha = std::min(alpha, short_a);
+                    rm3_pool = std::max(rm3_pool, 250);
+                } else if (qn >= 12 && N >= 20000u) {
+                    alpha = std::max(alpha, 0.75f);
+                    fb_terms = std::min(fb_terms, 25);
                 }
-            } else if (qn <= 4) {
-                float t = (static_cast<float>(qn) - 2.0f) / 2.0f;
-                if (t < 0.0f) t = 0.0f;
-                if (t > 1.0f) t = 1.0f;
-                // qn=2 → α≤0.42; qn=4 → α≤0.62 (SHORT default).
-                const float short_a = 0.42f + 0.20f * t;
-                alpha = std::min(alpha, short_a);
-                rm3_pool = std::max(rm3_pool, 250);
-            } else if (qn >= 12 && N >= 20000u) {
-                alpha = std::max(alpha, 0.75f);
-                fb_terms = std::min(fb_terms, 25);
+                if (!news_rm3 && rm3_pool > 250) rm3_pool = 250;
             }
-            if (!news_rm3 && rm3_pool > 250) rm3_pool = 250;
         }
 
         std::vector<std::pair<int32_t, float>> q_vec(qw.begin(), qw.end());
@@ -1312,12 +1318,13 @@ public:
         return results;
     }
 
-    // BM25+ only (no RM3). Used by retrieve_bm25_only in Python.
+    // BM25+ only: no RM3 and no query-length cuts on δ / title.
     std::vector<std::pair<std::string, float>> retrieve_bm25(
         const std::string& query, int k, float k1, float b, float delta,
         float w_title, float title_bonus)
     {
-        return retrieve(query, k, k1, b, delta, w_title, title_bonus, false);
+        return retrieve(query, k, k1, b, delta, w_title, title_bonus,
+                        false, 10, 25, 0.6f, 1000.0f, RM3_POOL, false);
     }
 };
 
