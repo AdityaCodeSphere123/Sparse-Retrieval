@@ -1,5 +1,3 @@
-% COL 7364/764 --- Assignment 1 (Sparse Retrieval) --- Report
-% Compile: pdflatex report.tex  (twice)
 \documentclass[10pt,a4paper]{article}
 
 \usepackage[margin=0.75in,top=0.7in,bottom=0.8in]{geometry}
@@ -88,6 +86,14 @@ $W{=}4$ write identical files. The caller is worker~0.
 
 \subsection{Boolean and vector-space (required)}
 \texttt{boolean\_search} is AND/OR over posting sets, unranked, sorted doc ids.
+Correctness is the unit tests in \texttt{tests/test\_retrievers.py} (known tiny
+corpus, hand-checked scores), not nDCG@10. On the 50 CORD-19 topics the
+Python indexer gives mean $|Q_{\mathrm{AND}}|{=}4$ with recall $0.004$
+($34/50$ empty conjunctions) versus mean $|Q_{\mathrm{OR}}|{=}1.5{\times}10^{5}$
+with recall $0.985$: AND is too strict for long NL topics, OR is almost the
+collection. Ranked metrics on a lexicographic prefix of OR are undefined as a
+retriever comparison, so Table~\ref{tab:req} omits them.
+
 \texttt{vsm\_score} is \texttt{lnc.ltc} cosine: $w=(1+\log \mathit{tf})\cdot\ln(N/\mathit{df})$,
 with $\|d\|$ the full-document L2 norm from build time. Query-subspace norms are
 not cosine. Ties: score desc, then doc id asc.
@@ -134,9 +140,19 @@ full-text, newswire). C++ \texttt{retrieve} then overlays query length: RM3/$\de
 off for document-as-query; $\alpha$ tilts on very short/long queries.
 \texttt{retrieve\_bm25} sets \texttt{apply\_qlen\_heuristics=false}.
 
-A knob was kept only if it helped the CORD-19-shaped regime without collapsing a
-differently shaped collection (e.g.\ RM3 stays off on Touch\'e-length forums).
-Table~\ref{tab:xfer} is that check, re-measured on the current binary.
+The discrete cuts are on \emph{shape}, not on a named BEIR id, and they sit
+on top of a continuous SHORT$\to$NEWS interpolation (\(t$ from analysed
+$\mathrm{avgdl}\in[120,155]$). An unseen \((N,\mathrm{avgdl})$ that misses every
+if-branch keeps that blend with RM3 off --- it does not look up a fingerprint.
+On the CORD-19 index I re-scored the 50 topics after lying to
+\texttt{adapt\_params} about $N$ and $\mathrm{avgdl}$: $\pm15\%$ around the
+true pair $(171{,}332,\,109.7)$ stays in the large-abstract regime
+(nDCG@10 $0.7458$, or $0.7317$ when $+15\%$ avgdl starts the $b$-blend).
+Crossing a cut on purpose --- $\mathrm{avgdl}{=}136$ or $N{=}99{,}999$ ---
+falls back to the blend, RM3 off, and nDCG@10 drops to $0.69$, still above
+textbook BM25 ($0.636$). Table~\ref{tab:xfer} is the same check across
+real collections: a knob shipped only if it did not collapse a differently
+shaped set (RM3 stays off on Touch\'e-length forums).
 
 \section{Evaluation}
 All CORD-19 numbers below were re-run for this report (4~Sep~2026) with
@@ -147,14 +163,13 @@ never used. C++ rows share Porter+stops; Boolean/VSM/Python-BM25 use the
 S-stem indexer.
 
 \begin{table}[h]\centering\small
-\caption{Required retrievers on CORD-19 dev, $k{=}10$. Boolean OR is unranked
-(lexicographic Cord ids); the first 10 contain no judged relevant documents.}
+\caption{Ranked retrievers on CORD-19 dev, $k{=}10$. Boolean AND/OR is unranked;
+set-level size/recall is in \S2.1. Correctness: \texttt{tests/test\_retrievers.py}.}
 \label{tab:req}
 \begin{tabular}{lcccc}
 \toprule
 Run & nDCG@10 & MAP@10 & MRR & P@10\\
 \midrule
-Boolean (OR, unranked, doc-id order) & 0.0000 & 0.0000 & 0.0000 & 0.0000\\
 TF--IDF cosine VSM (\texttt{lnc.ltc}, Python) & 0.2815 & 0.0067 & 0.5178 & 0.3160\\
 Python BM25, $k_1{=}1.2$, $b{=}0.75$, $\delta{=}0$ & 0.5714 & 0.0139 & 0.8393 & 0.6360\\
 Python BM25$\oplus$VSM fusion ($0.85/0.15$) & 0.5514 & 0.0129 & 0.7992 & 0.6300\\
@@ -215,22 +230,25 @@ CORD-19 / TREC-COVID (dev) & 171\,332 & 109.7 & 50 & 0.6356 & 0.7458 & 0.0198 & 
 \subsection{Parameter search}
 $k_1$ and $b$ were re-swept with \texttt{retrieve\_bm25\_only} (RM3 off, no
 query-length overlay, \texttt{title\_bonus}${=}0$, $\delta{=}0.80$) so each curve
-isolates one knob (Figure~\ref{fig:k1b}). nDCG rises with $k_1$ through $2.8$
-($0.6548$); $b$ is flat on $[0.5,0.8]$ (peak $0.6364$ at $b{=}0.70$). I did not
-ship the BM25-only argmax: with RM3 on, $k_1{=}2.4$ over-weighted tf on abstracts.
-Shipped $(k_1,b)=(2.15,0.60)$ is in the flat $b$-band and stacks with
-$\delta{=}0.80$, $\beta{=}0.60$ ($+0.049$), then RM3 ($+0.064$). Moving $k_1$ from
-$1.2$ to $2.15$ \emph{without} title is slightly negative.
+isolates one knob (Figure~\ref{fig:k1b}). On the $0.3$-step grid, nDCG rises with
+$k_1$ through $2.8$ ($0.6548$); $b$ is flat on $[0.5,0.8]$ (peak $0.6364$ at
+$b{=}0.70$). A dense probe on the same run ($k_1\in[2.0,2.4]$, identical $b$,
+$\delta$, no title) wobbles by at most $0.006$ (e.g.\ $2.10{\to}0.6337$,
+$2.15{\to}0.6323$, $2.18{\to}0.6370$): that is 50-topic noise, not a second
+protocol, so Figure~\ref{fig:k1b} plots only the grid. I treat $\pm0.01$ nDCG@10
+as the useful band and do not ship a BM25-only argmax: with RM3 on, $k_1{=}2.4$
+over-weighted tf on abstracts. Shipped $(k_1,b)=(2.15,0.60)$ is in the flat
+$b$-band and stacks with $\delta{=}0.80$, $\beta{=}0.60$ ($+0.049$), then RM3
+($+0.064$). Moving $k_1$ from $1.2$ to $2.15$ \emph{without} title is slightly
+negative, inside that same band.
 
 \begin{figure}[h]\centering
 \begin{tikzpicture}
 \begin{axis}[width=0.46\textwidth,height=4.2cm,xlabel={$k_1$ ($b{=}0.60$, $\delta{=}0.80$, no title)},
   ylabel={nDCG@10},grid=both,mark size=1.4pt,tick label style={font=\scriptsize},
-  label style={font=\small},ymin=0.53,ymax=0.67,legend style={font=\tiny,at={(0.97,0.08)},anchor=south east}]
+  label style={font=\small},ymin=0.53,ymax=0.67]
 \addplot coordinates {(0.6,0.5537) (0.9,0.5801) (1.2,0.5940) (1.5,0.6107)
   (1.8,0.6209) (2.1,0.6337) (2.4,0.6440) (2.8,0.6548)};
-\addplot[only marks, mark=star, mark size=2.2pt] coordinates {(2.15,0.6323)};
-\legend{sweep grid, shipped $k_1{=}2.15$}
 \end{axis}
 \end{tikzpicture}\hfill
 \begin{tikzpicture}
@@ -241,16 +259,17 @@ $1.2$ to $2.15$ \emph{without} title is slightly negative.
   (0.6,0.6323) (0.7,0.6364) (0.8,0.6338) (0.9,0.6161)};
 \end{axis}
 \end{tikzpicture}
-\caption{nDCG@10 on the 50 CORD-19 dev topics, BM25+ only (re-run). The $k_1$
-curve is the original grid; shipped $k_1{=}2.15$ is marked separately so it is
-not interpolated into the line. Shipped $(2.15,0.60)$ is not the BM25-only peak
+\caption{nDCG@10 on the 50 CORD-19 dev topics, BM25+ only, one process.
+The $k_1$ panel is the $0.3$-step grid only. Off-grid $k_1{=}2.15$ is $0.6323$,
+$0.001$ below $k_1{=}2.1$, inside a $\pm0.01$ 50-topic band (dense probe
+wobble $\le0.006$). Shipped $(2.15,0.60)$ is not the BM25-only peak
 ($k_1{=}2.8$).}
 \label{fig:k1b}
 \end{figure}
 
-\noindent\textbf{Overfitting control.} The 50-topic grid is noisy at the top, so
-the shipped config is a function of collection shape. Knobs that moved CORD-19
-but hurt Touch\'e/SciDocs were reverted.
+\noindent\textbf{Overfitting control.} The 50-topic $(k_1,b)$ top is flat to
+within the $\pm0.01$ band above, which is why the shipped pair is a shape
+function rather than $\arg\max$ of Figure~\ref{fig:k1b}.
 
 \section{Error analysis}
 Five TREC-COVID queries where \texttt{retrieve()} is weak (re-measured nDCG@10).
