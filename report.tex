@@ -1,0 +1,302 @@
+% COL 7364/764 --- Assignment 1 (Sparse Retrieval) --- Report
+% Compile: pdflatex report.tex  (twice)
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[margin=0.75in,top=0.7in,bottom=0.8in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.16}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+
+\setlist{nosep,leftmargin=*}
+\setlength{\parskip}{2pt}
+
+\title{\vspace{-2.2em}\textbf{COL 7364/764 --- Assignment 1: Sparse Retrieval}\\[2pt]
+\large A from-scratch inverted index with BM25+ and RM3}
+\author{Aditya Anand --- 2023CS50284}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-1.8em}
+
+\section{Indexing design}
+
+\subsection{Analysis chain}
+The competition engine analyses documents and queries with the same function
+(\texttt{each\_surface} in \texttt{analysis.cpp}):
+\begin{itemize}
+  \item \textbf{Tokenisation.} Lowercase; split on any non-alphanumeric character.
+  \item \textbf{Dotted initials.} Single letters separated only by `\texttt{.}' are glued
+        (\texttt{U.S.}~$\to$~\texttt{us}). A leftover length-1 letter is dropped.
+  \item \textbf{Stopwords.} Lucene-style English plus question words
+        (\texttt{INDEX\_STOPWORDS}) at index and query time. A Fox-style list
+        (\texttt{STOPWORDS}) is used only when pruning the RM3 CSR on
+        $N\ge 20{,}000$.
+  \item \textbf{Stemming.} Porter by default (own \texttt{PorterStemmer});
+        \texttt{IR\_STEMMER=1|0} selects S-stem or none. Stems are memoised per thread.
+\end{itemize}
+Stemmer and stop flags are stored in uncompressed \texttt{meta.bin}
+(\texttt{INDEX\_VERSION}${}=14$) and re-read at load.
+
+The required Boolean/VSM/Python-BM25 path is a \emph{separate} indexer
+(\texttt{indexer.py}): S-stem, no stop list, no acronym folding. Unit tests
+(\texttt{tests/test\_retrievers.py}) score that path. Table~\ref{tab:req} therefore
+compares two analysis chains on the same topics, which is what the assignment
+asks (independently verifiable Boolean/VSM vs.\ BM25), not a single tokenizer.
+
+\subsection{What is persisted}
+Five files reconstruct the scorer. Four of them may be gzipped
+(\texttt{postings.bin} level~6, others 9) if gzip is smaller; \texttt{meta.bin} is
+left plain.
+\begin{itemize}
+  \item \textbf{\texttt{dict.bin}} --- sorted terms, front-coded (vbyte prefix + suffix);
+        one vbyte packs $\mathit{df}$, codec id and \texttt{has\_title}; postings
+        offset as a vbyte delta. Term ids are array positions (binary search).
+  \item \textbf{\texttt{postings.bin}} --- $\mathit{df}<8$: gap+tf vbyte with a flag for
+        $(\mathit{tf}{=}1)$. Longer lists: Simple-9 on $\mathit{tf}-1$ plus Elias--Fano
+        on doc ids, or \texttt{CODEC\_S9EF\_UNIT} if every body $\mathit{tf}$ is 1
+        (no Simple-9 payload). Title tf is a sparse vbyte sidecar. Long lists are
+        never stored as vbyte: decode of high-$\mathit{df}$ query terms dominated
+        latency.
+  \item \textbf{\texttt{docmap.bin}} --- if all external ids share a length and a
+        $\le 64$-symbol alphabet, packed base-$A$ codes when that is smaller than
+        raw bytes; equal-length ids otherwise stored raw; variable-length ids
+        front-coded.
+  \item \textbf{\texttt{doclens.bin}} --- $N$, $\mathrm{avgdl}$, corpus token total,
+        and one byte $|d|/\mathrm{avgdl} = 64\log_2(1+r)$; code 255 saturates at 64.
+\end{itemize}
+Not on disk: RSJ IDF (closed form at load), collection frequency and the RM3 CSR
+(rebuilt in \texttt{load\_index}; the harness times build, not load), and
+positions. Postings gzip is four concatenated members (caller compresses chunk~0).
+\texttt{mtime}${=}0$. Load inflates \texttt{.gz} members to a temp dir and
+\texttt{mmap}s.
+
+\subsection{Build path}
+\texttt{build\_index\_from\_file} \texttt{mmap}s JSONL, splits line spans, and runs
+SPIMI. The parser unescapes only when a backslash is present. $W\le 4$ workers
+(reduced at 400k/800k docs) own contiguous doc-id ranges. Vocabulary ranges
+merge/encode in parallel; dictionary front-coding is serial, so $W{=}1$ and
+$W{=}4$ write identical files. The caller is worker~0.
+
+\section{Retrieval models}
+
+\subsection{Boolean and vector-space (required)}
+\texttt{boolean\_search} is AND/OR over posting sets, unranked, sorted doc ids.
+\texttt{vsm\_score} is \texttt{lnc.ltc} cosine: $w=(1+\log \mathit{tf})\cdot\ln(N/\mathit{df})$,
+with $\|d\|$ the full-document L2 norm from build time. Query-subspace norms are
+not cosine. Ties: score desc, then doc id asc.
+
+\subsection{BM25+ (required)}
+Python \texttt{bm25.py} and the C++ inner loop implement the same Okapi/BM25+
+body (tunable $k_1$, $b$; $\delta{=}0$ is textbook BM25). C++ additionally
+normalises query tf and adds a title indicator:
+\[
+w_q\left[\frac{\mathit{tf}_{\mathrm{eff}}(k_1+1)}
+{\mathit{tf}_{\mathrm{eff}}+k_1(1-b+b\,|d|/\mathrm{avgdl})}
++\delta+\beta\,\mathbb{1}[\mathit{tf}^{\mathrm{title}}>0]\right],
+\quad
+w_q=\frac{\mathit{qtf}_q}{\sum \mathit{qtf}}\ln\!\left(1+\frac{N-\mathit{df}+0.5}{\mathit{df}+0.5}\right).
+\]
+$\mathit{tf}_{\mathrm{eff}}$ is body tf ($w_{\mathrm{title}}{=}0$ in the shipped
+config). The title window is the first 12 token \emph{positions} after
+\texttt{each\_surface} (a stopword occupies a slot but is not stored). TAT into a
+generation-stamped accumulator; $k_1(1-b+b\,|d|/\mathrm{avgdl})$ is a 256-entry
+LUT on the length byte.
+
+\subsection{Custom scorer and RM3 (competition)}
+\texttt{custom\_scorer.py} min--max fuses Python BM25 ($k_1{=}0.9$, $b{=}0.4$) and
+cosine at $0.85/0.15$ over a pool of 200. On CORD-19 it is \emph{worse} than
+Python BM25 (Table~\ref{tab:req}), so \texttt{retrieve()} does not call it.
+
+Competition ranking is C++ BM25+ with optional RM3. From the top
+$\mathit{fb\_docs}$ of pass~1,
+$P(w|R)=\sum_i P(d_i|R)\,(\mathit{tf}_{w,d_i}+\mu P(w|C))/(|d_i|+\mu)$,
+IDF-weighted, top $\mathit{fb\_terms}$ mixed as
+$\alpha\cdot\mathrm{original}+(1-\alpha)\cdot\mathrm{expansion}$.
+$P(d|R)=\lambda\,\mathrm{uniform}+(1-\lambda)\,\mathrm{log1p}(\mathrm{score})$
+with $\lambda{=}1$ on newswire (full second BM25 pass) and $\lambda{=}0.25$ on
+abstracts (rerank the first-pass pool, capped at 250). Skip expansion if
+feedback-score variance $<10^{-6}$; require support $\ge 2$ when
+$\mathit{fb\_docs}\ge 12$. The CSR is per-doc $\mathit{tf}\cdot\mathrm{idf}$
+pruned (df band).
+
+\subsection{Collection-adaptive parameters}
+\texttt{adapt\_params}$(N,\mathrm{avgdl})$ --- never query text --- interpolates
+a short-doc endpoint toward a newswire endpoint, then applies regimes
+(near-duplicate titles, short answers, forums, large abstracts, small
+full-text, newswire). C++ \texttt{retrieve} then overlays query length: RM3/$\delta$/title
+off for document-as-query; $\alpha$ tilts on very short/long queries.
+\texttt{retrieve\_bm25} sets \texttt{apply\_qlen\_heuristics=false}.
+
+A knob was kept only if it helped the CORD-19-shaped regime without collapsing a
+differently shaped collection (e.g.\ RM3 stays off on Touch\'e-length forums).
+Table~\ref{tab:xfer} is that check, re-measured on the current binary.
+
+\section{Evaluation}
+All CORD-19 numbers below were re-run for this report (4~Sep~2026) with
+\texttt{harness/metrics.py} (graded nDCG, $2^{\mathrm{rel}}-1$; MAP/MRR/P@10
+binarise $\mathrm{rel}>0$) on the 50 released TREC-COVID topics
+($N{=}171{,}332$, analysed $\mathrm{avgdl}{=}109.71$). Held-out topics were
+never used. C++ rows share Porter+stops; Boolean/VSM/Python-BM25 use the
+S-stem indexer.
+
+\begin{table}[h]\centering\small
+\caption{Required retrievers on CORD-19 dev, $k{=}10$. Boolean OR is unranked
+(lexicographic Cord ids); the first 10 contain no judged relevant documents.}
+\label{tab:req}
+\begin{tabular}{lcccc}
+\toprule
+Run & nDCG@10 & MAP@10 & MRR & P@10\\
+\midrule
+Boolean (OR, unranked, doc-id order) & 0.0000 & 0.0000 & 0.0000 & 0.0000\\
+TF--IDF cosine VSM (\texttt{lnc.ltc}, Python) & 0.2815 & 0.0067 & 0.5178 & 0.3160\\
+Python BM25, $k_1{=}1.2$, $b{=}0.75$, $\delta{=}0$ & 0.5714 & 0.0139 & 0.8393 & 0.6360\\
+Python BM25$\oplus$VSM fusion ($0.85/0.15$) & 0.5514 & 0.0129 & 0.7992 & 0.6300\\
+C++ BM25, $k_1{=}1.2$, $b{=}0.75$, $\delta{=}0$ & 0.6356 & 0.0155 & 0.8875 & 0.6920\\
+C++ BM25+ ($k_1{=}2.15$, $b{=}0.60$, $\delta{=}0.80$), no title & 0.6323 & 0.0151 & 0.8990 & 0.6900\\
+\quad + title $\beta{=}0.60$ & 0.6815 & 0.0171 & 0.9283 & 0.7380\\
+\quad + RM3 ($\alpha{=}0.62$, $\mu{=}9000$, 30/40) & 0.7458 & 0.0198 & 0.9589 & 0.8260\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]\centering\small
+\caption{CORD-19, two-process harness. MAP@10 is small because topics have
+hundreds of relevant documents. Early-phase CORD snapshot from the first
+leaderboard week (before the current codecs).}
+\label{tab:eff}
+\begin{tabular}{lcccccc}
+\toprule
+Phase & nDCG@10 & MAP@10 & MRR & Build & Latency & Index\\
+\midrule
+Initial / early CORD run & $\sim$0.735 & $\sim$0.019 & $\sim$0.93 & $\sim$3\,s & $\sim$2.9\,ms & $\sim$41\,MB\\
+This entry (re-measured) & 0.7458 & 0.0198 & 0.9589 & 2.20\,s & 2.28\,ms & 16.6\,MB\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]\centering\scriptsize
+\caption{Same C++ engine on every local collection. \textbf{BM25} is textbook
+Okapi ($k_1{=}1.2$, $b{=}0.75$, $\delta{=}0$, no title, no RM3) via
+\texttt{retrieve\_bm25\_only}. \textbf{Ours} is competition \texttt{retrieve()}
+(\texttt{adapt\_params}). BEIR test splits; Antique test; Vaswani.}
+\label{tab:xfer}
+\begin{tabular}{lrrcccccc}
+\toprule
+Collection & $N$ & avgdl & \#q & \multicolumn{2}{c}{nDCG@10} & MAP@10 & P@10 & RM3\\
+\cmidrule(lr){5-6}
+ &  &  &  & BM25 & Ours &  &  & \\
+\midrule
+Toy & 20 & 7.8 & 6 & 0.8793 & 0.8793 & 0.8250 & 0.317 & off\\
+Cranfield & 1\,400 & 100.8 & 225 & 0.2922 & 0.3308 & 0.2891 & 0.271 & on\\
+CACM & 3\,204 & 33.7 & 52 & 0.5020 & 0.5256 & 0.2762 & 0.369 & on\\
+Vaswani & 11\,429 & 24.8 & 93 & 0.4356 & 0.4571 & 0.1637 & 0.381 & on\\
+\cmidrule(lr){1-9}
+SciFact & 5\,183 & 145.5 & 300 & 0.6800 & 0.6832 & 0.6353 & 0.090 & off\\
+NFCorpus & 3\,633 & 156.7 & 323 & 0.3240 & 0.3307 & 0.1243 & 0.239 & on\\
+FiQA & 57\,638 & 71.6 & 648 & 0.2476 & 0.2624 & 0.1971 & 0.073 & off\\
+SciDocs & 25\,657 & 115.2 & 1\,000 & 0.1568 & 0.1654 & 0.0966 & 0.087 & off\\
+ArguAna & 8\,674 & 96.5 & 1\,406 & 0.3690 & 0.3538 & 0.2313 & 0.074 & on\\
+Touch\'e-2020 & 382\,545 & 155.3 & 49 & 0.4014 & 0.4899 & 0.1543 & 0.802 & off\\
+Quora & 522\,931 & 5.8 & 10\,000 & 0.7858 & 0.7853 & 0.7376 & 0.119 & off\\
+Antique & 403\,666 & 20.4 & 200 & 0.3486 & 0.4033 & 0.2279 & 0.746 & off\\
+\cmidrule(lr){1-9}
+CORD-19 / TREC-COVID (dev) & 171\,332 & 109.7 & 50 & 0.6356 & 0.7458 & 0.0198 & 0.826 & on\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Parameter search}
+$k_1$ and $b$ were re-swept with \texttt{retrieve\_bm25\_only} (RM3 off, no
+query-length overlay, \texttt{title\_bonus}${=}0$, $\delta{=}0.80$) so each curve
+isolates one knob (Figure~\ref{fig:k1b}). nDCG rises with $k_1$ through $2.8$
+($0.6548$); $b$ is flat on $[0.5,0.8]$ (peak $0.6364$ at $b{=}0.70$). I did not
+ship the BM25-only argmax: with RM3 on, $k_1{=}2.4$ over-weighted tf on abstracts.
+Shipped $(k_1,b)=(2.15,0.60)$ is in the flat $b$-band and stacks with
+$\delta{=}0.80$, $\beta{=}0.60$ ($+0.049$), then RM3 ($+0.064$). Moving $k_1$ from
+$1.2$ to $2.15$ \emph{without} title is slightly negative.
+
+\begin{figure}[h]\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.46\textwidth,height=4.2cm,xlabel={$k_1$ ($b{=}0.60$, $\delta{=}0.80$, no title)},
+  ylabel={nDCG@10},grid=both,mark size=1.4pt,tick label style={font=\scriptsize},
+  label style={font=\small},ymin=0.53,ymax=0.67,legend style={font=\tiny,at={(0.97,0.08)},anchor=south east}]
+\addplot coordinates {(0.6,0.5537) (0.9,0.5801) (1.2,0.5940) (1.5,0.6107)
+  (1.8,0.6209) (2.1,0.6337) (2.4,0.6440) (2.8,0.6548)};
+\addplot[only marks, mark=star, mark size=2.2pt] coordinates {(2.15,0.6323)};
+\legend{sweep grid, shipped $k_1{=}2.15$}
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[width=0.46\textwidth,height=4.2cm,xlabel={$b$ ($k_1{=}2.15$, $\delta{=}0.80$, no title)},
+  ylabel={nDCG@10},grid=both,mark size=1.4pt,tick label style={font=\scriptsize},
+  label style={font=\small},ymin=0.60,ymax=0.65]
+\addplot coordinates {(0.2,0.6155) (0.3,0.6241) (0.4,0.6319) (0.5,0.6339)
+  (0.6,0.6323) (0.7,0.6364) (0.8,0.6338) (0.9,0.6161)};
+\end{axis}
+\end{tikzpicture}
+\caption{nDCG@10 on the 50 CORD-19 dev topics, BM25+ only (re-run). The $k_1$
+curve is the original grid; shipped $k_1{=}2.15$ is marked separately so it is
+not interpolated into the line. Shipped $(2.15,0.60)$ is not the BM25-only peak
+($k_1{=}2.8$).}
+\label{fig:k1b}
+\end{figure}
+
+\noindent\textbf{Overfitting control.} The 50-topic grid is noisy at the top, so
+the shipped config is a function of collection shape. Knobs that moved CORD-19
+but hurt Touch\'e/SciDocs were reverted.
+
+\section{Error analysis}
+Five TREC-COVID queries where \texttt{retrieve()} is weak (re-measured nDCG@10).
+\begin{enumerate}
+  \item \textbf{Query 4} ($0.066$) --- \emph{``what causes death from Covid-19?''}
+        Question words are in \texttt{INDEX\_STOPWORDS}, so the query is mainly
+        \{\texttt{caus}, \texttt{death}, \texttt{covid}\}. Mortality language is
+        ubiquitous; the mechanism (ARDS) is not in those stems. RM3 expands
+        ``death'' into more mortality reviews.
+  \item \textbf{Query 12} ($0.191$) --- quarantine best practices. Title-window
+        hits reward early ``hospital''/``quarantine'' on short overviews. The
+        variance guard only fires on near-constant first-pass scores.
+  \item \textbf{Query 31} ($0.266$) --- coronavirus vs.\ seasonal flu. Contrastive;
+        bag-of-words cannot require difference. No positions are indexed.
+  \item \textbf{Query 15} ($0.366$) --- live outside the body. Only partly overlaps
+        surface-stability language (query 16, $0.430$).
+  \item \textbf{Query 49} ($0.481$) --- long multi-facet NL. Not dump-length, so
+        the overlay leaves RM3 on and the expansion can lock onto one facet.
+\end{enumerate}
+Query 42 (Vitamin~D) is \emph{not} a failure ($0.948$): \texttt{vitamin} is
+selective after dropping `\texttt{d}'. Query 41 (`U.S.') is $0.922$.
+
+\section{Final competition entry}
+\texttt{retrieve()} is \textbf{C++ BM25+ with RM3}, knobs from
+\texttt{adapt\_params}$(N,\mathrm{avgdl})$ plus the query-length overlay. It is
+not the Python fusion ($-0.020$ nDCG@10 vs.\ Python BM25). Boolean/VSM remain
+tested Python components. The bet is shape-based generalisation
+(Table~\ref{tab:xfer}) over a single $(k_1,b)$ fit to 50 topics.
+
+\paragraph{Reproducibility.} \texttt{README.md}. The extension is compiled in
+\texttt{docker build}, never inside \texttt{build\_index}. Worker count does not
+change output bytes; gzip timestamps are zeroed; ties are (score desc, id asc).
+
+\section*{AI-use disclosure}
+LLM assistance (Cursor / Claude) was used for design discussion, code review,
+and drafting this report. Indexing, codecs, adaptation, and all numbers were
+implemented and re-measured by me on the course harness.
+
+\section*{Code provenance}
+No search library is used in submitted components. Literature (not a source
+tree): Okapi BM25 (Robertson \& Zaragoza, 2009); BM25+ (Lv \& Zhai, 2011); RM3
+(Lavrenko \& Croft, 2001) with Dirichlet smoothing (Zhai \& Lafferty, 2001) ---
+newswire $\mu{=}1000$, $\alpha{=}0.5$, 10+10 started from Anserini and was
+re-tuned; Simple-9 (Anh \& Moffat, 2005); Elias--Fano; front coding and vbyte
+(Manning et al.). Third-party: \texttt{pybind11} and the starter harness.
+\texttt{ir\_datasets} is used only to fetch local proxy corpora, not inside
+\texttt{retrieve()}.
+
+\end{document}

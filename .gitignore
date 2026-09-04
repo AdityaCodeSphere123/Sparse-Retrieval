@@ -10,6 +10,7 @@ runs/
 build/
 *.so
 *.dylib
+data/**/_index/
 data/full
 data/proxy_msmarco
 data/proxy_touche

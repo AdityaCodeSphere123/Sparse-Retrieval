@@ -12,6 +12,7 @@
 #     docs/
 #     harness/
 #     README.md
+#     report.tex
 #     requirements.txt
 #     runs/
 #     scripts/
@@ -47,8 +48,13 @@ cp "${ROOT_DIR}/assignment1.tex" "${BUILD_DIR}/"
 cp "${ROOT_DIR}/conftest.py" "${BUILD_DIR}/"
 cp "${ROOT_DIR}/Dockerfile" "${BUILD_DIR}/"
 cp "${ROOT_DIR}/README.md" "${BUILD_DIR}/"
-cp "${ROOT_DIR}/report.md" "${BUILD_DIR}/"
 cp "${ROOT_DIR}/requirements.txt" "${BUILD_DIR}/"
+if [ -f "${ROOT_DIR}/report.tex" ]; then
+  cp "${ROOT_DIR}/report.tex" "${BUILD_DIR}/"
+fi
+if [ -f "${ROOT_DIR}/report.pdf" ]; then
+  cp "${ROOT_DIR}/report.pdf" "${BUILD_DIR}/"
+fi
 
 cp -r "${ROOT_DIR}/docs" "${BUILD_DIR}/"
 cp -r "${ROOT_DIR}/harness" "${BUILD_DIR}/"

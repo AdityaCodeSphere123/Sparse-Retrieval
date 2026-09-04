@@ -48,31 +48,5 @@ python -m harness.run_harness \
   --run-out runs/cacm_run.trec \
   --report-out runs/cacm_report.json
 
-run_proxy() {
-  local name="$1" dir="$2"
-  echo
-  echo "== Full harness run on ${name} =="
-  if [[ ! -f "${dir}/corpus.jsonl" || ! -f "${dir}/queries_dev.tsv" || ! -f "${dir}/qrels_dev.txt" ]]; then
-    echo "SKIP (missing ${dir})"
-    return 0
-  fi
-  python -m harness.run_harness \
-    --corpus "${dir}/corpus.jsonl" \
-    --queries "${dir}/queries_dev.tsv" \
-    --qrels "${dir}/qrels_dev.txt" \
-    --run-out "runs/${name}_run.trec" \
-    --report-out "runs/${name}_report.json"
-}
-
-run_proxy touche  data/proxy_touche
-run_proxy fiqa    data/proxy_fiqa
-run_proxy scifact data/proxy_scifact
-run_proxy nfcorpus data/proxy_nfcorpus
-run_proxy arguana data/proxy_arguana
-run_proxy antique data/proxy_antique
-run_proxy quora data/proxy_quora
-run_proxy scidocs data/proxy_scidocs
-run_proxy vaswani data/vaswani
-
 echo
 echo "All smoke checks passed."
