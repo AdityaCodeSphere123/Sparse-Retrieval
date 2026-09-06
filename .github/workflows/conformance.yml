@@ -1,0 +1,54 @@
+name: Conformance Check
+
+# Runs on every push, exactly as described in the assignment (Section 5,
+# "Continuous conformance checking"): interface conformance tests plus a
+# full harness pass over the public toy/dev query set, so interface
+# breakage is caught within minutes of pushing, not at the deadline.
+#
+# This does NOT compute your leaderboard score — nDCG@10/MAP@10 here are
+# against the toy set (or the released dev set, if you point CORPUS_DIR
+# at data/full), not the private held-out set used for grading.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build compiled extension
+        if: ${{ hashFiles('submission/setup.py') != '' }}
+        working-directory: submission
+        run: python setup.py build_ext --inplace
+
+      - name: Interface conformance tests
+        run: pytest tests/test_interface_conformance.py -v
+
+      - name: Metrics unit tests
+        run: pytest tests/test_metrics.py -v
+
+      - name: Full harness smoke run (toy set)
+        run: |
+          python -m harness.run_harness \
+            --corpus data/toy/corpus.jsonl \
+            --queries data/toy/queries_dev.tsv \
+            --qrels data/toy/qrels_dev.txt \
+            --baseline-run data/toy/reference_bm25_run_dev.trec \
+            --run-out runs/dev_run.trec \
+            --report-out runs/dev_report.json
+
+      - name: Upload run + report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-run-and-report
+          path: runs/

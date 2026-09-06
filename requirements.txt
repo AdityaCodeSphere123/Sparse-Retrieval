@@ -1,0 +1,24 @@
+# Core (needed to run the harness and the shipped trivial baseline)
+pytest>=7.0
+
+# Available if you want to compile part of your submission as a C/C++
+# extension (see docs/SUBMISSION_INTERFACE.md, "Compiled extensions").
+# This submission uses pybind11 (cpp_engine); Cython is unused but harmless.
+# The provided Docker image has the C/C++ toolchain (build-essential).
+Cython>=3.0
+pybind11>=2.10.0
+setuptools>=60.0
+
+
+# Needed only for scripts/download_full_corpus.py (fetching the real
+# assignment corpus). Not required to run the toy set or the harness itself.
+ir_datasets>=0.5.5
+
+# Needed only for harness/generate_baseline.py (regenerating the
+# reference BM25 "beat this" run file). A precomputed run file is already
+# shipped in data/toy/, so most students will never need to run this.
+rank_bm25>=0.2.2
+
+# Optional: if you want to cross-check this harness's metrics against the
+# standard TREC tool. Not required.
+# pytrec_eval>=0.5

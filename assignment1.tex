@@ -1,0 +1,213 @@
+\documentclass[10pt]{article}
+%\usepackage[moderate]{savetrees}
+\usepackage[scale=0.8]{geometry}
+\usepackage{url}
+\usepackage{tgcursor}
+\usepackage[breakable]{tcolorbox}
+\usepackage[edges]{forest}
+\usetikzlibrary{arrows.meta}
+\usepackage{booktabs}
+\newtcolorbox{pabox}[2][]{% 
+colback=red!5!white,colframe=red!75!black,fonttitle=\bfseries, title=Examp.~\thetcbcounter: #2,#1}
+
+\newtcolorbox{mybox}[2][]{%
+	breakable,colback=red!5!white,colframe=red!75!black,title=#2,#1
+}
+\newtcolorbox{exbox}[2][]{%
+	breakable,colback=green!5!white,colframe=green!8!black,title=#2,#1}
+	
+\newcommand{\sbcomment}[1]{\textcolor{red}{\textbf{SBJ:}#1}}
+\usepackage{hyperref}
+\usepackage{dirtree}
+\usepackage{xspace}
+\newcommand{\eat}[1]{}
+\newcommand{\STARTDAY}{4\xspace}
+\begin{document}
+\title{COL 7364/764 Assignment 1 - Sparse Retrieval}
+\date{2026 - Version 1.0 \\(dated 20th August 2026)}
+\maketitle
+\noindent
+\begin{mybox}{Important Dates} 
+This assignment runs in three phases. Please note that the deadline is set for 5PM of each day. We will not change it. 
+\begin{center}
+\begin{tabular}{l p{8cm} p{3cm} }
+\toprule
+\textbf{Phase} & \textbf{Description} & \textbf{Date} \\
+\midrule
+Initial Submission & You will be given a dataset and topics to work with after \STARTDAY days from the release of the assignment. You are expected to submit a version which passes all the conformance tests. After the submission deadline, we will compare it against the instructors' competitive BM25 reference implementation, and only those which pass will be considered for next phase. & \textbf{28th August 2026, 5PM IST} \\
+\cmidrule(lr){1-3}
+Competition Round & We will release the full leaderboard every day between the previous deadline day, and the final deadline date for this phase. The leaderboard is computed against a held out dataset and topics (will be revealed to you only after this deadline). You may submit your implementation as many times as you want during this phase. For each day, we will consider the latest version you have submitted by 5PM each day. & \textbf{29th August 2026, 5PM IST -- 3rd September 2026, 5PM IST} (please note the time) \\ 
+\cmidrule(lr){1-3}
+Report Submission & You are required to submit a report that explains your approach both in the initial submission phase as well as the competition round. You are also required to submit all the performance metrics (see the document below) you had in the released test dataset and topics in each phase. &  \textbf{6th September 2026, 11:59PM IST} \\ 
+\bottomrule
+\end{tabular}
+\end{center}
+
+All submissions are to be made on Moodle. 
+\end{mybox}
+
+\begin{exbox}{Instructions}
+\textbf{\large Follow all instructions. Submissions not following these instructions will not be evaluated.}
+{\small
+\begin{enumerate}
+\item This programming assignment is to be done by each student individually. Do not collaborate by sharing code, algorithm, and any other pertinent details with each other. You are free to discuss and post questions to seek clarifications. Please post all discussions related to this assignment with "hw1" tag on Piazza. 
+\item All programs have to be written either using Python or C/C++ programming languages only. Anything else requires explicit prior permission from the instructor. The machine we use to evaluate your submissions is running a Ubuntu 24.04.3 LTS, with Python 3.12.3, 4 CPU cores, 8 GB RAM, GCC/G++ 13.3.0.  \\
+We recommend you to use same versions to avoid the use of deprecated/unsupported functions or take care to ensure required compatibility. 
+\item A single zip of the source code has to be submitted. The zip file should be structured such that, upon deflating all submission files should be under a directory with the student's registration number. E.g., if a student's registration number is \texttt{20XXYYYY999} then the zip submission should be named \textsf{20XXYYYY999.zip}. Upon deflating, \textbf{all contained files} should be under a directory named \textsf{./20XXYYYY999} only (names should be in uppercase). Your submission might be rejected and not be evaluated if you do not adhere to these specifications. This requirement will be satisfied if you just download the ZIP file from your working repository fork, and rename it to appropriate Zip file name. 
+		
+%	Apart from source files, the submission zip file should contain a build mechanism \textit{if needed}. It is the responsibility of each student to ensure that it compiles and generates the necessary executable as specified. \textbf{Please include an empty file in case building is not required} \textit{(e.g. if you are using Python)}. 	    \item Do not submit notebooks -- all programs will be run from the commandline only.
+	
+	The  list of files to be submitted, along with their naming conventions and call signatures as given in the instructions below.
+
+ \item \textbf{Note that we will use only Ubuntu Linux machines to build and run your assignments.} So take care that your file names, paths, argument handling etc. are compatible.
+\item You \emph{should not} submit data files. If you are planning to use any other ``special'' library, please talk to the instructor first (or post on Piazza). 
+\item Note that your submission will be evaluated using larger collection. Only assumption you are allowed to make is that all documents will be in English, have sentences terminated by a period, \eat{each document is a separate file, }and all documents are in one single directory. The overall format of documents will be same as given in your training. The collection directory will be given as an input (see below).
+\item \textbf{Note that there will be no deadline extensions. Apart from the usual ``please start early'' advise, I must warn you that this assignment requires significant amount of implementation effort, as well as some `manual' tuning of parameters to get good speed up and performance. Do not wait till the end.}
+\end{enumerate}
+}
+The file structure in each submission must be exactly as follows (DO NOT RENAME ANY DIRECTORY / FILE that is already shared): 
+
+ 		\dirtree{%
+ 		.1 20XXYYYY999/.
+		.2 assignment1.tex.
+ 		.2 conftest.py.
+		.2 data/.
+		.3 README.md.
+		.3 toy/.
+		.2 Dockerfile.
+		.2 docs/.
+		.3 DOCKER\_SUBMISSION.md.
+		.3 SUBMISSION\_INTERFACE.md.
+		.2 harness/.
+		.2 README.md.
+		.2 requirements.txt.
+		.2 runs/
+		.2 scripts/.
+		.2 submission/.
+		.2 tests/.
+		}
+
+\end{exbox}
+
+\section{Assignment Description}
+
+The goal of this assignment is to build and tune a from-scratch inverted-index retriever to top the class leaderboard.  You will build a from-scratch inverted-index retrieval engine and tune it to outrank every other submission in the class — and the instructor's own reference system — on nDCG@10 over a held-out query set. This is the assignment where the difference between a B-grade IR system and an A-grade one is entirely in the details: stemming choices, BM25 parameter tuning, term-weighting design, and how you handle short queries and rare terms.
+
+
+\subsection{Learning Objectives}
+\begin{itemize}
+\item Implement an inverted index from raw documents through tokenisation, stopword handling, and postings construction.
+\item Implement and compare at least two ranking functions: a Boolean/vector-space model and BM25 (Robertson \& Walker et al., 1992; Robertson \& Zaragoza, 2009).
+\item Understand, in a hands-on way, why parameter choices (BM25's k1, b) materially change ranking quality on real query sets.
+\item Correctly implement and interpret standard TREC-style evaluation metrics (MAP@k, nDCG@k, MRR, Precision@k) using \texttt{trec\_eval}-compatible qrels.
+\item Experience, first-hand, how leaderboard-driven tuning can overfit to a public dev set — and why a held-out private evaluation set exists.
+\end{itemize}
+
+
+\subsection{What you must implement}
+You must build the following components yourself — implemented from scratch, without using an existing search library (Lucene/Elasticsearch/Pyserini/Whoosh, etc.) for indexing or scoring — and exposed through the required Python entrypoint (Section \ref{subsec:entry}). You do not have to write pure Python: a C/C++ extension you compile yourself (via Cython or pybind11) and call from that entrypoint is fine, provided the indexing/scoring logic is your own; see the starter repo's `\texttt{docs/SUBMISSION\_INTERFACE.md}` ("Compiled extensions") for the build details and a timing caveat. You may use standard libraries for tokenisation/stemming (e.g., NLTK's Porter stemmer) and numerical libraries (NumPy).
+
+We have made a reference implementation along with the harness we will use in our evaluations at the following github repository: \url{https://github.com/col7364iitd/2026-a1-student.git}.
+\textbf{It is strongly recommended that you {\it fork} it into your own repository on github, and start working on your fork.} The advantage this is that you get for free a conformance check workflow that automatically runs smoke test on the submission so that your submission does not break any interface contracts. 
+
+\begin{description}
+	
+\item[Indexer:] builds an inverted index (postings lists with term frequencies and document/collection statistics needed for your scoring functions) over the provided corpus, and persists it to disk in a format your own code can reconstruct later without rebuilding from the raw corpus — the exact save/load contract is given in the starter repo. The on-disk size of what you persist is itself a graded leaderboard component (Section 7); a naive dump of every field you touched during indexing will cost you there, so decide deliberately what actually needs to survive to query time.
+\item [Boolean/VSM retriever:] supports conjunctive/disjunctive Boolean queries and a cosine-similarity vector-space ranking with a TF-IDF weighting scheme of your choice.
+\item [Probabilistic retriever:] a BM25 implementation with tunable k1 and b.
+\item [A combined/custom scorer (optional, for competitive edge):] any linear or non-linear combination of the above signals, additional features such as proximity/bigram overlap, or your own heuristic — this is where separation in the leaderboard tends to happen.
+\end{description}
+
+\subsection{What counts as your "entry"}
+\label{subsec:entry}
+Your competition entry is three functions — \\`\texttt{build\_index(corpus\_path, index\_dir)}`,\\ `\texttt{load\_index(index\_dir)}`, and \\ `\texttt{retrieve(query: str, k: int) -> List[(doc\_id, score)]}` \\(exact signatures given in the starter repo) — that the grading harness calls for every held-out query. 
+
+	Please note that `\texttt{build\_index}` and `\texttt{load\_index}`/`\texttt{retrieve}` are run by the harness as two separate processes, in that order, with nothing shared between them but what you wrote to `\texttt{index\_dir}`: this is how the harness verifies your persistence is real rather than an artifact of both calls happening to run in the same Python process. You may internally select whichever of your scorers performs best, or blend them — the harness only sees the final ranked list.
+
+
+\section{Submission Interface \& Conformance Checking}
+
+Every submission must run through the exact `\texttt{build\_index(corpus\_path, index\_dir)}` / `\texttt{load\_index(index\_dir)}` / `\texttt{retrieve(query: str, k: int) -> List[(doc\_id, score)]}` signatures given in the starter repository — no other calling convention, CLI wrapper, or output format is accepted. The starter repo already contains a trivial reference submission (returns the first k documents in collection order, with working persistence to and from disk) that passes the grading harness end-to-end; fork it and replace the internals rather than building submission plumbing from scratch.
+\begin{description}
+\item [Continuous conformance checking.] At the end of each day after \STARTDAY days from the assignment release date (at 5PM exactly), all submissions are collected (including the old ones), we will run the public harness on a small sanity query set and report pass/fail plus latency on the leaderboard website. Use this to catch interface breakage, not at the deadline. 
+\item [Containerisation.] Submissions run inside the provided Docker image with pinned dependencies; do not assume any package beyond what the image includes without updating the provided `\texttt{requirements.txt}` and re-verifying the CI check passes.
+\item [Compiled extensions.] You are not required to write pure Python — a C/C++ extension you compile yourself (e.g. via Cython or pybind11) and call from `\texttt{submission/retrieve.py}` is permitted, provided the underlying indexing/scoring logic is your own (the "no existing library" rule is about which libraries you use, not which language you use). The provided Docker image includes a C/C++ toolchain (`build-essential`) so such an extension builds correctly during `docker build`; build it there, not inside `\texttt{build\_index()}`, since anything `\texttt{build\_index()}` does is charged against your index-build-time efficiency metric.
+\item [Conformance freeze.] 48 hours before the first submission deadline, the CI check must be green. Interface failures reported for the first time after the freeze are graded as a submission error, not treated as a harness bug.
+
+\end{description}
+
+\section{Dataset and Tools}
+\begin{description}
+\item [Corpus:] a mid-sized TREC-style newswire or web collection (e.g., a subset of Robust04 or TREC-COVID via `ir\_datasets`) — small enough to index on a laptop in minutes, large enough ($\ge$ 500K documents) that naive approaches are noticeably slow.
+\item [Training/dev topics + qrels:] released with the assignment for local tuning.
+\item [Held-out topics:] withheld until the private leaderboard is scored at the deadline.
+\item [Reference tooling (for comparison only, not for your submission):] `ir\_datasets` for corpus/qrels loading and `trec\_eval` (or `pytrec\_eval`) for metric computation. The starter repo also ships a script that generates your own local BM25 comparison run using a standard library, with generic textbook parameters — useful for sanity-checking your system, but note it is not the same run, and not necessarily the same parameters, course staff score you against.
+\end{description}
+
+\section{Competition Mechanics and Scoring}
+\label{sec:scoring}
+\begin{description}
+\item[Format:] open leaderboard, unlimited submissions before the deadline, public dev-topic score visible in real time, private held-out-topic score revealed at the deadline (standard two-tier design to discourage dev-set overfitting).
+\begin{center}
+\begin{tabular}{|l | p{5cm} | l |}
+\hline
+\textbf{Rank component}	& \textbf{Metric} &\textbf{	Weight}\\
+\hline
+\hline
+Primary	& nDCG@10 on held-out topics	 & 70\% of leaderboard score\\
+\hline
+Secondary (tie-break)&	MAP@10 on held-out topics&	10\%\\
+\hline
+Efficiency bonus/penalty& 	Index build time + mean query latency, relative to class median	&  $\pm$10\% \\
+\hline
+Index size	& On-disk size of your persisted index after build, relative to class median (full marks at $le$ half the median, zero at $\ge 2\times$ the median, linear between)	& 10\% \\
+\hline
+\end{tabular}
+\end{center}
+\item[A note on compiled extensions:] if you use a C/C++ extension, expect a real advantage on the efficiency and index-size components above over an equivalent pure-Python submission — that trade is expected, not a scoring bug; it mirrors how real IR engines are built and is part of what this section is measuring.
+
+\item[A note on "MAP@10":] since `\texttt{retrieve()}` only ever returns up to k documents, this is not textbook unbounded MAP — full MAP would require ranking (or at least scoring) the entire corpus so precision at every rank where a relevant document appears is known. MAP@10 is Average Precision computed over your top 10 results, still normalised by the true total number of relevant documents per query (from the qrels, not from what you found) — so a query with more than 10 relevant documents can never reach 1.0 on this metric, for any submission. This matches how `trec\_eval` itself behaves on a depth-limited run file; every submission is held to the same yardstick, so relative ranking is unaffected.
+\item[Baseline you must beat:] a competitive BM25 reference, tuned by course staff on data you do not have access to. Its exact parameters are not disclosed, and are deliberately not the textbook defaults used by the comparison script in the starter repo — matching "the standard values" is not a reliable way to clear this floor. Beating the baseline is the pass/fail floor, not the goal: it exists so that a submission that technically runs but ranks no better than a generic BM25 doesn't pass on leaderboard performance. The competitive-grade component is driven by your percentile rank among the whole class on the private held-out set — the difference between clearing the floor and placing in the top decile is entirely about how much further you push, and the floor tells you nothing about where that ceiling is.
+\end{description}
+
+
+\section{Oral Defense}
+After the private leaderboard closes, a random selection of students sit a 10–15 minute oral defense: a walkthrough of one design decision, 2–3 targeted questions on your own code, and a live perturbation (the examiner changes a parameter such as k1 or the smoothing constant and asks you to predict the effect before re-running). If the team cannot explain or meaningfully modify their own submission, the leaderboard-performance component below is capped at 50\% of its earned value regardless of rank.
+
+\section{What is to be submitted?}
+\begin{enumerate}
+\item Source code implementing the indexer and all required retrievers, with a README describing how to reproduce your index and run the harness.
+\item A short report (3–4 pages) covering: your indexing design choices (stopwords, stemming, and how you compressed or pruned what you persist to disk etc.), a table comparing Boolean/VSM vs. BM25 performance on the dev set, your parameter search procedure for k1 and b (include a plot of nDCG@10 vs. the swept parameter), and an error analysis of 3–5 queries where your system ranks poorly. This report can be submitted upto 3 days after the competition closes.
+\item A one-paragraph description of your final competition entry (which scorer or blend you submitted, and why).
+\item An AI-use disclosure statement and a code provenance statement.
+\end{enumerate}
+
+
+\section{Grading policy}
+\begin{center}
+\begin{tabular}{|p{3.5cm}|l|p{10cm}|} 
+\hline	
+\textbf{Component} &	Weight &	Criteria \\
+\hline
+\hline
+Leaderboard performance	& 50\%	& The Section ~\ref{sec:scoring} leaderboard score (nDCG@10 + MAP@10 + efficiency modifier + index-size score), scaled primarily by percentile rank among the whole class on the private held-out set; clearing the undisclosed baseline is a pass/fail floor, not a target to stop at. Capped at 50\% of earned value if the oral defense (below) indicates the team cannot explain their own submission.\\
+\hline
+Correctness of required components	& 20\%	& Boolean/VSM and BM25 retrievers are both correctly implemented and independently verifiable (graded by unit tests against known small examples, not leaderboard score alone). \\
+\hline
+Report quality	& 20\%	& Parameter-tuning methodology is sound (e.g., tuned on dev, not held-out); analysis is specific and evidenced, not generic. \\
+\hline
+Interface conformance	& 5\%	& CI smoke test passing at the conformance freeze; submission runs unmodified through the harness.\\
+\hline
+Code quality \& reproducibility	& 5\%	& Runs end-to-end from the README; index build and load are both deterministic.\\
+\hline
+
+\end{tabular}
+\end{center}
+
+\section{Academic Integrity}
+No existing search/indexing library may be used for the required components. Pretrained language models or embeddings are out of scope for this assignment — that machinery is introduced later in the course. Discussing high-level strategy with classmates is fine; sharing code or a tuned parameter file is not.
+
+LLM assistance is permitted but must be declared in an AI-use disclosure statement, and any external code consulted (including Pyserini source, public repos, or prior submissions) must be listed in a code provenance statement with the specific delta you implemented. Course staff run similarity detection across current- and prior-term submissions and public repositories; flagged submissions receive closer scrutiny at the oral defense rather than an automatic penalty. A team that cannot explain code flagged as similar to an external source, in the defense, will be treated as an integrity case, not merely graded down.
+
+
+\end{document}

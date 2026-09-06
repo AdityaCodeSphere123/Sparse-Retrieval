@@ -1,0 +1,73 @@
+{
+  "submission": "submission.retrieve",
+  "num_queries": 6,
+  "num_queries_scored": 6,
+  "skipped_no_qrels": [],
+  "aggregate_metrics": {
+    "ndcg@10": 0.8792867282544824,
+    "map@10": 0.8250000000000001,
+    "mrr": 1.0,
+    "p@10": 0.3166666666666667
+  },
+  "leaderboard": {
+    "ndcg@10": 0.8792867282544824,
+    "map@10": 0.8250000000000001,
+    "provisional_score_80pct": 0.6980007097781377,
+    "note": "This is nDCG@10 and MAP@10 combined at their 70%/10% weights (80% of the total). The remaining \u00b110% efficiency modifier and 0-10% index-size score are both computed relative to the whole class and are applied when course staff aggregate the real leaderboard.",
+    "baseline_ndcg@10": 0.862480709374298,
+    "baseline_map@10": 0.6836309523809524,
+    "beats_baseline_ndcg@10": true,
+    "beats_baseline_map@10": true
+  },
+  "efficiency": {
+    "index_build_seconds": 0.007902666002337355,
+    "index_load_seconds": 0.007318083997233771,
+    "index_size_bytes": 890,
+    "mean_query_latency_seconds": 1.669450042148431e-05,
+    "max_query_latency_seconds": 3.1541996577288955e-05
+  },
+  "per_query_metrics": {
+    "q1": {
+      "ndcg@10": 0.9099795808617943,
+      "map@10": 1.0,
+      "mrr": 1.0,
+      "p@10": 0.4,
+      "num_ranked": 4
+    },
+    "q2": {
+      "ndcg@10": 0.9677327793493801,
+      "map@10": 0.75,
+      "mrr": 1.0,
+      "p@10": 0.3,
+      "num_ranked": 4
+    },
+    "q3": {
+      "ndcg@10": 0.9307550306045228,
+      "map@10": 1.0,
+      "mrr": 1.0,
+      "p@10": 0.4,
+      "num_ranked": 4
+    },
+    "q4": {
+      "ndcg@10": 1.0,
+      "map@10": 1.0,
+      "mrr": 1.0,
+      "p@10": 0.4,
+      "num_ranked": 4
+    },
+    "q5": {
+      "ndcg@10": 0.6244247138302588,
+      "map@10": 0.2,
+      "mrr": 1.0,
+      "p@10": 0.1,
+      "num_ranked": 1
+    },
+    "q6": {
+      "ndcg@10": 0.8428282648809379,
+      "map@10": 1.0,
+      "mrr": 1.0,
+      "p@10": 0.3,
+      "num_ranked": 3
+    }
+  }
+}
