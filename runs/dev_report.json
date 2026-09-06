@@ -20,15 +20,15 @@
     "beats_baseline_map@10": true
   },
   "efficiency": {
-    "index_build_seconds": 0.0070558749976044055,
-    "index_load_seconds": 0.007071708998410031,
+    "index_build_seconds": 0.007902666002337355,
+    "index_load_seconds": 0.007318083997233771,
     "index_size_bytes": 890,
-    "mean_query_latency_seconds": 7.888833351898938e-06,
-    "max_query_latency_seconds": 1.6665999282849953e-05
+    "mean_query_latency_seconds": 1.669450042148431e-05,
+    "max_query_latency_seconds": 3.1541996577288955e-05
   },
   "per_query_metrics": {
     "q1": {
-      "ndcg@10": 0.9307550306045228,
+      "ndcg@10": 0.9099795808617943,
       "map@10": 1.0,
       "mrr": 1.0,
       "p@10": 0.4,
@@ -42,7 +42,7 @@
       "num_ranked": 4
     },
     "q3": {
-      "ndcg@10": 0.9099795808617943,
+      "ndcg@10": 0.9307550306045228,
       "map@10": 1.0,
       "mrr": 1.0,
       "p@10": 0.4,
