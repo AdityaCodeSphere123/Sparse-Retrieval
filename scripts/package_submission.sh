@@ -114,7 +114,7 @@ if [ "${missing}" -ne 0 ]; then
   exit 1
 fi
 
-# Guard: never ship the assignment PDF or the full corpus.
+# Guard: never ship the spec PDF or the full corpus.
 rm -f "${BUILD_DIR}/assignment1.pdf"
 rm -rf "${BUILD_DIR}/data/full"
 

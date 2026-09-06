@@ -11,7 +11,7 @@ programming languages, coffee, and IR itself). It exists so you can:
 - run the harness end-to-end and see sane, hand-checkable metrics,
 - run the unit tests in `tests/`, which are written against this exact set.
 
-**The toy set is not the assignment corpus and its scores do not count
+**The toy set is not the full corpus and its scores do not count
 toward your grade.** It is small enough that a correct implementation
 should get every judged query essentially right — use it to catch bugs,
 not to tune parameters.
@@ -21,12 +21,11 @@ Files:
 - `toy/queries_dev.tsv` — `qid<TAB>query text`
 - `toy/qrels_dev.txt` — TREC qrels format: `qid 0 doc_id relevance`
 
-## The real assignment corpus
+## The full corpus
 
 Run `python scripts/download_full_corpus.py` to fetch the actual
-assignment collection via [`ir_datasets`](https://ir-datasets.com/) (a
-mid-sized public TREC-style collection; see the assignment spec, Section 6,
-for the exact dataset name announced for this offering). The script writes
+collection via [`ir_datasets`](https://ir-datasets.com/) (a
+mid-sized public TREC-style collection). The script writes
 `corpus.jsonl` in the same format as the toy set, plus the released dev
 topics and qrels, so your code does not need to change between the toy
 set and the real one.

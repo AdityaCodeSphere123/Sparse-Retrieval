@@ -21,7 +21,7 @@ from typing import Dict, Iterable, List, Tuple
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
-# lnc.ltc-style log-tf. False -> w = tf * ln(N/df), matching the assignment
+# lnc.ltc-style log-tf. False -> w = tf * ln(N/df), matching the spec
 # text. Must stay in lockstep with boolean_vsm (imported from here).
 USE_LOG_TF = True
 

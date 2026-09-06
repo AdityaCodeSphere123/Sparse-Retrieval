@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Fetch the real assignment corpus + released dev topics/qrels via ir_datasets
+Fetch the full corpus + released dev topics/qrels via ir_datasets
 and write them into data/full/ in the same format used by data/toy/.
 
 Default dataset: beir/trec-covid (~171K documents, public, no NIST forms

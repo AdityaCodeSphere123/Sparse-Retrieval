@@ -60,7 +60,6 @@
 {\Large\bfseries Submitted by}\par
 \vspace{0.25cm}
 {\Large Aditya Anand\par}
-{\Large 2023CS50284\par}
 \end{minipage}%
 \begin{minipage}{0.45\textwidth}
 \centering
@@ -452,11 +451,6 @@ Checks under \path{tests/}: retrievers (Boolean/VSM/BM25 vs hand-worked scores,
 $k_1$/$b$, ties); codecs (Simple-9/EF, acronyms); reproducibility (byte-identical
 rebuild, reload, doc-id ties, $W{=}1$ vs $W{=}4$, BM25-only skips query-length
 cuts); interface conformance (harness signatures); metrics (nDCG/MAP/MRR/P@k).
-
-\section*{AI-use disclosure}
-LLM assistance (Cursor and Claude) was used for discussion,
-code review, code generation, and for drafting this report. The indexing design, BM25+/RM3 setup, adaptation logic and which knobs to ship
-were my decisions. Every reported number was measured by me on the course harness.
 
 \section*{Code provenance}
 No search library is used in any submitted component. Porter stemming is my own

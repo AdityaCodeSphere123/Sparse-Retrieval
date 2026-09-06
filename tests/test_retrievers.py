@@ -1,7 +1,7 @@
 """Independent correctness checks for Boolean/VSM and BM25.
 
-These are the required components graded against known small examples
-(assignment Section 7, 20%), not leaderboard nDCG. Expected scores are
+These are the required components graded against known small examples,
+not leaderboard nDCG. Expected scores are
 hand-derived from the formulas in the module docstrings.
 """
 import hashlib

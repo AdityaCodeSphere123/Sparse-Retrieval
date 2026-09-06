@@ -8,18 +8,17 @@ Read this carefully: this is a tool for your own sanity-checking, not a
 reproduction of the official grading baseline. Course staff score you
 against a separately tuned BM25 reference on data you don't have, with
 parameters that are not disclosed and are deliberately not assumed to
-match the defaults below (assignment Section 7). Running this script and
+match the defaults below. Running this script and
 confirming you beat *its* output tells you very little about whether
 you'd beat the real one — use it to catch obviously broken rankings, not
 as a finish line.
 
-This is explicitly the "reference tooling" mentioned in the assignment
-(Section 6): it is a standard library call, not a from-scratch
+This is explicitly the "reference tooling" mentioned in the spec: it is a standard library call, not a from-scratch
 implementation, so running or reading this script does not give away a
 Boolean/VSM/BM25 implementation you could pass off as your own. Using
 `rank_bm25` (or any other existing search library) inside your own
-submission/ code is not allowed — see the assignment's Academic
-Integrity section.
+submission/ code is not allowed — see the Academic
+Integrity rules.
 
 Usage:
     python -m harness.generate_baseline \

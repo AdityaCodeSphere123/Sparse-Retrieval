@@ -1,6 +1,5 @@
 # Pinned, minimal image so the grading harness runs your submission
-# identically regardless of local setup (assignment Section 5,
-# "Containerisation"). Course staff run every submission through this
+# identically regardless of local setup. Course staff run every submission through this
 # same image at grading time.
 FROM python:3.11-slim
 

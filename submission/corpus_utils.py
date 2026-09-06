@@ -2,8 +2,8 @@
 submission/corpus_utils.py
 
 Small, shared, non-graded utility for reading the corpus format used
-throughout this assignment. You are welcome to use this as-is — reading a
-JSONL file is plumbing, not the ranking logic the assignment grades — or
+throughout this project. You are welcome to use this as-is — reading a
+JSONL file is plumbing, not the ranking ranking logic — or
 replace it if your index needs a different loading strategy (e.g.
 streaming instead of loading everything into memory).
 """
@@ -26,7 +26,7 @@ def stream_corpus(path: str) -> Iterable[Tuple[str, str]]:
     """Yield (doc_id, text) from a jsonl file, a directory, or ir_datasets.
 
     A directory may contain `corpus.jsonl`, one or more `*.jsonl` files, or
-    one document per file (filename stem = doc_id). The assignment allows
+    one document per file (filename stem = doc_id). The spec allows
     the held-out collection to arrive as a single directory.
     """
     if os.path.isdir(path):

@@ -1,6 +1,6 @@
 """
 harness/trec_io.py — reading/writing the plain-text formats used
-throughout this assignment. Deliberately dependency-free (no pytrec_eval
+throughout this project. Deliberately dependency-free (no pytrec_eval
 requirement) so the harness runs anywhere.
 
 Formats:

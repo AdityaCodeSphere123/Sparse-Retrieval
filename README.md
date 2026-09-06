@@ -1,9 +1,9 @@
-# COL 7364/764 — Assignment 1: Sparse Retrieval
+# Sparse Retrieval
 
 From-scratch inverted index with **BM25+** and **RM3**. Competition path is the
 C++ engine (`submission/code/`) called from `submission/retrieve.py`.
 
-**Author: Aditya Anand (2023CS50284)**
+**Author: Aditya Anand**
 
 The PDF write-up is `report.tex` / `report.pdf`. This README is the
 reproducible companion: how to run, layout, what is implemented, measured
@@ -60,7 +60,7 @@ pytest tests/ -q
 
 ```
 .
-├── assignment1.tex          # course spec
+├── assignment1.tex          # spec
 ├── report.tex / report.pdf  # 4-page report
 ├── README.md
 ├── Dockerfile               # grading image; compiles cpp_engine

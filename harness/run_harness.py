@@ -33,7 +33,7 @@ the same process. The query-phase subprocess starts with none of the build
 phase's memory — if `load_index()` is incomplete, it fails or scores badly
 right here, not silently. The on-disk byte size of `index_dir`, measured by
 this script between the two phases, is what the class-relative index-size
-score (assignment Section 7) is computed from — see
+score is computed from — see
 instructor-tools/aggregate_leaderboard.py.
 
 You do not need to pass `--_phase` or `--_result-out` yourself; they're how

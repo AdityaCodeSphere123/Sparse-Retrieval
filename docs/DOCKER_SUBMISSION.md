@@ -19,8 +19,8 @@ the student image, CI, and course staff's grading image all run
 it locally before you push, especially close to the conformance freeze:
 
 ```bash
-docker build -t my-a1-submission .
-docker run --rm my-a1-submission
+docker build -t my-submission .
+docker run --rm my-submission
 ```
 
 The default command runs the full harness against the toy set (see the
@@ -29,11 +29,11 @@ get running `bash scripts/smoke_test.sh` directly. If it works in the
 container, it will work in CI and at grading time — that's the entire
 point.
 
-To run it against the real assignment corpus instead of the toy set,
+To run it against the full corpus instead of the toy set,
 mount your `data/full/` directory and override the command:
 
 ```bash
-docker run --rm -v "$(pwd)/data/full:/repo/data/full" my-a1-submission \
+docker run --rm -v "$(pwd)/data/full:/repo/data/full" my-submission \
   python -m harness.run_harness \
   --corpus data/full/corpus.jsonl \
   --queries data/full/queries_dev.tsv \
@@ -57,14 +57,13 @@ grading container also runs with networking disabled.
 
 This isn't a secret mechanism — it's described here on purpose. It means
 there is no version of "quietly adjust the scoring code" that does
-anything except cost you the oral defense (Section 7.1 of the assignment
-spec), where you'll be asked to explain your own submission live. Put
+anything except cost you the oral defense, where you'll be asked to explain your own submission live. Put
 your effort into `submission/`, which is the only thing that's actually
 graded.
 
 ## Conformance freeze reminder
 
-Same rule as the rest of the assignment: `docker build` and `docker run`
+Same rule as everywhere else: `docker build` and `docker run`
 against your own repo should succeed cleanly by 48 hours before the
 deadline (docs/SUBMISSION_INTERFACE.md). If your image doesn't build,
 CI's conformance job won't pass either — they run the same checks.

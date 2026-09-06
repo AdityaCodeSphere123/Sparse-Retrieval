@@ -1,6 +1,6 @@
 """
 harness/leaderboard.py — combine raw metrics into the weighted leaderboard
-score defined in the assignment (Section 7):
+score:
 
     70% * nDCG@10  +  10% * MAP@10
   + efficiency bonus/penalty for build time & query latency (up to ±10%)
@@ -61,7 +61,7 @@ def efficiency_modifier(
 def index_size_score(your_index_bytes: float, class_median_index_bytes: float) -> float:
     """A standalone 0-to-MAX_INDEX_SIZE_WEIGHT component (not a ± modifier
     like efficiency_modifier — this is its own weighted piece of the
-    leaderboard score, per the assignment's Section 7 weighting): full
+    leaderboard score): full
     marks at half the class median size or smaller, zero marks at double
     the class median or larger, linear in between. Rewards genuine
     compression (delta/VByte-encoded postings, dropping redundant

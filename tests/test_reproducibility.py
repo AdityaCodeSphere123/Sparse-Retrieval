@@ -1,6 +1,6 @@
 """Index build/load determinism and two-process harness persistence.
 
-Assignment Section 7 (5%): 'Runs end-to-end from the README; index build
+Requirement: 'Runs end-to-end from the README; index build
 and load are both deterministic.'
 """
 import hashlib

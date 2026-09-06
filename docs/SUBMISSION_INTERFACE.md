@@ -1,8 +1,7 @@
 # Submission Interface Contract
 
-This is the canonical, binding version of the interface referenced in the
-assignment spec (Section 5, "Submission Interface & Conformance
-Checking"): *"exact signature given in the starter repo."* This file is
+This is the canonical, binding version of the interface referenced as
+*"exact signature given in the starter repo."* This file is
 that reference.
 
 ## What the harness calls
@@ -58,8 +57,7 @@ mechanics.
 - Its wall-clock time is measured and reported as your index-build-time
   efficiency metric — do expensive one-time work here, not in `retrieve()`.
 - The **on-disk byte size of `index_dir` after this returns** is measured
-  and is its own graded leaderboard component (assignment Section 7,
-  "index size," 0-10% of your score, relative to the class median). Write
+  and is its own graded leaderboard component ("index size," 0-10% of your score, relative to the class median). Write
   only what `retrieve()` actually needs, and consider compressing it —
   see `submission/indexer.py`'s `InvertedIndex.save()` docstring for
   concrete starting points.
@@ -124,14 +122,13 @@ yourself.
   anything that happens inside `build_index()` is charged against your
   index-build-time efficiency metric — a one-time compile isn't indexing
   work and shouldn't be billed as such.
-- **This is not a loophole around "no existing search library"**
-  (assignment Section 4.1/10). Your indexing and scoring logic still has
+- **This is not a loophole around "no existing search library"**. Your indexing and scoring logic still has
   to be your own work; the rule is about not importing Lucene/
   Elasticsearch/Pyserini/Whoosh, not about which language you wrote your
   own implementation in.
 - **Expect a real efficiency/index-size advantage from this**, relative
   to an equivalent pure-Python submission — that's expected, not a
-  scoring bug (assignment Section 7).
+  scoring bug.
 
 ## What "conformance" means in practice
 
@@ -160,8 +157,7 @@ Conformance is a floor, not a target.
 
 ## Conformance freeze
 
-48 hours before the assignment deadline, your repository's CI conformance
+48 hours before the deadline, your repository's CI conformance
 check must be green. Interface problems reported for the first time after
-the freeze are graded as a submission error (assignment Section 9,
-Grading Rubric — "Interface conformance"), not treated as a harness bug.
+the freeze are graded as a submission error ("Interface conformance"), not treated as a harness bug.
 Run `scripts/smoke_test.sh` locally any time before then.

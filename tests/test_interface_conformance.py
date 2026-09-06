@@ -1,7 +1,6 @@
 """
 tests/test_interface_conformance.py — the exact check the CI conformance
-job runs on every push (assignment Section 5, "Submission Interface &
-Conformance Checking"). If this file passes, your submission has the
+job runs on every push. If this file passes, your submission has the
 right shape for the grading harness to run it; it says nothing about
 ranking quality.
 
